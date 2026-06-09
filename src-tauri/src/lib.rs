@@ -19,7 +19,7 @@ fn greet(name: &str) -> String {
 /// 对 2-5 份标书做交叉比对，返回相似度矩阵 + 段落对齐 + 雷同条款聚合 + 元数据指纹。
 /// `on_progress` 通过 Tauri Channel 实时回传检测进度。解析在本地完成，不上传任何文件。
 #[tauri::command]
-fn analyze_paths(
+async fn analyze_paths(
     paths: Vec<String>,
     templates: Vec<String>,
     semantic: bool,
@@ -27,9 +27,14 @@ fn analyze_paths(
     scope: String,
     on_progress: tauri::ipc::Channel<engine::report::Progress>,
 ) -> Result<Report, String> {
-    engine::analyze(paths, templates, semantic, threshold, scope, &move |p| {
-        let _ = on_progress.send(p);
+    // 重计算放到阻塞线程池，避免堵住主线程导致界面冻结、进度不刷新。
+    tauri::async_runtime::spawn_blocking(move || {
+        engine::analyze(paths, templates, semantic, threshold, scope, &move |p| {
+            let _ = on_progress.send(p);
+        })
     })
+    .await
+    .map_err(|e| format!("分析任务失败：{e}"))?
 }
 
 /// 保存一次查重结果为历史任务，返回任务 id。
@@ -83,12 +88,16 @@ struct DocMeta {
 }
 
 #[tauri::command]
-fn parse_meta(path: String) -> Result<DocMeta, String> {
-    let pd = engine::parse::parse_file(std::path::Path::new(&path))?;
-    Ok(DocMeta {
-        pages: pd.pages,
-        char_count: pd.text.chars().count(),
+async fn parse_meta(path: String) -> Result<DocMeta, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let pd = engine::parse::parse_file(std::path::Path::new(&path))?;
+        Ok(DocMeta {
+            pages: pd.pages,
+            char_count: pd.text.chars().count(),
+        })
     })
+    .await
+    .map_err(|e| format!("解析任务失败：{e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
