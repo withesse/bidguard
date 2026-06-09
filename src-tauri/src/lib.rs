@@ -74,6 +74,23 @@ fn export_html(report: Report, path: String) -> Result<(), String> {
     export::to_html(&report, &path)
 }
 
+/// 解析单个文件，返回页数与字数；用于候选槽位的即时状态与早期校验。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocMeta {
+    pages: u32,
+    char_count: usize,
+}
+
+#[tauri::command]
+fn parse_meta(path: String) -> Result<DocMeta, String> {
+    let pd = engine::parse::parse_file(std::path::Path::new(&path))?;
+    Ok(DocMeta {
+        pages: pd.pages,
+        char_count: pd.text.chars().count(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -87,7 +104,8 @@ pub fn run() {
             delete_task,
             export_excel,
             export_docx,
-            export_html
+            export_html,
+            parse_meta
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

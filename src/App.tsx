@@ -14,17 +14,22 @@ import { useTheme } from "./theme";
 import { useToast } from "./components/Toast";
 import { C } from "./design/tokens";
 import type { Screen } from "./routes";
-import { isTauri, pickBidFiles, runAnalysis, saveTask, getTask, type Report, type Progress } from "./engine";
+import { isTauri, pickBidFiles, runAnalysis, parseMeta, saveTask, getTask, type Report, type Progress } from "./engine";
 import { loadTemplates } from "./templates";
 import { getSettings, setSettings, type Settings as AppSettings } from "./prefs";
 
 const NAV_KEYS: NavKey[] = ["home", "tasks", "history", "library", "settings"];
 const ACCEPT = /\.(docx|pdf|txt|md)$/i;
 
+export type FileStatus = "parsing" | "ok" | "error";
 export interface PickedFile {
   path: string;
   name: string;
   type: string;
+  status: FileStatus;
+  pages?: number;
+  chars?: number;
+  error?: string;
 }
 
 function App() {
@@ -38,6 +43,21 @@ function App() {
   const { dark } = useTheme();
   const toast = useToast();
 
+  // 异步解析单个候选文件，回填页数/字数或标记解析失败
+  const parseOne = async (path: string) => {
+    if (!isTauri()) return;
+    try {
+      const m = await parseMeta(path);
+      setFiles((prev) =>
+        prev.map((f) => (f.path === path ? { ...f, status: "ok", pages: m.pages, chars: m.charCount } : f)),
+      );
+    } catch (e) {
+      setFiles((prev) =>
+        prev.map((f) => (f.path === path ? { ...f, status: "error", error: String(e) } : f)),
+      );
+    }
+  };
+
   const appendPaths = (paths: string[]) => {
     setFiles((prev) => {
       const seen = new Set(prev.map((f) => f.path));
@@ -47,9 +67,12 @@ function App() {
           path: p,
           name: p.split(/[\\/]/).pop() ?? p,
           type: (p.split(".").pop() ?? "").toLowerCase(),
+          status: "parsing" as const,
         }));
       const next = [...prev, ...add].slice(0, 5);
       if (prev.length + add.length > 5) toast.show("最多比对 5 份标书，多余的已忽略", "warn");
+      const toParse = next.filter((f) => add.some((a) => a.path === f.path)).map((f) => f.path);
+      queueMicrotask(() => toParse.forEach(parseOne));
       return next;
     });
   };
@@ -123,6 +146,8 @@ function App() {
       const failed = r.docs.filter((d) => d.parseError).length;
       if (failed > 0) toast.show(`${failed} 份文档解析失败，已在报告中标注`, "warn");
       saveTask(taskName.trim() || `${r.docs.length} 份标书交叉比对`, r).catch(() => {});
+      setFiles([]);
+      setTaskName("未命名查重任务");
     } catch (e) {
       setScreen("new");
       toast.show("分析失败：" + String(e), "error");

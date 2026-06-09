@@ -480,10 +480,28 @@ function FileSlot({
           marginTop: 8,
           display: "flex",
           justifyContent: "space-between",
+          gap: 4,
         }}
       >
-        <span>{(f.type || "?").toUpperCase()}</span>
-        <span style={{ fontFamily: C.mono }}>待解析</span>
+        <span style={{ flexShrink: 0 }}>{(f.type || "?").toUpperCase()}</span>
+        {f.status === "error" ? (
+          <span style={{ fontFamily: C.mono, color: C.danger }} title={f.error}>
+            解析失败
+          </span>
+        ) : f.status === "ok" ? (
+          <span
+            style={{
+              fontFamily: C.mono,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {f.pages} 页 · {f.chars} 字
+          </span>
+        ) : (
+          <span style={{ fontFamily: C.mono }}>解析中…</span>
+        )}
       </div>
     </div>
   );

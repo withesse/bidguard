@@ -141,6 +141,16 @@ export function runAnalysis(
   });
 }
 
+export interface DocMeta {
+  pages: number;
+  charCount: number;
+}
+
+/** 解析单个文件，返回页数/字数（用于候选槽位即时状态与早期校验）。失败时 reject。 */
+export function parseMeta(path: string): Promise<DocMeta> {
+  return invoke<DocMeta>("parse_meta", { path });
+}
+
 // —— 历史任务持久化 ——
 export interface TaskSummary {
   id: string;
