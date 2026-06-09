@@ -1,5 +1,5 @@
 // 主题上下文：外观模式 / 品牌色 / 高亮方案 / 侧栏 / 字号。持久化到 localStorage。
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 
 export type Mode = "light" | "dark" | "system";
 export type Highlight = "amber" | "rose" | "blue";
@@ -63,8 +63,25 @@ interface ThemeCtx extends Theme {
 
 const ThemeContext = createContext<ThemeCtx>({ ...DEFAULT, set: () => {} });
 
+// 界面字号 = webview 缩放（等比放大字体+界面，不撑破布局）
+const ZOOM: Record<FontScale, number> = { compact: 0.9, regular: 1.0, comfy: 1.2 };
+function applyZoom(scale: FontScale) {
+  const z = ZOOM[scale] ?? 1;
+  if (typeof window === "undefined") return;
+  if ("__TAURI_INTERNALS__" in window) {
+    import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) => getCurrentWebview().setZoom(z))
+      .catch(() => {});
+  } else {
+    (document.documentElement.style as unknown as { zoom: string }).zoom = String(z);
+  }
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [t, setT] = useState<Theme>(loadTheme);
+  useEffect(() => {
+    applyZoom(t.fontScale);
+  }, [t.fontScale]);
   const set = (patch: Partial<Theme>) =>
     setT((prev) => {
       const next = { ...prev, ...patch };

@@ -4,20 +4,14 @@ import { C } from "../design/tokens";
 import { Logo } from "../design/Icon";
 import { Topbar } from "../components/Topbar";
 import { Toggle, SegControl } from "../components/primitives";
-import { useTheme, type Mode } from "../theme";
+import { useTheme, type FontScale } from "../theme";
 import { useToast } from "../components/Toast";
 import { getSettings, setSettings, type Settings as DetectSettings } from "../prefs";
 
-const THEME_SWATCHES = ["#4F58A8", "#2E5BFF", "#0E9A8F", "#C84D2E", "#2B2D33"];
-
-const VARIANTS: { key: string; label: string; accent: string; mode: Mode }[] = [
-  { key: "A", label: "A · 素雅靛蓝", accent: "#4F58A8", mode: "light" },
-  { key: "B", label: "B · 暗色青绿", accent: "#0E9A8F", mode: "dark" },
-  { key: "C", label: "C · 暖纸红土", accent: "#C84D2E", mode: "light" },
-];
+const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy"];
 
 export function Settings() {
-  const { dark, accent, mode, set } = useTheme();
+  const { dark, accent, mode, set, fontScale, layout } = useTheme();
   const toast = useToast();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -85,64 +79,18 @@ export function Settings() {
 
           {/* 外观 —— 驱动主题 */}
           <Card title="外观" cardBg={cardBg} border={border} mute={mute}>
-            <Row label="视觉变体" sub="一键切换设计稿三套方向（A / B / C）" ink={ink} mute={mute}>
-              <div style={{ display: "flex", gap: 8 }}>
-                {VARIANTS.map((v) => {
-                  const active = accent === v.accent && dark === (v.mode === "dark");
-                  return (
-                    <button
-                      key={v.key}
-                      type="button"
-                      onClick={() => set({ accent: v.accent, mode: v.mode })}
-                      title={v.label}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                        padding: "5px 9px",
-                        borderRadius: 8,
-                        cursor: "pointer",
-                        fontFamily: C.font,
-                        fontSize: 11.5,
-                        fontWeight: 600,
-                        color: active ? (dark ? "#fff" : C.ink) : mute,
-                        background: active ? (dark ? "rgba(255,255,255,0.06)" : C.paper2) : "transparent",
-                        border: `1px solid ${active ? v.accent : border}`,
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 14,
-                          height: 14,
-                          borderRadius: 4,
-                          background: v.accent,
-                          boxShadow: v.mode === "dark" ? "inset 0 0 0 2px #15151B" : "none",
-                        }}
-                      />
-                      {v.key}
-                    </button>
-                  );
-                })}
-              </div>
+            <Row label="界面字号" sub="整体放大或缩小界面与文字" ink={ink} mute={mute}>
+              <SegControl
+                options={["小", "标准", "大"]}
+                value={Math.max(0, FONT_SCALES.indexOf(fontScale))}
+                onChange={(i) => set({ fontScale: FONT_SCALES[i] })}
+              />
             </Row>
-            <Row label="主题色" sub="影响按钮、矩阵与高亮" ink={ink} mute={mute}>
-              <div style={{ display: "flex", gap: 6 }}>
-                {THEME_SWATCHES.map((c) => (
-                  <div
-                    key={c}
-                    onClick={() => set({ accent: c })}
-                    style={{
-                      width: 22,
-                      height: 22,
-                      borderRadius: 6,
-                      background: c,
-                      cursor: "pointer",
-                      boxShadow:
-                        c === accent ? `0 0 0 2px ${dark ? "#15151B" : C.paper}, 0 0 0 3.5px ${c}` : "none",
-                    }}
-                  />
-                ))}
-              </div>
+            <Row label="紧凑侧栏" sub="折叠侧栏文字只留图标，腾出更多内容空间" ink={ink} mute={mute}>
+              <Toggle
+                on={layout === "compact"}
+                onChange={() => set({ layout: layout === "compact" ? "comfort" : "compact" })}
+              />
             </Row>
             <Row label="深色模式" sub="浅色 / 深色 / 跟随系统" ink={ink} mute={mute} last>
               <SegControl
