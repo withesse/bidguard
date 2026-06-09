@@ -28,3 +28,6 @@ dist-ssr
 
 # 说明：src-tauri/binaries（pdfium 原生库）与 src-tauri/models（OCR ONNX 模型）
 # 保留入库，以便 clone 后开箱即可构建；如需瘦身可改为 setup 脚本按需下载。
+
+# Claude Code 本地会话 / 记忆数据
+.claude/
