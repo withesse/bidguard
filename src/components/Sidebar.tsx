@@ -42,29 +42,29 @@ export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) 
       {/* 品牌 */}
       <div
         style={{
-          padding: compact ? "14px 0 10px" : "14px 14px 10px",
+          padding: compact ? "16px 0 14px" : "18px 16px 14px",
           display: "flex",
           alignItems: "center",
-          gap: 9,
+          gap: 10,
           justifyContent: compact ? "center" : "flex-start",
         }}
       >
-        <Logo size={20} color={accent} />
+        <Logo size={24} color={accent} />
         {!compact && (
-          <div>
+          <div style={{ lineHeight: 1.15 }}>
             <div
               style={{
-                fontSize: 13,
+                fontSize: 15,
                 fontWeight: 700,
                 color: inkStrong,
-                letterSpacing: "-0.01em",
-                lineHeight: 1,
+                letterSpacing: "0.02em",
+                fontFamily: C.serif,
               }}
             >
               原本
             </div>
-            <div style={{ fontSize: 9.5, color: inkMute, marginTop: 3, letterSpacing: "0.04em" }}>
-              Verum · 标书查重
+            <div style={{ fontSize: 10, color: inkMute, marginTop: 1, letterSpacing: "0.14em" }}>
+              标书查重
             </div>
           </div>
         )}

@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "原本 · 标书查重",
+        "hiddenTitle": true,
         "width": 1320,
         "height": 840,
         "minWidth": 1080,
