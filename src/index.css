@@ -45,6 +45,15 @@ button {
   }
 }
 
+/* 减少动效（设置 → 外观）：关闭动画与过渡 */
+html.reduce-motion *,
+html.reduce-motion *::before,
+html.reduce-motion *::after {
+  animation-duration: 0.001s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001s !important;
+}
+
 /* 细滚动条 */
 ::-webkit-scrollbar {
   width: 10px;

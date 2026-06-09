@@ -4,14 +4,16 @@ import { C } from "../design/tokens";
 import { Logo } from "../design/Icon";
 import { Topbar } from "../components/Topbar";
 import { Toggle, SegControl } from "../components/primitives";
-import { useTheme, type FontScale } from "../theme";
+import { useTheme, type FontScale, type Highlight } from "../theme";
 import { useToast } from "../components/Toast";
-import { getSettings, setSettings, type Settings as DetectSettings } from "../prefs";
+import { getSettings, setSettings, type Settings as DetectSettings, type Scope } from "../prefs";
 
-const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy"];
+const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy", "spacious"];
+const SCOPES: Scope[] = ["full", "tech", "business"];
+const HIGHLIGHTS: Highlight[] = ["amber", "rose", "blue"];
 
 export function Settings() {
-  const { dark, accent, mode, set, fontScale, layout } = useTheme();
+  const { dark, accent, mode, set, fontScale, layout, highlight, reduceMotion } = useTheme();
   const toast = useToast();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -31,6 +33,13 @@ export function Settings() {
         <div style={{ maxWidth: 720, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
           {/* 检测偏好 */}
           <Card title="检测偏好（新任务默认值）" cardBg={cardBg} border={border} mute={mute}>
+            <Row label="默认比对范围" sub="新任务默认比对的标段" ink={ink} mute={mute}>
+              <SegControl
+                options={["完整文档", "仅技术标", "仅商务标"]}
+                value={Math.max(0, SCOPES.indexOf(s.scope))}
+                onChange={(i) => change({ scope: SCOPES[i] })}
+              />
+            </Row>
             <Row label="默认相似度阈值" sub="新任务的初始阈值，可在任务页临时调整" ink={ink} mute={mute}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <input
@@ -81,9 +90,16 @@ export function Settings() {
           <Card title="外观" cardBg={cardBg} border={border} mute={mute}>
             <Row label="界面字号" sub="整体放大或缩小界面与文字" ink={ink} mute={mute}>
               <SegControl
-                options={["小", "标准", "大"]}
+                options={["小", "标准", "大", "特大"]}
                 value={Math.max(0, FONT_SCALES.indexOf(fontScale))}
                 onChange={(i) => set({ fontScale: FONT_SCALES[i] })}
+              />
+            </Row>
+            <Row label="雷同高亮配色" sub="逐对对比中雷同片段的标注颜色" ink={ink} mute={mute}>
+              <SegControl
+                options={["琥珀", "玫红", "靛蓝"]}
+                value={Math.max(0, HIGHLIGHTS.indexOf(highlight))}
+                onChange={(i) => set({ highlight: HIGHLIGHTS[i] })}
               />
             </Row>
             <Row label="紧凑侧栏" sub="折叠侧栏文字只留图标，腾出更多内容空间" ink={ink} mute={mute}>
@@ -91,6 +107,9 @@ export function Settings() {
                 on={layout === "compact"}
                 onChange={() => set({ layout: layout === "compact" ? "comfort" : "compact" })}
               />
+            </Row>
+            <Row label="减少动效" sub="关闭进度脉冲与过渡动画" ink={ink} mute={mute}>
+              <Toggle on={reduceMotion} onChange={() => set({ reduceMotion: !reduceMotion })} />
             </Row>
             <Row label="深色模式" sub="浅色 / 深色 / 跟随系统" ink={ink} mute={mute} last>
               <SegControl

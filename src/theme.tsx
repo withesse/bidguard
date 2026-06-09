@@ -4,7 +4,7 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 export type Mode = "light" | "dark" | "system";
 export type Highlight = "amber" | "rose" | "blue";
 export type Layout = "comfort" | "compact";
-export type FontScale = "compact" | "regular" | "comfy";
+export type FontScale = "compact" | "regular" | "comfy" | "spacious";
 
 export interface Theme {
   mode: Mode;
@@ -13,6 +13,7 @@ export interface Theme {
   highlight: Highlight;
   layout: Layout;
   fontScale: FontScale;
+  reduceMotion: boolean;
 }
 
 const DEFAULT: Theme = {
@@ -22,6 +23,7 @@ const DEFAULT: Theme = {
   highlight: "amber",
   layout: "comfort",
   fontScale: "regular",
+  reduceMotion: false,
 };
 
 const STORAGE_KEY = "bidguard-theme";
@@ -64,7 +66,7 @@ interface ThemeCtx extends Theme {
 const ThemeContext = createContext<ThemeCtx>({ ...DEFAULT, set: () => {} });
 
 // 界面字号 = webview 缩放（等比放大字体+界面，不撑破布局）
-const ZOOM: Record<FontScale, number> = { compact: 0.9, regular: 1.0, comfy: 1.2 };
+const ZOOM: Record<FontScale, number> = { compact: 0.9, regular: 1.0, comfy: 1.15, spacious: 1.35 };
 function applyZoom(scale: FontScale) {
   const z = ZOOM[scale] ?? 1;
   if (typeof window === "undefined") return;
@@ -82,6 +84,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     applyZoom(t.fontScale);
   }, [t.fontScale]);
+  useEffect(() => {
+    if (typeof document !== "undefined")
+      document.documentElement.classList.toggle("reduce-motion", t.reduceMotion);
+  }, [t.reduceMotion]);
   const set = (patch: Partial<Theme>) =>
     setT((prev) => {
       const next = { ...prev, ...patch };

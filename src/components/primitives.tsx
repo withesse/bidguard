@@ -260,6 +260,7 @@ export function SegControl({
           style={{
             flex: 1,
             textAlign: "center",
+            whiteSpace: "nowrap",
             padding: "5px 12px",
             fontSize: 11.5,
             fontWeight: 600,
