@@ -2,14 +2,13 @@
 // 任务导向，个人版（无团队/工作区）。
 import { C } from "../design/tokens";
 import { Icon } from "../design/Icon";
-import { Logo } from "../design/Icon";
 import { useTheme } from "../theme";
 import type { Screen } from "../routes";
 
 export type NavKey = "home" | "tasks" | "history" | "library" | "settings";
 
 export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) => void }) {
-  const { dark, accent, layout } = useTheme();
+  const { dark, layout } = useTheme();
   const compact = layout === "compact";
   const bg = dark ? "#15151B" : C.paper2;
   const border = dark ? "rgba(255,255,255,0.06)" : C.line;
@@ -49,9 +48,15 @@ export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) 
           justifyContent: compact ? "center" : "flex-start",
         }}
       >
-        <Logo size={24} color={accent} />
+        <img
+          src="/icon.png"
+          alt="原本"
+          width={36}
+          height={36}
+          style={{ borderRadius: 9, display: "block", flexShrink: 0 }}
+        />
         {!compact && (
-          <div style={{ lineHeight: 1.15 }}>
+          <div style={{ lineHeight: 1.1 }}>
             <div
               style={{
                 fontSize: 15,
