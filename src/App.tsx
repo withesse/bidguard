@@ -198,7 +198,9 @@ function App() {
       {screen === "history" && (
         <Tasks onGo={setScreen} onOpen={openTask} title="历史记录" mode="all" />
       )}
-      {screen === "scan" && <Scan onGo={setScreen} progress={progress} files={pending} />}
+      {screen === "scan" && (
+        <Scan onGo={setScreen} progress={progress} files={pending} semantic={settings.semantic} />
+      )}
       {screen === "settings" && <Settings />}
       {screen === "matrix" && <MatrixScreen onGo={setScreen} report={report} />}
       {screen === "compare" && <Compare onGo={setScreen} report={report} />}

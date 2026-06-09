@@ -6,10 +6,13 @@ pub fn embed(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Some(Vec::new());
     }
-    let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::MultilingualE5Small).with_show_download_progress(false),
-    )
-    .ok()?;
+    let mut opts =
+        InitOptions::new(EmbeddingModel::MultilingualE5Small).with_show_download_progress(false);
+    // 稳定的绝对缓存目录：打包后 cwd=/ 不可写，必须显式指定，否则模型加载/下载失败
+    if let Some(home) = std::env::var_os("HOME") {
+        opts = opts.with_cache_dir(std::path::PathBuf::from(home).join(".cache/bidguard/fastembed"));
+    }
+    let mut model = TextEmbedding::try_new(opts).ok()?;
     let docs: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
     model.embed(docs, None).ok()
 }

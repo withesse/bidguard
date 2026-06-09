@@ -12,37 +12,58 @@ export function Scan({
   onGo,
   progress,
   files,
+  semantic = false,
 }: {
   onGo: (s: Screen) => void;
   progress?: Progress | null;
   files?: string[];
+  semantic?: boolean;
 }) {
-  if (files && files.length) return <RealScan onGo={onGo} progress={progress} files={files} />;
+  if (files && files.length)
+    return <RealScan onGo={onGo} progress={progress} files={files} semantic={semantic} />;
   return <MockScan onGo={onGo} />;
 }
 
 // ─────────────────────────────────────────────────────────────
 // 真实模式
 // ─────────────────────────────────────────────────────────────
-const STAGE_ORDER = ["parse", "compare", "cluster", "done"];
 const STAGE_LABEL: Record<string, string> = {
   parse: "解析文档 + 分词分段",
+  semantic: "语义比对 · AI 向量",
   compare: "两两段落对齐比对",
   cluster: "聚合 & 围标识别",
   done: "完成",
 };
+const stageList = (semantic: boolean) =>
+  semantic ? ["parse", "semantic", "compare", "cluster"] : ["parse", "compare", "cluster"];
 
-function overallPct(p?: Progress | null): number {
+function overallPct(p: Progress | null | undefined, semantic: boolean): number {
   if (!p) return 2;
   const within = p.total > 0 ? p.done / p.total : 0;
-  if (p.stage === "parse") return within * 35;
-  if (p.stage === "compare") return 35 + within * 55;
-  if (p.stage === "cluster") return 90 + within * 8;
   if (p.stage === "done") return 100;
-  return 0;
+  if (p.stage === "cluster") return 90 + within * 8;
+  if (semantic) {
+    if (p.stage === "parse") return within * 20;
+    if (p.stage === "semantic") return 20 + within * 20;
+    if (p.stage === "compare") return 40 + within * 50;
+  } else {
+    if (p.stage === "parse") return within * 35;
+    if (p.stage === "compare") return 35 + within * 55;
+  }
+  return 30;
 }
 
-function RealScan({ onGo, progress, files }: { onGo: (s: Screen) => void; progress?: Progress | null; files: string[] }) {
+function RealScan({
+  onGo,
+  progress,
+  files,
+  semantic,
+}: {
+  onGo: (s: Screen) => void;
+  progress?: Progress | null;
+  files: string[];
+  semantic: boolean;
+}) {
   const { dark, accent } = useTheme();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -52,8 +73,9 @@ function RealScan({ onGo, progress, files }: { onGo: (s: Screen) => void; progre
   const TAGS = ["甲", "乙", "丙", "丁", "戊"];
   const PAL = ["#4F58A8", "#0E9A8F", "#C28430", "#B54545", "#7C3AED"];
 
-  const pct = Math.round(overallPct(progress));
-  const cur = STAGE_ORDER.indexOf(progress?.stage ?? "parse");
+  const STAGES = stageList(semantic);
+  const pct = Math.round(overallPct(progress, semantic));
+  const cur = STAGES.indexOf(progress?.stage ?? "parse");
   const parsedDocs = progress?.stage === "parse" ? progress.done : files.length;
 
   return (
@@ -92,7 +114,7 @@ function RealScan({ onGo, progress, files }: { onGo: (s: Screen) => void; progre
           <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 20 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: ink, marginBottom: 12 }}>处理阶段</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {STAGE_ORDER.slice(0, 3).map((stage, i) => {
+              {STAGES.map((stage, i) => {
                 const status = cur > i ? "done" : cur === i ? "running" : "pending";
                 return (
                   <div key={stage} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, background: dark ? "rgba(255,255,255,0.02)" : "#fff", border: `1px solid ${border}` }}>
