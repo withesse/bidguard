@@ -278,4 +278,102 @@ mod tests {
             parsed.text
         );
     }
+
+    // 端到端：自动生成标书 → 跑完整引擎 → 验证围标判定 / 聚类 / 章节，并做负向对照。
+    #[test]
+    fn collusion_pipeline_on_generated_bids() {
+        let dir = std::env::temp_dir().join("bidguard_gen_bids");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: String| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, content).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+
+        // —— 围标组：甲乙技术+商务条款近乎逐字雷同；甲乙丙共有合规声明与工期条款 ——
+        let tech = "系统采用分层解耦的微服务架构设计自下而上划分为基础设施层数据资源层应用支撑层与业务应用层\n\
+各层之间通过标准化接口解耦所有业务能力对外以统一接口网关暴露确保横向可扩展与纵向可演进\n\
+平台采用读写分离与多级缓存机制保证高可用性与毫秒级的端到端响应";
+        let compliance = "本项目严格遵循国家信息安全等级保护三级标准与相关行业规范要求";
+        let schedule = "本工程建设周期为一百八十个日历日完成全部交付与验收工作";
+        let qual = "我公司具备信息系统集成及服务一级资质与软件企业认定证书";
+
+        let jia = write(
+            "甲_智慧城邦.txt",
+            format!("本技术方案由智慧城邦科技有限公司编制\n{tech}\n{compliance}\n{schedule}\n投标报价为人民币一千两百八十万元整包含全部软硬件与三年运维服务费用\n{qual}"),
+        );
+        let yi = write(
+            "乙_启明信息.txt",
+            format!("本技术方案由启明信息技术股份公司编制\n{tech}\n{compliance}\n{schedule}\n投标报价为人民币一千两百九十万元整包含全部软硬件与三年运维服务费用\n{qual}"),
+        );
+        let bing = write(
+            "丙_鸿信科技.txt",
+            format!("本技术方案由鸿信科技集团独立编写完成\n我们基于云原生容器编排技术构建弹性可伸缩的整体解决方案\n采用事件驱动与消息队列实现各子系统之间的异步协同与削峰填谷\n数据治理方面引入数据中台统一汇聚清洗与共享交换各类政务数据资源\n{compliance}\n{schedule}\n投标报价为人民币一千一百五十万元整\n我公司持有建筑智能化工程专业承包资质"),
+        );
+
+        let r = analyze(vec![jia, yi, bing], vec![], false, 0.5, "full".into(), &noop).unwrap();
+        eprintln!(
+            "[围标组] 峰值={:.2} 判定={}({:.2}) 信号={} 聚类={}(其中{}组跨≥3份) 共有特征词={}",
+            r.peak,
+            r.collusion.level,
+            r.collusion.score,
+            r.collusion.signals.len(),
+            r.clusters.len(),
+            r.clusters.iter().filter(|c| c.docs.len() >= 3).count(),
+            r.shared_terms.len()
+        );
+        for s in &r.collusion.signals {
+            eprintln!("   · {} (权重{:.2})", s.detail, s.weight);
+        }
+
+        assert!(r.peak >= 0.75, "甲乙应高度同源，实际峰值 {}", r.peak);
+        let p01 = r.pairs.iter().find(|p| p.a == 0 && p.b == 1).expect("应有甲乙对");
+        assert!(p01.matches.len() >= 4, "甲乙应有多处雷同段落，实际 {}", p01.matches.len());
+        assert!(
+            r.clusters.iter().any(|c| c.docs.len() >= 3),
+            "应存在跨 3 份文档的雷同条款"
+        );
+        assert!(r.sections.iter().any(|s| s.section == "tech"), "应识别出技术标段");
+        assert!(r.sections.iter().any(|s| s.section == "business"), "应识别出商务标段");
+        assert!(
+            matches!(r.collusion.level.as_str(), "high" | "medium"),
+            "围标组应判定为需复核(high/medium)，实际 {}",
+            r.collusion.level
+        );
+
+        // —— 负向对照：三份业务领域完全不同的独立标书，不应误判 ——
+        let a = write(
+            "独A.txt",
+            "本公司专注于城市轨道交通信号系统的设计集成与现场实施工作\n依托自主研发的列车自动控制平台保障线路运行安全与准点率".into(),
+        );
+        let b = write(
+            "独B.txt",
+            "我司主营医院信息化与电子病历平台的建设运营服务\n凭借多年三甲医院项目经验提供稳定的临床数据与诊疗支撑".into(),
+        );
+        let c = write(
+            "独C.txt",
+            "团队从事智慧农业物联网传感终端的研发生产与销售\n通过田间环境监测与作物长势分析帮助种植户增产增收".into(),
+        );
+        let r2 = analyze(vec![a, b, c], vec![], false, 0.5, "full".into(), &noop).unwrap();
+        eprintln!(
+            "[独立组] 峰值={:.2} 判定={}({:.2}) 聚类={}",
+            r2.peak,
+            r2.collusion.level,
+            r2.collusion.score,
+            r2.clusters.len()
+        );
+
+        assert!(
+            matches!(r2.collusion.level.as_str(), "none" | "low"),
+            "独立标书不应判围标，实际 {}",
+            r2.collusion.level
+        );
+        assert!(
+            r2.clusters.iter().all(|c| c.docs.len() < 3),
+            "独立标书不应出现跨 3 份的雷同条款"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
