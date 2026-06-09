@@ -1,0 +1,39 @@
+[package]
+name = "bidguard"
+version = "0.1.0"
+description = "原本 · 标书查重 — 离线标书交叉比对与围标识别"
+authors = ["原本 Verum"]
+edition = "2021"
+
+[lib]
+# `_lib` 后缀避免与 bin 重名（Windows 下的已知问题）
+name = "bidguard_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 引擎依赖（纯 Rust，无系统库依赖）
+zip = { version = "2", default-features = false, features = ["deflate"] } # 解 docx(zip)
+quick-xml = "0.36"   # 解析 docx 正文与元数据 XML
+jieba-rs = "0.7"     # 中文分词
+pdf-extract = "0.7"  # PDF 文本抽取回落（纯 Rust，文本型 PDF）
+pdfium-render = "0.8" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
+lopdf = "0.34"       # 读 PDF 元数据指纹（Info 字典）
+similar = "2"        # 字符级 diff（逐对对比高亮）
+rust_xlsxwriter = "0.79" # 导出 Excel 报告
+fastembed = "5"      # 语义查重（中文 embedding；ort rc.12，与 oar-ocr 对齐）
+oar-ocr = "0.6"      # 扫描件中文 OCR（PaddleOCR ONNX via ort rc.12）
+image = "0.25"       # 栅格化 PDF 页 → RgbImage 喂 OCR
+encoding_rs = "0.8"  # GBK/GB18030 文本解码（国标编码标书）
+
+# 计划中（需要原生库/模型/下载，先不引入以保证干净构建）：
+# pdfium-render —— 更强鲁棒性的 PDF 抽取（需随包带原生 libpdfium）
+# fastembed / candle / ort —— 语义查重（中文 embedding）
+# leptess / RapidOCR(ort) —— 扫描件 OCR（或走 Python sidecar）

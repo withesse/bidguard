@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    # 用 macOS：仓库内置 libpdfium.dylib + ONNX Runtime 可用，pdfium / 引擎测试可真实运行
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装前端依赖
+        run: npm install
+      - name: 前端类型检查 + 构建
+        run: npm run build
+      - name: 引擎单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
