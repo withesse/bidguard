@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>原本 · 标书查重 · 2-5 份交叉比对 · macOS / Windows</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&family=Noto+Serif+SC:wght@400;500;600;700;900&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      font-family: "Inter", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+      color: #16161B;
+      background: #f0eee9;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+    button { font-family: inherit; }
+    a { text-decoration: none; }
+    @keyframes cpulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.85); }
+    }
+  </style>
+</head>
+<body>
+  <template id="__bundler_thumbnail" data-bg-color="#f0eee9">
+    <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+      <rect width="1200" height="800" fill="#f0eee9"/>
+      <!-- Brand mark -->
+      <rect x="540" y="240" width="120" height="120" rx="26" fill="#4F58A8"/>
+      <text x="600" y="332" text-anchor="middle"
+        font-family="Noto Serif SC, Georgia, serif" font-weight="700"
+        font-size="78" fill="white" letter-spacing="-2">原</text>
+      <!-- 2x2 matrix dots representing N×N -->
+      <g transform="translate(540 410)">
+        <rect x="0"  y="0"  width="50" height="50" rx="8" fill="#EEEBE2"/>
+        <rect x="60" y="0"  width="50" height="50" rx="8" fill="#B85546"/>
+        <rect x="0"  y="60" width="50" height="50" rx="8" fill="#B85546"/>
+        <rect x="60" y="60" width="50" height="50" rx="8" fill="#EEEBE2"/>
+      </g>
+      <text x="600" y="572" text-anchor="middle"
+        font-family="Inter, Noto Sans SC, sans-serif" font-weight="700"
+        font-size="28" fill="#16161B" letter-spacing="-0.5">原本 · 标书查重</text>
+      <text x="600" y="606" text-anchor="middle"
+        font-family="Inter, Noto Sans SC, sans-serif" font-weight="500"
+        font-size="16" fill="#6B6B76">2-5 份标书交叉比对 · 围标识别</text>
+    </svg>
+  </template>
+  <div id="root"></div>
+
+  <!-- React + Babel -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <!-- Starter components -->
+  <script type="text/babel" src="src/design-canvas.jsx"></script>
+  <script type="text/babel" src="src/tweaks-panel.jsx"></script>
+
+  <!-- 原本 · 标书查重 -->
+  <script type="text/babel" src="src/c/tokens.jsx"></script>
+  <script type="text/babel" src="src/c/frames.jsx"></script>
+  <script type="text/babel" src="src/c/shell.jsx"></script>
+  <script type="text/babel" src="src/c/bid-a.jsx"></script>
+  <script type="text/babel" src="src/c/bid-b.jsx"></script>
+  <script type="text/babel" src="src/c/bid-c.jsx"></script>
+  <script type="text/babel" src="src/c/bid-app.jsx"></script>
+</body>
+</html>
