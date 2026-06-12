@@ -1,11 +1,22 @@
-// 围标综合判定：把文本相似度、跨文档雷同条款、元数据同源、共有特征词加权成一个结论。
+// 围标综合判定：把文本相似度、跨文档雷同条款、元数据同源、共有特征词、
+// 报价梯度（金额接近但条款雷同）加权成一个结论。
 use crate::engine::report::{Cluster, Collusion, CollusionSignal, DocInfo, SharedTerm};
 
-pub fn assess(
+/// 报价梯度信号：两文档报价差距很小（围标常见的「陪标价」），且多处条款雷同。
+pub struct PriceProximity {
+    pub a: usize,
+    pub b: usize,
+    pub amount_a: u64,
+    pub amount_b: u64,
+    pub gap_pct: f32,
+}
+
+pub fn assess_with(
     peak: f32,
     clusters: &[Cluster],
     docs: &[DocInfo],
     shared_terms: &[SharedTerm],
+    price_pairs: &[PriceProximity],
 ) -> Collusion {
     let mut signals = Vec::new();
     let mut score = 0.0f32;
@@ -61,6 +72,34 @@ pub fn assess(
             kind: "sharedTerms".into(),
             detail: format!("{} 个罕见特征词被多份标书共用", shared_terms.len()),
             weight: 0.1,
+        });
+    }
+
+    // 5) 报价梯度雷同：金额仅差几个百分点 + 多处条款雷同，是典型的围标陪标特征。
+    // 多对接近时全部列出（最多 3 对），权重记一次（同一类证据不叠加）。
+    if !price_pairs.is_empty() {
+        const STEMS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+        let tag = |i: usize| STEMS.get(i).copied().unwrap_or("?");
+        let shown: Vec<String> = price_pairs
+            .iter()
+            .take(3)
+            .map(|p| {
+                format!(
+                    "「{}」「{}」差 {:.1}%（{} vs {} 元）",
+                    tag(p.a),
+                    tag(p.b),
+                    p.gap_pct * 100.0,
+                    p.amount_a,
+                    p.amount_b
+                )
+            })
+            .collect();
+        let w = 0.15;
+        score += w;
+        signals.push(CollusionSignal {
+            kind: "facts".into(),
+            detail: format!("报价梯度雷同：{}，且相关文档多处条款雷同", shown.join("；")),
+            weight: w,
         });
     }
 

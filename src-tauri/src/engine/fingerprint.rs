@@ -2,7 +2,7 @@
 use crate::engine::report::DocInfo;
 use std::collections::HashMap;
 
-const LABELS: [&str; 5] = ["甲", "乙", "丙", "丁", "戊"];
+const LABELS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
 
 fn label(i: usize) -> &'static str {
     LABELS.get(i).copied().unwrap_or("?")

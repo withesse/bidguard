@@ -39,7 +39,7 @@ pub struct Progress {
 }
 
 /// 字符级差异片段。op: "eq"(相同) | "ins"(B 增) | "del"(A 删)。
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffOp {
     pub op: String,
