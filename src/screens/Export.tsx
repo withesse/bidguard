@@ -1,16 +1,23 @@
 // 屏 7 · 导出报告 —— 移植自 app-design/project/src/c/bid-c.jsx (BidScrExport)
+// 有 jobId 时走新通路（后端从 DB 装配，报告含八类统计/事实冲突/配置快照）。
 import { Fragment, useState, type ReactNode } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import { C, severityColor } from "../design/tokens";
 import { Topbar } from "../components/Topbar";
 import { Button, DocChip, Toggle } from "../components/primitives";
 import { useTheme } from "../theme";
-import { isTauri, exportReport, type ExportKind, type Report } from "../engine";
+import { errMsg, isTauri } from "../api/client";
+import { exportReport as exportReportV2 } from "../api";
+import { useAppSettings } from "../queries/data";
 import { useToast } from "../components/Toast";
 
-const FORMATS: { t: string; label: string; sub: string; kind: ExportKind }[] = [
-  { t: "html", label: "网页 / PDF", sub: "浏览器可打印为 PDF", kind: "html" },
-  { t: "docx", label: "Word", sub: "可继续编辑", kind: "docx" },
-  { t: "xls", label: "Excel", sub: "矩阵 + 明细", kind: "xlsx" },
+const FORMATS: { t: string; label: string; sub: string; kind: string; ext: string }[] = [
+  { t: "html", label: "网页 / PDF", sub: "浏览器可打印为 PDF", kind: "html", ext: "html" },
+  { t: "docx", label: "Word", sub: "可继续编辑", kind: "docx", ext: "docx" },
+  { t: "xls", label: "Excel", sub: "矩阵 + 明细 + 冲突", kind: "xlsx", ext: "xlsx" },
+  { t: "json", label: "JSON", sub: "系统集成 / 二次处理", kind: "json", ext: "json" },
+  { t: "md", label: "Markdown", sub: "文本归档 / 知识库", kind: "markdown", ext: "md" },
+  { t: "csv", label: "CSV", sub: "条款明细表格化", kind: "csv", ext: "csv" },
 ];
 
 const INCLUDE = [
@@ -23,7 +30,7 @@ const INCLUDE = [
   "工商关联辅助参考（若启用）",
 ];
 
-export function Export({ report }: { report?: Report | null }) {
+export function Export({ jobId }: { jobId?: string }) {
   const { dark, accent } = useTheme();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -32,24 +39,62 @@ export function Export({ report }: { report?: Report | null }) {
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
   const toast = useToast();
 
-  const [fmt, setFmt] = useState(0);
+  // 默认格式来自用户全局设置（export.defaultFormat），未设置时 html
+  const { data: appCfg } = useAppSettings();
+  const defaultKind =
+    ((appCfg as Record<string, Record<string, unknown>> | undefined)?.export
+      ?.defaultFormat as string) ?? "html";
+  const [fmt, setFmt] = useState(() =>
+    Math.max(0, FORMATS.findIndex((f) => f.kind === defaultKind)),
+  );
   const [checks, setChecks] = useState<boolean[]>(INCLUDE.map((_, i) => i < 6));
   const [security, setSecurity] = useState<boolean[]>([true, true, true]);
+  const [lastExport, setLastExport] = useState<{ path: string; label: string } | null>(null);
 
   const toggleCheck = (i: number) => setChecks((c) => c.map((v, j) => (j === i ? !v : v)));
   const toggleSec = (i: number) => setSecurity((s) => s.map((v, j) => (j === i ? !v : v)));
 
   const onExport = async () => {
-    if (!report || !isTauri()) {
+    if (!isTauri()) {
+      toast.show("导出仅在桌面应用内可用", "warn");
+      return;
+    }
+    if (!jobId) {
       toast.show("请先在应用内完成一次查重，再导出报告", "warn");
       return;
     }
     const f = FORMATS[fmt];
     try {
-      const p = await exportReport(report, f.kind);
-      if (p) toast.show(`已导出 ${f.label} 报告：${p}`, "success");
+      const path = await save({
+        title: `导出${f.label}报告`,
+        defaultPath: `标书查重报告.${f.ext}`,
+        filters: [{ name: f.label, extensions: [f.ext] }],
+      });
+      if (!path) return;
+      await exportReportV2(jobId, f.kind, path);
+      setLastExport({ path, label: f.label });
+      toast.show(`已导出 ${f.label} 报告`, "success");
     } catch (e) {
-      toast.show("导出失败：" + String(e), "error");
+      toast.show("导出失败：" + errMsg(e), "error");
+    }
+  };
+
+  const openExported = async () => {
+    if (!lastExport) return;
+    try {
+      const { openPath } = await import("@tauri-apps/plugin-opener");
+      await openPath(lastExport.path);
+    } catch (e) {
+      toast.show("打开失败：" + errMsg(e), "error");
+    }
+  };
+  const revealExported = async () => {
+    if (!lastExport) return;
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(lastExport.path);
+    } catch (e) {
+      toast.show("定位失败：" + errMsg(e), "error");
     }
   };
 
@@ -57,7 +102,7 @@ export function Export({ report }: { report?: Report | null }) {
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
         title="导出报告"
-        sub="市政信息化平台采购 · 4 份标书 · 6 对比对"
+        sub="选择格式与范围，导出本地查重报告（含八类统计与事实冲突）"
         actions={
           <Button
             kind="primary"
@@ -69,6 +114,30 @@ export function Export({ report }: { report?: Report | null }) {
           </Button>
         }
       />
+      {lastExport && (
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "8px 48px",
+            borderBottom: `1px solid ${border}`,
+            fontSize: 12,
+            color: mute,
+          }}
+        >
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+            已导出 {lastExport.label} 报告：{lastExport.path}
+          </span>
+          <Button kind="secondary" size="sm" onClick={openExported}>
+            打开
+          </Button>
+          <Button kind="ghost" size="sm" onClick={revealExported}>
+            在文件夹中显示
+          </Button>
+        </div>
+      )}
       <div style={{ flex: 1, overflow: "auto", padding: "28px 48px 40px" }}>
         <div style={{ maxWidth: 1100, margin: "0 auto", display: "grid", gridTemplateColumns: "420px 1fr", gap: 18 }}>
           {/* 左：选项 */}

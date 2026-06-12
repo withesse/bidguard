@@ -113,6 +113,8 @@ export function Button({
   dark: darkProp,
   style,
   onClick,
+  disabled,
+  title,
 }: {
   kind?: ButtonKind;
   size?: ButtonSize;
@@ -123,6 +125,8 @@ export function Button({
   dark?: boolean;
   style?: CSSProperties;
   onClick?: () => void;
+  disabled?: boolean;
+  title?: string;
 }) {
   const th = useTheme();
   const accent = accentProp ?? th.accent;
@@ -160,6 +164,8 @@ export function Button({
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
+      title={title}
       style={{
         height: sizes.h,
         padding: `0 ${sizes.px}px`,
@@ -172,7 +178,8 @@ export function Button({
         display: "inline-flex",
         alignItems: "center",
         gap: sizes.gap,
-        cursor: "pointer",
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.5 : 1,
         boxShadow: k.shadow,
         fontFamily: C.font,
         letterSpacing: "-0.005em",

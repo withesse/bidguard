@@ -7,10 +7,9 @@ import { Button, Pill } from "../components/primitives";
 import { useTheme, type Highlight } from "../theme";
 import type { Screen } from "../routes";
 import type { Report, DiffOp } from "../engine";
+import { docColor, docTag } from "../utils/docTag";
 
 type HiScheme = Record<string, string>;
-const TAGS = ["甲", "乙", "丙", "丁", "戊"];
-const PAL = ["#4F58A8", "#0E9A8F", "#C28430", "#B54545", "#7C3AED"];
 
 function hiScheme(name: Highlight): HiScheme {
   if (name === "rose")
@@ -40,13 +39,13 @@ function RealCompare({ report, onGo }: { report: Report; onGo: (s: Screen) => vo
   const pairs = useMemo(() => [...report.pairs].sort((a, b) => b.score - a.score), [report.pairs]);
   const [sel, setSel] = useState(0);
   const pair = pairs[sel] ?? pairs[0];
-  const docName = (i: number) => report.docs[i]?.name ?? TAGS[i] ?? "?";
+  const docName = (i: number) => report.docs[i]?.name ?? docTag(i);
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
         title="逐对对比"
-        sub={`${TAGS[pair.a]} ${docName(pair.a)} × ${TAGS[pair.b]} ${docName(pair.b)} · ${pair.matches.length} 处匹配`}
+        sub={`${docTag(pair.a)} ${docName(pair.a)} × ${docTag(pair.b)} ${docName(pair.b)} · ${pair.matches.length} 处匹配`}
         actions={
           <Button kind="primary" size="md" icon="check" onClick={() => onGo("matrix")}>
             返回报告
@@ -157,7 +156,7 @@ function Tag({ idx, size = 18 }: { idx: number; size?: number }) {
         width: size,
         height: size,
         borderRadius: 4,
-        background: PAL[idx] ?? C.brand,
+        background: docColor(idx),
         color: "#fff",
         display: "flex",
         alignItems: "center",
@@ -167,7 +166,7 @@ function Tag({ idx, size = 18 }: { idx: number; size?: number }) {
         fontFamily: C.serif,
       }}
     >
-      {TAGS[idx] ?? "?"}
+      {docTag(idx)}
     </div>
   );
 }
@@ -176,7 +175,7 @@ function PaneHeader({ idx, ink }: { idx: number; ink: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
       <Tag idx={idx} size={22} />
-      <span style={{ fontSize: 12.5, fontWeight: 700, color: ink }}>{TAGS[idx]} 方</span>
+      <span style={{ fontSize: 12.5, fontWeight: 700, color: ink }}>{docTag(idx)} 方</span>
     </div>
   );
 }

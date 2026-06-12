@@ -1,35 +1,45 @@
-// 屏 · 查重源 —— 本地通用模板 / 基准库管理。命中样板的段落在查重时被剔除。
+// 屏 · 查重源 —— 通用模板 / 基准库管理（落库：导入分块时标记命中样板）。
 import { useState, type CSSProperties } from "react";
 import { C } from "../design/tokens";
 import { Icon } from "../design/Icon";
 import { Topbar } from "../components/Topbar";
 import { Button } from "../components/primitives";
 import { useTheme } from "../theme";
-import { loadTemplates, saveTemplates, newTemplateId, type Template } from "../templates";
+import { useToast } from "../components/Toast";
+import { errMsg } from "../api/client";
+import { useDeleteTemplate, useSaveTemplate, useTemplates } from "../queries/data";
 
 export function Library() {
   const { dark, accent } = useTheme();
+  const toast = useToast();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
   const bg = dark ? "#15151B" : C.paper;
   const cardBg = dark ? "rgba(255,255,255,0.04)" : C.white;
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
 
-  const [items, setItems] = useState<Template[]>(loadTemplates);
+  const { data } = useTemplates();
+  const items = data ?? [];
+  const save = useSaveTemplate();
+  const delTpl = useDeleteTemplate();
   const [name, setName] = useState("");
   const [text, setText] = useState("");
 
-  const commit = (next: Template[]) => {
-    setItems(next);
-    saveTemplates(next);
-  };
   const add = () => {
     if (!name.trim() || !text.trim()) return;
-    commit([{ id: newTemplateId(), name: name.trim(), text: text.trim() }, ...items]);
-    setName("");
-    setText("");
+    save.mutate(
+      { name: name.trim(), text: text.trim() },
+      {
+        onSuccess: () => {
+          setName("");
+          setText("");
+        },
+        onError: (e) => toast.show("保存失败：" + errMsg(e), "error"),
+      },
+    );
   };
-  const remove = (id: string) => commit(items.filter((i) => i.id !== id));
+  const remove = (id: string) =>
+    delTpl.mutate(id, { onError: (e) => toast.show("删除失败：" + errMsg(e), "error") });
 
   const inputStyle: CSSProperties = {
     width: "100%",
@@ -62,9 +72,9 @@ export function Library() {
           >
             <Icon name="book" size={18} style={{ color: accent, marginTop: 2 }} />
             <div style={{ fontSize: 12.5, color: mute, lineHeight: 1.7 }}>
-              这里维护行业通用样板（法律法规、资质目录、标准承诺等）。查重时，
-              <b style={{ color: ink }}>与这些样板高度相似的段落会被视为非可疑、不计入围标判定</b>
-              ，从而减少误报。全部存储在你本地。
+              这里维护行业通用样板（法律法规、资质目录、标准承诺等）。导入标书时，
+              <b style={{ color: ink }}>与这些样板高度相似的段落会被标记为模板、不计入雷同与围标判定</b>
+              ，从而减少误报。全部存储在你本地。修改模板后需重新导入文档才会生效。
             </div>
           </div>
 

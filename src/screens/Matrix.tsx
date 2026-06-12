@@ -9,6 +9,7 @@ import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import type { Screen } from "../routes";
 import type { Report, Fingerprint } from "../engine";
+import { docColor, docTag } from "../utils/docTag";
 
 interface ViewDoc {
   tag: string;
@@ -44,8 +45,6 @@ interface MatrixView {
   isReal: boolean;
 }
 
-const TAGS = ["甲", "乙", "丙", "丁", "戊"];
-const PAL = ["#4F58A8", "#0E9A8F", "#C28430", "#B54545", "#7C3AED"];
 
 function sev(pct: number): { c: string; label: string } {
   if (pct >= 80) return { c: C.danger, label: "高度雷同" };
@@ -119,10 +118,10 @@ const MOCK_VIEW: MatrixView = {
 function fromReport(r: Report): MatrixView {
   const n = r.docs.length;
   const docs: ViewDoc[] = r.docs.map((d, i) => ({
-    tag: TAGS[i] ?? "?",
+    tag: docTag(i),
     short: d.name.replace(/\.[^.]+$/, "").slice(0, 8),
     full: d.name,
-    color: PAL[i] ?? C.brand,
+    color: docColor(i),
     note: d.parseError ?? undefined,
     fp: d.fingerprint,
   }));
@@ -228,13 +227,13 @@ export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; repo
   };
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
+    <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
-        title="检测报告 · 市政信息化平台采购"
+        title="检测报告"
         sub={
           v.isReal
             ? `本地完成 · ${n} 份标书 · ${(n * (n - 1)) / 2} 对比对`
-            : "5 月 26 日 14:32 完成 · 4 份标书 · 6 对比对"
+            : "演示数据 · 4 份标书 · 6 对比对"
         }
         actions={
           <>
