@@ -1,9 +1,8 @@
-// 前端 ↔ Rust 引擎调用层。
-// 注意：invoke / dialog 仅在真实 Tauri 窗口内有效；浏览器预览里 isTauri() 为 false。
-import { invoke, Channel } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+// 报告数据形状（与 src-tauri/src/engine/report.rs 的 serde camelCase 输出对应）。
+// 结果屏 Matrix/Compare/Export 经 useJobReport 适配器消费这套 Report 形状；
+// 新通路的原生 DTO 在 src/api/types.ts。
+import { open } from "@tauri-apps/plugin-dialog";
 
-// 与 src-tauri/src/engine/report.rs 的 serde(camelCase) 输出一一对应
 export interface Fingerprint {
   author: string | null;
   lastModifiedBy: string | null;
@@ -57,7 +56,7 @@ export interface Cluster {
 }
 
 export interface CollusionSignal {
-  kind: string; // similarity | cluster | metadata | sharedTerms
+  kind: string; // similarity | cluster | metadata | sharedTerms | facts
   detail: string;
   weight: number;
 }
@@ -91,114 +90,13 @@ export interface Report {
   sharedTerms?: SharedTerm[];
 }
 
-export const SECTION_LABEL: Record<string, string> = {
-  tech: "技术标",
-  business: "商务标",
-  other: "其他",
-};
-
-export interface Progress {
-  stage: "parse" | "compare" | "cluster" | "done" | string;
-  done: number;
-  total: number;
-  note: string;
-}
-
-/** 是否运行在真实 Tauri 窗口内（用于在浏览器预览中优雅降级到演示数据）。 */
-export function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
-/** 弹出系统文件选择框，选择 2-5 份标书，返回绝对路径数组。 */
+/** 弹出系统文件选择框，选择待比对的标书，返回绝对路径数组。 */
 export async function pickBidFiles(): Promise<string[]> {
   const sel = await open({
     multiple: true,
-    title: "选择 2 至 5 份标书",
-    filters: [{ name: "标书文件", extensions: ["docx", "pdf", "txt", "md"] }],
+    title: "选择 2 至 10 份标书",
+    filters: [{ name: "标书文件", extensions: ["docx", "pdf", "txt", "md", "xlsx", "xls"] }],
   });
   if (!sel) return [];
   return Array.isArray(sel) ? sel : [sel];
-}
-
-/** 调用 Rust 引擎做交叉比对；templates 为查重源样板（命中则剔除）；onProgress 实时回传进度。 */
-export function runAnalysis(
-  paths: string[],
-  templates: string[],
-  semantic: boolean,
-  threshold: number,
-  scope: string,
-  onProgress?: (p: Progress) => void,
-): Promise<Report> {
-  const channel = new Channel<Progress>();
-  if (onProgress) channel.onmessage = onProgress;
-  return invoke<Report>("analyze_paths", {
-    paths,
-    templates,
-    semantic,
-    threshold,
-    scope,
-    onProgress: channel,
-  });
-}
-
-export interface DocMeta {
-  pages: number;
-  charCount: number;
-}
-
-/** 解析单个文件，返回页数/字数（用于候选槽位即时状态与早期校验）。失败时 reject。 */
-export function parseMeta(path: string): Promise<DocMeta> {
-  return invoke<DocMeta>("parse_meta", { path });
-}
-
-// —— 历史任务持久化 ——
-export interface TaskSummary {
-  id: string;
-  name: string;
-  createdAt: number;
-  docCount: number;
-  pairCount: number;
-  clusterCount: number;
-  peak: number;
-  collusionLevel?: string; // high|medium|low|none（旧任务可能缺，回落用 peak）
-  matrix: number[][];
-}
-
-export function saveTask(name: string, report: Report): Promise<string> {
-  return invoke<string>("save_task", { name, report });
-}
-export function listTasks(): Promise<TaskSummary[]> {
-  return invoke<TaskSummary[]>("list_tasks");
-}
-export function getTask(id: string): Promise<Report> {
-  return invoke<Report>("get_task", { id });
-}
-export function deleteTask(id: string): Promise<void> {
-  return invoke<void>("delete_task", { id });
-}
-
-export type ExportKind = "xlsx" | "docx" | "html";
-
-const EXPORT_META: Record<ExportKind, { title: string; name: string; ext: string; cmd: string }> = {
-  xlsx: { title: "导出 Excel 报告", name: "标书查重报告.xlsx", ext: "xlsx", cmd: "export_excel" },
-  docx: { title: "导出 Word 报告", name: "标书查重报告.docx", ext: "docx", cmd: "export_docx" },
-  html: { title: "导出网页报告（可打印为 PDF）", name: "标书查重报告.html", ext: "html", cmd: "export_html" },
-};
-
-/** 导出报告（xlsx / docx / html）；弹保存框选路径，返回保存路径（取消则 null）。 */
-export async function exportReport(report: Report, kind: ExportKind): Promise<string | null> {
-  const meta = EXPORT_META[kind];
-  const path = await save({
-    title: meta.title,
-    defaultPath: meta.name,
-    filters: [{ name: meta.title, extensions: [meta.ext] }],
-  });
-  if (!path) return null;
-  await invoke<void>(meta.cmd, { report, path });
-  return path;
-}
-
-/** 兼容旧调用：导出 Excel。 */
-export function exportExcel(report: Report): Promise<string | null> {
-  return exportReport(report, "xlsx");
 }
