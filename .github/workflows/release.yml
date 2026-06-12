@@ -44,14 +44,19 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 默认产出未签名包。配置好证书后，在此加回这些 secrets 即可启用签名/公证/自动更新：
+          # 自动更新签名：私钥与密码存在 GitHub Secrets。
+          # tauri.conf.json 已配 createUpdaterArtifacts:true + 公钥，构建时生成 .sig 与 latest.json。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS 证书/公证（可选；配好后补 secrets 即生效）：
           #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
           #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
-          #   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "BidGuard ${{ github.ref_name }}"
-          releaseBody: "原本 · 标书查重 —— 本地标书交叉比对与围标识别。"
+          releaseBody: "原本 · 标书查重 —— 本地标书交叉比对与围标识别。发布草稿后 latest.json 才对旧版本生效。"
           releaseDraft: true
           prerelease: false
+          # 生成并上传 latest.json（自动更新清单）
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

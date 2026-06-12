@@ -15,9 +15,15 @@ jobs:
         with:
           node-version: 20
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: 安装前端依赖
         run: npm install
-      - name: 前端类型检查 + 构建
+      - name: 前端类型检查 + 构建（含 tsc）
         run: npm run build
+      - name: 前端单元测试
+        run: npm test
+      - name: Clippy（警告即失败）
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
       - name: 引擎单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
