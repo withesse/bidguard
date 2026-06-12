@@ -17,6 +17,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-window-state = "2"
+tauri-plugin-opener = "2"    # 导出后用系统默认程序打开报告 / Finder 定位
+tauri-plugin-log = "2"       # 日志落盘（app_log_dir，不含正文）
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -33,6 +36,20 @@ fastembed = "5"      # 语义查重（中文 embedding；ort rc.12，与 oar-ocr
 oar-ocr = "0.6"      # 扫描件中文 OCR（PaddleOCR ONNX via ort rc.12）
 image = "0.25"       # 栅格化 PDF 页 → RgbImage 喂 OCR
 encoding_rs = "0.8"  # GBK/GB18030 文本解码（国标编码标书）
+r2d2_sqlite = { version = "0.34.0", features = ["bundled"] }
+r2d2 = "0.8.10"
+thiserror = "2.0.18"
+chrono = "0.4.45"
+rusqlite = "0.39"
+uuid = { version = "1.23.3", features = ["v4"] }
+sha2 = "0.11.0"
+rayon = "1.12.0"
+regex = "1.12.4"
+twox-hash = "2.1.2"
+unicode-normalization = "0.1.25"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+calamine = { version = "0.35.0", features = ["dates"] }
 
 # 计划中（需要原生库/模型/下载，先不引入以保证干净构建）：
 # pdfium-render —— 更强鲁棒性的 PDF 抽取（需随包带原生 libpdfium）
