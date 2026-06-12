@@ -336,7 +336,7 @@ export function Settings() {
 
           <div style={{ fontSize: 11, color: mute, textAlign: "center", padding: "8px 0 20px" }}>
             <Logo size={20} color={accent} style={{ verticalAlign: "middle", marginRight: 6 }} />
-            <span style={{ verticalAlign: "middle" }}>原本 · Verum · 标书查重 v0.1.0</span>
+            <span style={{ verticalAlign: "middle" }}>原本 · Verum · 标书查重 v0.2.0</span>
           </div>
         </div>
       </div>

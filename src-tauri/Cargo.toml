@@ -1,6 +1,6 @@
 [package]
 name = "bidguard"
-version = "0.1.0"
+version = "0.2.0"
 description = "原本 · 标书查重 — 离线标书交叉比对与围标识别"
 authors = ["原本 Verum"]
 edition = "2021"
