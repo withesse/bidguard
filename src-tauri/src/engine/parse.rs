@@ -186,8 +186,7 @@ pub fn strip_header_footer(blocks: &mut [Block]) {
         if let Some(k) = blocks[i]
             .text
             .lines()
-            .filter(|l| !l.trim().is_empty())
-            .next_back()
+            .rfind(|l| !l.trim().is_empty())
             .and_then(key)
         {
             *last_freq.entry(k).or_insert(0) += 1;

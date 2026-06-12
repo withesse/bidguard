@@ -28,15 +28,6 @@ pub struct DocInfo {
     pub parse_error: Option<String>, // 该份解析失败时的原因（不影响整体）
 }
 
-/// 进度事件（检测中实时反馈）。stage: parse | compare | cluster | done
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Progress {
-    pub stage: String,
-    pub done: usize,
-    pub total: usize,
-    pub note: String,
-}
 
 /// 字符级差异片段。op: "eq"(相同) | "ins"(B 增) | "del"(A 删)。
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -120,19 +111,3 @@ pub struct SharedTerm {
     pub docs: Vec<usize>,
 }
 
-/// 交叉比对报告。
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Report {
-    pub docs: Vec<DocInfo>,        // 文档顺序对应矩阵行列（甲乙丙丁戊）
-    pub matrix: Vec<Vec<f32>>,     // n×n 文档级相似度，对角线为 1.0
-    pub peak: f32,                 // 非对角线最大相似度（峰值）
-    pub pairs: Vec<PairDetail>,    // 逐对对比：每对文档的匹配段落 + diff
-    pub clusters: Vec<Cluster>,    // 重复条款：跨文档雷同段落聚合
-    #[serde(default)]
-    pub collusion: Collusion, // 围标综合判定
-    #[serde(default)]
-    pub sections: Vec<SectionStat>, // 章节热力
-    #[serde(default)]
-    pub shared_terms: Vec<SharedTerm>, // 共有特征词
-}

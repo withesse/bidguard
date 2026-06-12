@@ -355,7 +355,7 @@ fn hash_file(path: &Path, ctx: &JobCtx) -> AppResult<String> {
         h.update(&buf[..n]);
         blocks += 1;
         // 每 ~16MB 检查一次取消，超大文件也能秒级响应
-        if blocks % 256 == 0 {
+        if blocks.is_multiple_of(256) {
             ctx.check()?;
         }
     }
@@ -469,7 +469,7 @@ mod tests {
         let f = write(&dir, "shared.txt", "系统采用事件驱动与消息队列实现各子系统之间的异步协同与削峰填谷处理。");
 
         let (ctx, _) = ctx_for(&pool, &ws1, false);
-        run_import(&ctx, jieba.clone(), &ws1, &[f.clone()], &Default::default()).unwrap();
+        run_import(&ctx, jieba.clone(), &ws1, std::slice::from_ref(&f), &Default::default()).unwrap();
 
         let ws2 = {
             let conn = pool.get().unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let bad = write(&dir, "bid.docx", "这不是一个 zip 文件");
 
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba.clone(), &ws, &[bad.clone()], &Default::default()).unwrap();
+        run_import(&ctx, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default()).unwrap();
         {
             let conn = pool.get().unwrap();
             let docs = document_repo::list(&conn, &ws).unwrap();
@@ -603,7 +603,7 @@ mod tests {
 
         // 同一文件重试：不应被去重跳过，旧失败行应被清掉（仍失败但是新一次尝试）
         let (ctx2, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx2, jieba.clone(), &ws, &[bad.clone()], &Default::default()).unwrap();
+        run_import(&ctx2, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default()).unwrap();
         let first_retry_id = {
             let conn = pool.get().unwrap();
             let docs = document_repo::list(&conn, &ws).unwrap();

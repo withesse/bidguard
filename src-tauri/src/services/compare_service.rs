@@ -182,7 +182,7 @@ fn run_inner(
             || (Vec::new(), HashMap::new()),
             |(mut es, mut best), &(i, j)| {
                 let n = done.fetch_add(1, Ordering::Relaxed);
-                if n % 512 == 0 {
+                if n.is_multiple_of(512) {
                     ctx.progress("score", n, total_pairs, format!("已精排 {n} / {total_pairs}"));
                 }
                 let sem = embeddings.as_ref().and_then(|e| {
@@ -750,7 +750,7 @@ fn section_stats(chunks: &[CmpChunk], best: &HashMap<u32, f32>) -> Vec<SectionSt
             matches,
         })
         .collect();
-    out.sort_by(|a, b| (a.doc, a.section.clone()).cmp(&(b.doc, b.section.clone())));
+    out.sort_by_key(|s| (s.doc, s.section.clone()));
     out
 }
 
