@@ -38,13 +38,22 @@ pub struct ParsedBlocks {
 /// 新 API：结构化段块 + 取消旗标（OCR/栅格化等长阶段逐页检查）。
 /// 取消时尽快返回 Err；调用方应先自查旗标再决定如何归类该错误。
 pub fn parse_file_blocks(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
+    parse_file_blocks_opt(path, cancel, false)
+}
+
+/// 带选项的解析。ocr_docx_images=true 时对 docx 内嵌图片做 OCR（截图式表格/资质里的文字）。
+pub fn parse_file_blocks_opt(
+    path: &Path,
+    cancel: &AtomicBool,
+    ocr_docx_images: bool,
+) -> Result<ParsedBlocks, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "docx" => parse_docx(path),
+        "docx" => parse_docx(path, cancel, ocr_docx_images),
         "txt" | "md" => parse_txt(path),
         "pdf" => parse_pdf(path, cancel),
         "xlsx" | "xls" => parse_spreadsheet(path),
@@ -227,6 +236,43 @@ pub fn strip_header_footer(blocks: &mut [Block]) {
         }
         blocks[i].text = keep.join("\n");
     }
+}
+
+/// 软换行回流（PDF/OCR 文本层）：pdfium/pdf-extract/OCR 按「视觉行」断行，每行尾都是 `\n`，
+/// 直接分块会把一个自然段拆成每行一段。这里把同一段的多行重新拼回，仅在真正的段落边界保留 `\n`。
+/// 段落边界判定：空行，或行尾是句末标点（。！？!?；;…）/右引号/冒号——中文公文里这些强烈指示段末。
+/// 拼接时中英混排按需补空格（西文词间补，CJK 相邻不补），并消解西文行尾连字符 `-`。
+/// docx/txt/md 的 `\n` 是真实段落边界，不走此回流。
+pub fn reflow_wrapped_lines(text: &str) -> String {
+    let mut paras: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let is_break_end = |c: char| matches!(c, '。' | '！' | '？' | '.' | '!' | '?' | '；' | ';' | '…' | '：' | ':' | '”' | '』' | '」' | '）' | ')');
+    for line in text.split('\n') {
+        let t = line.trim();
+        if t.is_empty() {
+            if !cur.is_empty() {
+                paras.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if !cur.is_empty() {
+            let prev = cur.chars().next_back().unwrap_or(' ');
+            let next = t.chars().next().unwrap_or(' ');
+            if prev == '-' && cur.chars().rev().nth(1).is_some_and(|c| c.is_ascii_alphabetic()) {
+                cur.pop(); // 西文行尾连字符断词 → 去连字符直接拼
+            } else if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
+                cur.push(' '); // 西文词间补空格
+            }
+        }
+        cur.push_str(t);
+        if cur.chars().next_back().is_some_and(is_break_end) {
+            paras.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        paras.push(cur);
+    }
+    paras.join("\n")
 }
 
 /// 纯页码行：仅由数字、空白与少量装饰字符（- – — / 第 页 共 .）组成且含数字。
@@ -496,13 +542,23 @@ fn pdf_decode_string(bytes: &[u8]) -> String {
     }
 }
 
-fn parse_docx(path: &Path) -> Result<ParsedBlocks, String> {
+fn parse_docx(path: &Path, cancel: &AtomicBool, ocr_images: bool) -> Result<ParsedBlocks, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("非法 docx (zip): {e}"))?;
 
     let doc_xml = read_zip(&mut zip, "word/document.xml")
         .ok_or_else(|| "docx 缺少 word/document.xml".to_string())?;
-    let (blocks, legacy_text) = docx_blocks(&doc_xml);
+    let (mut blocks, mut legacy_text) = docx_blocks(&doc_xml);
+
+    // 内嵌图片 OCR：截图式报价表/资质/公章里的文字，否则纯文本管线完全看不到
+    if ocr_images {
+        let img_blocks = docx_image_ocr(&mut zip, cancel);
+        for b in &img_blocks {
+            legacy_text.push_str(&b.text);
+            legacy_text.push('\n');
+        }
+        blocks.extend(img_blocks);
+    }
 
     let mut fp = Fingerprint::default();
     if let Some(core) = read_zip(&mut zip, "docProps/core.xml") {
@@ -524,6 +580,80 @@ fn parse_docx(path: &Path) -> Result<ParsedBlocks, String> {
         legacy_text,
         ocr_layout_json: None,
     })
+}
+
+const MAX_DOCX_IMAGES: usize = 60; // OCR 图片数上限，防止图片墙文档拖垮导入
+const MIN_OCR_IMAGE_PX: u32 = 80; // 短边阈值，跳过图标/项目符号/分隔线等装饰图
+
+/// 提取 word/media/ 下的位图，逐张 OCR，识别文本各成一个块（追加在正文之后）。
+/// 仅在 ocr_docx_images 开启时调用；模型缺失则静默返回空（与 PDF OCR 同语义）。
+/// 按内容去重（页眉 logo 等重复图只 OCR 一次），跳过过小装饰图，逐张查取消。
+fn docx_image_ocr<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    cancel: &AtomicBool,
+) -> Vec<Block> {
+    let imgs = collect_docx_images(zip, cancel);
+    if imgs.is_empty() {
+        return Vec::new();
+    }
+    let Some(pages) = crate::engine::ocr::ocr_images(imgs, cancel) else {
+        return Vec::new(); // 模型不可用 / 被取消
+    };
+    pages
+        .into_iter()
+        .filter(|p| !p.text.trim().is_empty())
+        .map(|p| Block {
+            text: p.text.trim().to_string(),
+            heading_level: None,
+            page: None,
+            is_table_row: false,
+            is_list_item: false,
+        })
+        .collect()
+}
+
+/// 从 word/media/ 收集可 OCR 的位图：按内容去重、跳过装饰小图、限量。
+fn collect_docx_images<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    cancel: &AtomicBool,
+) -> Vec<image::RgbImage> {
+    use std::collections::HashSet;
+    let names: Vec<String> = zip
+        .file_names()
+        .filter(|n| {
+            let l = n.to_ascii_lowercase();
+            l.starts_with("word/media/")
+                && [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"]
+                    .iter()
+                    .any(|e| l.ends_with(e))
+        })
+        .map(String::from)
+        .collect();
+    let mut imgs: Vec<image::RgbImage> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for name in names {
+        if cancel.load(Ordering::SeqCst) || imgs.len() >= MAX_DOCX_IMAGES {
+            break;
+        }
+        let Some(bytes) = read_zip(zip, &name) else { continue };
+        // 内容去重：同一张图（如每页页眉 logo）只收一次
+        let h = {
+            use std::hash::{Hash, Hasher};
+            let mut s = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut s);
+            s.finish()
+        };
+        if !seen.insert(h) {
+            continue;
+        }
+        // emf/wmf 矢量图、损坏图解码失败 → 跳过（无可 OCR 像素）
+        let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        if img.width() < MIN_OCR_IMAGE_PX || img.height() < MIN_OCR_IMAGE_PX {
+            continue;
+        }
+        imgs.push(img.to_rgb8());
+    }
+    imgs
 }
 
 fn read_zip<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
@@ -852,6 +982,45 @@ mod tests {
     }
 
     #[test]
+    fn reflow_joins_soft_wrapped_lines_into_paragraphs() {
+        // pdfium 式按视觉行断行：一段被拆成多行，行尾无句号者应回流拼接
+        let raw = "本项目建设目标是构建统一的智慧水务管理平台，实现各业务\n\
+                   系统的数据汇聚与共享，全面提升运营管理水平。\n\
+                   平台采用分层解耦的微服务架构，支持横向扩展。";
+        let out = reflow_wrapped_lines(raw);
+        let paras: Vec<&str> = out.split('\n').collect();
+        assert_eq!(paras.len(), 2, "应回流成 2 段，而非 3 行：{paras:?}");
+        assert_eq!(paras[0], "本项目建设目标是构建统一的智慧水务管理平台，实现各业务系统的数据汇聚与共享，全面提升运营管理水平。");
+        assert_eq!(paras[1], "平台采用分层解耦的微服务架构，支持横向扩展。");
+        // CJK 相邻拼接不补空格
+        assert!(!paras[0].contains("业务 系统"));
+    }
+
+    #[test]
+    fn reflow_handles_blank_lines_and_latin() {
+        // 空行分段；西文词间补空格、行尾连字符消解
+        let raw = "first para line one\nline two ends here.\n\nThe quick brown fox jum-\nped over.";
+        let out = reflow_wrapped_lines(raw);
+        let paras: Vec<&str> = out.split('\n').collect();
+        assert_eq!(paras.len(), 2);
+        assert_eq!(paras[0], "first para line one line two ends here.");
+        assert_eq!(paras[1], "The quick brown fox jumped over.", "连字符断词应消解：{}", paras[1]);
+    }
+
+    #[test]
+    fn reflow_via_chunker_yields_paragraph_not_per_line() {
+        let jieba = jieba_rs::Jieba::new();
+        let raw = "本项目采用分层解耦的微服务总体架构，平台自下而上划分为基础设施层、数据资源\n\
+                   层、应用支撑层与业务应用层，所有能力对外以统一接口网关暴露。";
+        let reflowed = reflow_wrapped_lines(raw);
+        let block = vec![Block { text: reflowed, heading_level: None, page: Some(3), is_table_row: false, is_list_item: false }];
+        let chunks = crate::engine::chunker::chunk(&jieba, &block, &Default::default());
+        let paras: Vec<_> = chunks.iter().filter(|c| c.chunk_level == "paragraph" && c.chunk_type == "paragraph").collect();
+        assert_eq!(paras.len(), 1, "应是 1 个完整段落，而非每行一段：{}", paras.len());
+        assert!(paras[0].text.contains("基础设施层、数据资源层"), "跨行的词应被拼回：{}", paras[0].text);
+    }
+
+    #[test]
     fn page_number_line_detection() {
         for s in ["3", "- 3 -", "第 3 页", "3 / 12", "第3页 共12页"] {
             assert!(is_page_number_line(s), "{s}");
@@ -885,6 +1054,113 @@ mod tests {
 </sheetData></worksheet>"#.as_bytes()).unwrap();
         zw.finish().unwrap();
         p
+    }
+
+    /// 纯色 PNG 字节（用于尺寸/去重测试，无文字）。
+    fn solid_png(w: u32, h: u32, lum: u8) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([lum, lum, lum]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    /// 手造带 word/media/ 图片的 docx（body_xml + 若干图片字节）。
+    fn write_docx_with_media(dir: &Path, name: &str, body_xml: &str, media: &[(&str, Vec<u8>)]) -> String {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let o = SimpleFileOptions::default();
+        zw.start_file("[Content_Types].xml", o).unwrap();
+        zw.write_all(r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="png" ContentType="image/png"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", o).unwrap();
+        let xml = format!(r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_xml}</w:body></w:document>"#);
+        zw.write_all(xml.as_bytes()).unwrap();
+        for (fname, bytes) in media {
+            zw.start_file(format!("word/media/{fname}"), o).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn open_zip(path: &str) -> zip::ZipArchive<std::fs::File> {
+        zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn docx_image_collection_filters_and_dedups() {
+        let dir = std::env::temp_dir().join(format!("bg_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = solid_png(200, 120, 200);
+        let p = write_docx_with_media(
+            &dir,
+            "img.docx",
+            "<w:p><w:r><w:t>正文</w:t></w:r></w:p>",
+            &[
+                ("image1.png", big.clone()),
+                ("image2.png", big.clone()),    // 与 image1 内容相同 → 去重
+                ("image3.png", solid_png(40, 40, 0)), // 短边 < 80 → 装饰图剔除
+                ("logo.gif", solid_png(10, 10, 0)),    // 小图 → 剔除
+            ],
+        );
+        let mut zip = open_zip(&p);
+        let imgs = collect_docx_images(&mut zip, &no_cancel());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(imgs.len(), 1, "去重 + 小图过滤后应只剩 1 张");
+        assert_eq!(imgs[0].dimensions(), (200, 120));
+    }
+
+    #[test]
+    fn docx_without_images_is_zero_cost_and_unchanged() {
+        let dir = std::env::temp_dir().join(format!("bg_noimg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 无图片的 docx：开启 ocr_docx_images 不应改变结果、不应崩
+        let body = "<w:p><w:r><w:t>本项目采用分层解耦的微服务架构设计方案。</w:t></w:r></w:p>";
+        let p = write_docx_with_media(&dir, "plain.docx", body, &[]);
+        let off = parse_file_blocks_opt(Path::new(&p), &no_cancel(), false).unwrap();
+        let on = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(off.blocks.len(), on.blocks.len(), "无图片时开关不影响块数");
+        assert!(on.blocks.iter().any(|b| b.text.contains("微服务架构")));
+    }
+
+    #[test]
+    #[ignore] // 需 pdfium + OCR 模型：cargo test docx_image_ocr -- --ignored
+    fn docx_embedded_image_text_is_ocr_recognized() {
+        // 把样例 PDF 首页栅格成 PNG 贴进 docx → 开 OCR → 应识别出已知英文词
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
+        if !fixture.exists() {
+            return;
+        }
+        let imgs = match rasterize_pdf(&fixture, &no_cancel()) {
+            Some(v) if !v.is_empty() => v,
+            _ => return, // pdfium 不可用则跳过
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(imgs.into_iter().next().unwrap())
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("bg_imgocr_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_docx_with_media(
+            &dir,
+            "scan.docx",
+            "<w:p><w:r><w:t>下表为截图。</w:t></w:r></w:p>",
+            &[("page1.png", png.into_inner())],
+        );
+        let pb = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let joined = pb.blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n").to_lowercase();
+        assert!(
+            joined.contains("bidguard") || joined.contains("gateway"),
+            "图片内文字应被 OCR 识别进块，实际：{joined:?}"
+        );
+        // 文字块（正文）也仍在
+        assert!(pb.blocks.iter().any(|b| b.text.contains("下表为截图")));
     }
 
     #[test]

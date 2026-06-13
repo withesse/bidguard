@@ -208,7 +208,7 @@ fn paragraph(ctx: &mut Ctx, text: &str, page: Option<u32>, para_type: &str) {
         ctx.out.push(c);
     }
 
-    for piece in text.split(['。', '！', '？', '；', ';']) {
+    for piece in split_sentences(text) {
         let s = piece.trim();
         if s.chars().count() < ctx.opts.min_chars {
             continue;
@@ -218,6 +218,89 @@ fn paragraph(ctx: &mut Ctx, text: &str, page: Option<u32>, para_type: &str) {
         let c = make(ctx, s, "sentence", "sentence", page, order);
         ctx.out.push(c);
     }
+}
+
+/// 「必跟名字/数字」的称谓与引用缩写（小写），其后的 `.` 不视为句末。
+/// 不含 Inc./Ltd./Co./etc. —— 这些常常本身就是句末，交给「后接大写」规则判断；
+/// e.g./i.e./U.S.A. 等由「单字母缩写」规则兜住（每个点前都是单字母）。
+const SENTENCE_ABBREVS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "st", "sr", "jr", "messrs", "gov", "sen", "rep",
+    "no", "vol", "pp", "fig", "eq", "sec", "ch",
+];
+
+/// 句子切分（中英双语）：
+/// 中文 。！？；与分号 ; 无歧义，直接断；
+/// 英文 .!? 仅当「后接空白 + 大写/数字/CJK/引号」且前词非缩写或单字母时才断
+/// （避免 Mr. / U.S. / 3.5 / e.g. 被误切）。返回原文切片。
+pub fn split_sentences(text: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in 0..n {
+        let (bi, c) = chars[i];
+        let cut = if matches!(c, '。' | '！' | '？' | '；' | ';') {
+            true
+        } else if matches!(c, '.' | '!' | '?') {
+            // 跳过句末右引号/括号后看下一个有内容的字符
+            let mut j = i + 1;
+            while j < n && matches!(chars[j].1, '"' | '\'' | ')' | ']' | '}' | '”' | '’') {
+                j += 1;
+            }
+            let next_ok = if j >= n {
+                true
+            } else if chars[j].1.is_whitespace() {
+                let mut k = j;
+                while k < n && chars[k].1.is_whitespace() {
+                    k += 1;
+                }
+                k >= n || {
+                    let nc = chars[k].1;
+                    nc.is_uppercase()
+                        || nc.is_ascii_digit()
+                        || nc as u32 >= 0x3400
+                        || matches!(nc, '"' | '\'' | '“' | '‘' | '(')
+                }
+            } else {
+                false // 后面无空白（小数 3.5 / 缩写 U.S. / 网址）→ 非句末
+            };
+            next_ok && (c != '.' || !abbrev_before(&chars, i))
+        } else {
+            false
+        };
+        if cut {
+            let end = bi + c.len_utf8();
+            out.push(&text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        let tail = &text[start..];
+        if !tail.trim().is_empty() {
+            out.push(tail);
+        }
+    }
+    out
+}
+
+/// `.` 前的连续字母构成的词是否为缩写或单字母缩写（如 Mr / U / e）。
+fn abbrev_before(chars: &[(usize, char)], dot: usize) -> bool {
+    let mut word: Vec<char> = Vec::new();
+    let mut k = dot;
+    while k > 0 {
+        k -= 1;
+        let ch = chars[k].1;
+        if ch.is_ascii_alphabetic() {
+            word.push(ch);
+        } else {
+            break;
+        }
+    }
+    if word.is_empty() {
+        return false;
+    }
+    let w: String = word.iter().rev().collect();
+    w.chars().count() == 1 || SENTENCE_ABBREVS.contains(&w.to_ascii_lowercase().as_str())
 }
 
 /// 表格行是原子比对单元：段落级与句子级各产出一份（不拆句），并累入 section 原文。
@@ -315,6 +398,41 @@ mod tests {
     use super::*;
     use crate::engine::similarity::tokenize;
 
+    #[test]
+    fn split_sentences_cjk_and_english() {
+        // 中文按 。！？；切
+        let s = split_sentences("本项目采用微服务架构。平台支持横向扩展！是否可行？");
+        assert_eq!(s, vec!["本项目采用微服务架构。", "平台支持横向扩展！", "是否可行？"]);
+
+        // 英文按 . ! ? 切（后接空格+大写）
+        let s = split_sentences("The system is scalable. It supports high concurrency! Is it ready?");
+        assert_eq!(s.len(), 3, "英文应切成 3 句：{s:?}");
+        assert_eq!(s[0].trim(), "The system is scalable.");
+
+        // 缩写不误切：Mr. / Inc. / e.g.
+        let s = split_sentences("Mr. Smith works at Acme Inc. The project is led by Dr. Lee.");
+        assert_eq!(s.len(), 2, "Mr./Inc./Dr. 不应被当句末：{s:?}");
+        assert!(s[0].contains("Acme Inc."));
+
+        // 小数与缩写点不切：3.5 / U.S.A.
+        let s = split_sentences("The budget is 3.5 million USD for the U.S.A. region.");
+        assert_eq!(s.len(), 1, "小数与 U.S.A. 内的点不应切：{s:?}");
+
+        // 中英混排
+        let s = split_sentences("系统采用 microservices 架构。Response time is under 300ms.");
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn english_paragraph_splits_into_sentences() {
+        let jieba = Jieba::new();
+        let text = "The platform adopts a microservices architecture for horizontal scaling. Each subsystem is independently deployable and observable. All capabilities are exposed through a unified API gateway.";
+        let chunks = chunk(&jieba, &blocks_md(text), &ChunkerOptions::default());
+        let sents: Vec<_> = chunks.iter().filter(|c| c.chunk_level == "sentence").collect();
+        assert_eq!(sents.len(), 3, "英文段落应切成 3 个句子级块，而非整段一句：{}", sents.len());
+        assert!(sents[0].text.contains("microservices architecture"));
+    }
+
     fn blocks_md(text: &str) -> Vec<Block> {
         vec![Block {
             text: text.to_string(),
@@ -336,10 +454,10 @@ mod tests {
         let sects: Vec<_> = chunks.iter().filter(|c| c.chunk_level == "section").collect();
 
         assert!(paras.iter().any(|c| c.chunk_type == "heading" && c.text == "第一章 总体方案"));
-        // 段落级保留整段；句子级把两句拆开
+        // 段落级保留整段；句子级把两句拆开（保留句末标点，与前端着色一致）
         assert!(paras.iter().any(|c| c.text.contains("微服务总体架构设计。平台支持")));
-        assert!(sents.iter().any(|c| c.text == "本项目采用分层解耦的微服务总体架构设计"));
-        assert!(sents.iter().any(|c| c.text == "平台支持横向扩展与读写分离机制"));
+        assert!(sents.iter().any(|c| c.text == "本项目采用分层解耦的微服务总体架构设计。"));
+        assert!(sents.iter().any(|c| c.text == "平台支持横向扩展与读写分离机制。"));
         assert_eq!(sects.len(), 2, "两个标题 → 两个 section");
 
         // 章节路径：1.1 下的内容路径应含两级

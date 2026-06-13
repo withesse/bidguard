@@ -24,6 +24,8 @@ pub struct CompareDefaults {
     pub ignore_templates: bool, // 剔除查重源模板段落（BidGuard 扩展项）
     /// 分词语言：auto（按 CJK 占比逐块判定）| zh（恒 jieba）| en（恒单词切分）。
     pub language: String,
+    /// 语义模型：e5-small（默认）| e5-base | bge-zh（见 engine::embed::MODELS）。
+    pub embedding_model: String,
 }
 
 impl Default for CompareDefaults {
@@ -41,6 +43,7 @@ impl Default for CompareDefaults {
             scope: "full".into(),
             ignore_templates: true,
             language: "auto".into(),
+            embedding_model: "e5-small".into(),
         }
     }
 }
@@ -51,6 +54,9 @@ pub struct ParserDefaults {
     pub remove_header_footer: bool,
     pub preserve_page_number: bool,
     pub detect_table: bool,
+    /// 对 docx 内嵌图片做 OCR（截图式报价表/资质/公章里的文字，否则文本管线完全看不到，
+    /// 是围标规避文本查重的常见手法）。仅当图片存在且 OCR 模型可用时实际耗时。
+    pub ocr_docx_images: bool,
     pub min_paragraph_length: usize,
 }
 
@@ -60,6 +66,7 @@ impl Default for ParserDefaults {
             remove_header_footer: true,
             preserve_page_number: true,
             detect_table: true,
+            ocr_docx_images: true,
             min_paragraph_length: 10,
         }
     }

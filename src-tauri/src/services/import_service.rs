@@ -27,6 +27,7 @@ pub struct ImportOptions {
     pub detect_table: bool,
     pub preserve_page_number: bool,
     pub remove_header_footer: bool,
+    pub ocr_docx_images: bool,
     pub language: String, // auto | zh | en
 }
 
@@ -48,6 +49,7 @@ impl ImportOptions {
             detect_table: cfg.parser.detect_table,
             preserve_page_number: cfg.parser.preserve_page_number,
             remove_header_footer: cfg.parser.remove_header_footer,
+            ocr_docx_images: cfg.parser.ocr_docx_images,
             language: cfg.compare.language.clone(),
         }
     }
@@ -55,7 +57,7 @@ impl ImportOptions {
     /// 配置指纹：跨工作区分块缓存复用的匹配键（配置不同 → 分块不可互换）。
     pub fn options_hash(&self) -> String {
         let s = format!(
-            "v2|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|lang={}",
+            "v3|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|lang={}",
             self.min_paragraph_chars,
             self.normalize.ignore_case,
             self.normalize.ignore_punctuation,
@@ -63,6 +65,7 @@ impl ImportOptions {
             self.detect_table,
             self.preserve_page_number,
             self.remove_header_footer,
+            self.ocr_docx_images,
             self.language,
         );
         crate::engine::normalize::sha256_hex(s.as_bytes())
@@ -249,7 +252,8 @@ fn import_one(
         )?
     };
 
-    let parsed = parse::parse_file_blocks(Path::new(&item.path), ctx.cancel_flag());
+    let parsed =
+        parse::parse_file_blocks_opt(Path::new(&item.path), ctx.cancel_flag(), opts.ocr_docx_images);
     if ctx.cancelled() {
         // 解析被打断的半成品不保留（该行还没有任何分块）
         let conn = ctx.db.get()?;
@@ -266,6 +270,13 @@ fn import_one(
         Ok(mut pb) => {
             if opts.remove_header_footer {
                 parse::strip_header_footer(&mut pb.blocks);
+            }
+            // PDF/OCR 文本层按视觉行断行，回流成自然段后再分块（页眉页脚清理之后做，
+            // 否则页眉/页脚/页码会被拼进正文段落，破坏其识别）
+            if matches!(pb.method, "pdfium" | "pdf-extract" | "ocr") {
+                for b in pb.blocks.iter_mut().filter(|b| !b.is_table_row) {
+                    b.text = parse::reflow_wrapped_lines(&b.text);
+                }
             }
             let chunks = chunker::chunk(jieba, &pb.blocks, chunker_opts);
             let char_count = pb.legacy_text.chars().count();
@@ -572,6 +583,43 @@ mod tests {
         let jobs = job_repo::list(&conn, Some(&ws_id)).unwrap();
         assert!(!jobs.is_empty(), "任务记录仍在");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore] // 需真实 PDF：BIDGUARD_PDF=<path> cargo test pdf_paragraph_reflow_stats -- --ignored --nocapture
+    fn pdf_paragraph_reflow_stats() {
+        let Ok(pdf) = std::env::var("BIDGUARD_PDF") else {
+            eprintln!("跳过：未设 BIDGUARD_PDF");
+            return;
+        };
+        if !std::path::Path::new(&pdf).exists() {
+            eprintln!("跳过：{pdf} 不存在");
+            return;
+        }
+        let (pool, ws, _dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba, &ws, std::slice::from_ref(&pdf), &Default::default()).unwrap();
+
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        let d = &docs[0];
+        println!("\n解析方式={:?} 页数={:?} 段块数={}", d.parse_method, d.page_count, d.chunk_count);
+        let rows = crate::db::repo::chunk_repo::load_for_compare(&conn, &d.id, "paragraph").unwrap();
+        let lens: Vec<usize> = rows.iter().map(|r| r.text.chars().count()).collect();
+        let n = lens.len().max(1);
+        let avg = lens.iter().sum::<usize>() / n;
+        let short = lens.iter().filter(|&&l| l < 25).count();
+        let mut sorted = lens.clone();
+        sorted.sort_unstable();
+        let median = sorted.get(n / 2).copied().unwrap_or(0);
+        println!("段落级分块：{} 个，平均 {} 字，中位 {} 字，<25字的碎块占比 {:.0}%",
+            n, avg, median, short as f32 / n as f32 * 100.0);
+        println!("样例前 3 段：");
+        for r in rows.iter().take(3) {
+            println!("  [{}字] {}", r.text.chars().count(), r.text.chars().take(60).collect::<String>());
+        }
+        assert!(avg > 40, "回流后段落平均长度应 >40 字（修复前每行一段约 20-30 字），实际 {avg}");
     }
 
     #[test]
