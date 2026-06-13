@@ -27,6 +27,7 @@ import {
   useUpdateAnnotation,
 } from "../queries/data";
 import type { AnnotationDto, OcrLine } from "../api/types";
+import { chunkTypeUi, CHUNK_TYPE_ORDER, SENTENCE_TINTS, splitSentences } from "../utils/chunkType";
 
 const METHOD_CN: Record<string, string> = {
   docx: "Word 文档",
@@ -55,6 +56,29 @@ export function DocPreview() {
 
   const doc = data?.document;
   const chunks = useMemo(() => data?.chunks ?? [], [data]);
+
+  // 按类型计数 + 筛选（智能分块视图按分块类型展示）
+  const typeCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of chunks) m.set(c.chunkType, (m.get(c.chunkType) ?? 0) + 1);
+    return m;
+  }, [chunks]);
+  // 出现过的类型，按结构顺序排列
+  const presentTypes = useMemo(
+    () => CHUNK_TYPE_ORDER.filter((t) => typeCounts.has(t)).concat(
+      [...typeCounts.keys()].filter((t) => !CHUNK_TYPE_ORDER.includes(t)),
+    ),
+    [typeCounts],
+  );
+  // null = 全部；否则只显示该类型
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
+  // 句子着色：段落内按句子轮换底色，直观看到最细切分边界
+  const [sentenceColor, setSentenceColor] = useState(false);
+  const visibleChunks = useMemo(
+    () => (typeFilter ? chunks.filter((c) => c.chunkType === typeFilter) : chunks),
+    [chunks, typeFilter],
+  );
+
   const isPdf = doc?.fileType === "pdf";
   const isDocx = doc?.fileType === "docx";
   const isMd = doc?.fileType === "md";
@@ -143,7 +167,7 @@ export function DocPreview() {
   // —— 分块模式虚拟列表 ——
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
-    count: chunks.length,
+    count: visibleChunks.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 56,
     overscan: 12,
@@ -151,12 +175,12 @@ export function DocPreview() {
 
   const [located, setLocated] = useState(false);
   useEffect(() => {
-    if (located || mode !== "chunks" || chunks.length === 0 || !targetChunk) return;
-    let idx = chunks.findIndex((c) => c.id === targetChunk);
+    if (located || mode !== "chunks" || visibleChunks.length === 0 || !targetChunk) return;
+    let idx = visibleChunks.findIndex((c) => c.id === targetChunk);
     if (idx < 0) idx = 0; // 比对粒度与预览粒度不同时回落到开头
     virtualizer.scrollToIndex(idx, { align: "center" });
     setLocated(true);
-  }, [chunks, targetChunk, located, virtualizer, mode]);
+  }, [visibleChunks, targetChunk, located, virtualizer, mode]);
 
   // 版式模式定位锚点：目标分块的页码（pdf）/ 开头文本（docx）
   const targetObj = useMemo(
@@ -220,10 +244,59 @@ export function DocPreview() {
 
       {/* —— 智能分块模式 —— */}
       {mode === "chunks" && (
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 32px 32px" }}>
+        <>
+          {/* 类型筛选条：按分块类型展示与过滤 */}
+          {presentTypes.length > 0 && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "8px 32px",
+                borderBottom: `1px solid ${border}`,
+                flexWrap: "wrap",
+              }}
+            >
+              <TypeChip
+                label="全部"
+                count={chunks.length}
+                active={typeFilter === null}
+                fg={ink}
+                bg="transparent"
+                border={border}
+                onClick={() => setTypeFilter(null)}
+              />
+              {presentTypes.map((t) => {
+                const ui = chunkTypeUi(t);
+                return (
+                  <TypeChip
+                    key={t}
+                    label={ui.label}
+                    count={typeCounts.get(t) ?? 0}
+                    active={typeFilter === t}
+                    fg={ui.fg}
+                    bg={ui.bg}
+                    border={border}
+                    onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+                  />
+                );
+              })}
+              <span style={{ flex: 1 }} />
+              <TypeChip
+                label="句子着色"
+                count={-1}
+                active={sentenceColor}
+                fg="#534AB7"
+                bg="transparent"
+                border={border}
+                onClick={() => setSentenceColor((v) => !v)}
+              />
+            </div>
+          )}
+          <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "16px 32px 32px" }}>
           <div style={{ height: virtualizer.getTotalSize(), position: "relative", maxWidth: 860, margin: "0 auto" }}>
             {virtualizer.getVirtualItems().map((vi) => {
-              const c = chunks[vi.index];
+              const c = visibleChunks[vi.index];
               if (!c) return null;
               const hit = targetChunk != null && c.id === targetChunk;
               const anns = annsOfChunk.get(c.id) ?? [];
@@ -242,7 +315,7 @@ export function DocPreview() {
                   }}
                 >
                   <div className="bg-chunk-row" style={{ position: "relative" }}>
-                    <ChunkBlock c={c} hit={hit} ink={ink} mute={mute} cardBg={cardBg} border={border} />
+                    <ChunkBlock c={c} hit={hit} ink={ink} mute={mute} cardBg={cardBg} border={border} showTag sentenceColor={sentenceColor} />
                     <span
                       className="bg-ann-btn"
                       onClick={() => setEditingChunk(editingChunk === c.id ? null : c.id)}
@@ -284,7 +357,8 @@ export function DocPreview() {
               );
             })}
           </div>
-        </div>
+          </div>
+        </>
       )}
 
       {/* —— 原文版式模式 —— */}
@@ -443,6 +517,72 @@ function AnnBubble({
   );
 }
 
+/** 类型筛选条上的一个芯片：类型标签 + 计数，点击切换。 */
+function TypeChip({
+  label,
+  count,
+  active,
+  fg,
+  bg,
+  border,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  fg: string;
+  bg: string;
+  border: string;
+  onClick: () => void;
+}) {
+  return (
+    <span
+      onClick={onClick}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        fontSize: 11,
+        padding: "3px 9px",
+        borderRadius: 999,
+        cursor: "pointer",
+        fontWeight: active ? 700 : 500,
+        color: active ? "#fff" : fg,
+        background: active ? fg : bg,
+        border: `1px solid ${active ? fg : border}`,
+      }}
+    >
+      {label}
+      {count >= 0 && (
+        <span style={{ fontSize: 10, opacity: 0.85, fontFamily: "ui-monospace, monospace" }}>{count}</span>
+      )}
+    </span>
+  );
+}
+
+/** 分块左侧的类型小标签（智能分块视图按类型展示）。 */
+function ChunkTag({ type }: { type: string }) {
+  const ui = chunkTypeUi(type);
+  return (
+    <span
+      style={{
+        flexShrink: 0,
+        alignSelf: "flex-start",
+        marginTop: 2,
+        fontSize: 9.5,
+        fontWeight: 700,
+        padding: "1px 5px",
+        borderRadius: 4,
+        color: ui.fg,
+        background: ui.bg,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {ui.label}
+    </span>
+  );
+}
+
 function ChunkBlock({
   c,
   hit,
@@ -450,6 +590,8 @@ function ChunkBlock({
   mute,
   cardBg,
   border,
+  showTag,
+  sentenceColor,
 }: {
   c: { id: string; chunkType: string; text: string; page: number | null };
   hit: boolean;
@@ -457,14 +599,27 @@ function ChunkBlock({
   mute: string;
   cardBg: string;
   border: string;
+  showTag?: boolean;
+  sentenceColor?: boolean;
 }) {
   const hitStyle = hit
     ? { background: "rgba(79,88,168,0.10)", border: "1px solid #6B73C9", borderRadius: 8, padding: "8px 10px" }
     : {};
+  const tag = showTag ? <ChunkTag type={c.chunkType} /> : null;
+  // 句子着色：把段落文本切成句子，逐句轮换底色
+  const body =
+    sentenceColor && (c.chunkType === "paragraph" || c.chunkType === "list_item")
+      ? splitSentences(c.text).map((s, i) => (
+          <span key={i} style={{ background: SENTENCE_TINTS[i % SENTENCE_TINTS.length], borderRadius: 3, padding: "0 1px", boxDecorationBreak: "clone", WebkitBoxDecorationBreak: "clone" }}>
+            {s}
+          </span>
+        ))
+      : c.text;
 
   if (c.chunkType === "heading") {
     return (
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, paddingTop: 10, ...hitStyle }}>
+        {tag}
         <span style={{ fontSize: 14.5, fontWeight: 800, color: ink, fontFamily: C.serif }}>{c.text}</span>
         {c.page != null && <span style={{ fontSize: 10, color: mute }}>第 {c.page} 页</span>}
       </div>
@@ -474,9 +629,12 @@ function ChunkBlock({
   if (c.chunkType === "table_row") {
     const cells = c.text.split(" | ");
     return (
-      <div style={{ ...hitStyle }}>
+      <div style={{ display: "flex", gap: 8, ...hitStyle }}>
+        {tag}
         <div
           style={{
+            flex: 1,
+            minWidth: 0,
             display: "flex",
             background: cardBg,
             border: `1px solid ${border}`,
@@ -508,7 +666,8 @@ function ChunkBlock({
   const isList = c.chunkType === "list_item";
   return (
     <div style={{ display: "flex", gap: 10, ...hitStyle }}>
-      <span style={{ flexShrink: 0, width: 34, fontSize: 10, color: mute, textAlign: "right", paddingTop: 3 }}>
+      {tag}
+      <span style={{ flexShrink: 0, width: 28, fontSize: 10, color: mute, textAlign: "right", paddingTop: 3 }}>
         {c.page != null ? `P${c.page}` : ""}
       </span>
       {isList && <span style={{ flexShrink: 0, color: mute, fontSize: 13, lineHeight: 1.8 }}>•</span>}
@@ -518,12 +677,12 @@ function ChunkBlock({
           minWidth: 0,
           margin: 0,
           fontSize: 13,
-          lineHeight: 1.8,
+          lineHeight: sentenceColor ? 2 : 1.8,
           color: ink,
           wordBreak: "break-word",
         }}
       >
-        {c.text}
+        {body}
       </p>
     </div>
   );
