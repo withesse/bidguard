@@ -1,8 +1,44 @@
-// 语义查重：中文 embedding + 余弦。首次运行会下载模型（multilingual-e5-small）。
+// 语义查重：embedding + 余弦。首次使用某模型会下载（受 security.allowCloudModel 控制）。
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-/// 语义缓存的模型标识（embeddings 表主键之一，换模型不脏读）。
-pub const MODEL_ID: &str = "multilingual-e5-small";
+/// 一个可选语义模型的规格。id 进 embeddings 表主键，换模型不脏读且各自缓存。
+#[derive(Debug, Clone)]
+pub struct EmbedModelSpec {
+    pub key: &'static str,   // 配置值（前后端一致）
+    pub id: &'static str,    // 缓存 model_id（稳定，勿改，否则旧缓存失配）
+    pub label: &'static str, // UI 展示
+    pub model: EmbeddingModel,
+}
+
+/// 可选模型注册表。默认项（e5-small）的 id 沿用历史值，保证旧缓存继续命中。
+pub const MODELS: &[EmbedModelSpec] = &[
+    EmbedModelSpec {
+        key: "e5-small",
+        id: "multilingual-e5-small",
+        label: "E5 多语种 · 小（默认，快）",
+        model: EmbeddingModel::MultilingualE5Small,
+    },
+    EmbedModelSpec {
+        key: "e5-base",
+        id: "multilingual-e5-base",
+        label: "E5 多语种 · 大（更准，慢）",
+        model: EmbeddingModel::MultilingualE5Base,
+    },
+    EmbedModelSpec {
+        key: "bge-zh",
+        id: "bge-small-zh-v1.5",
+        label: "BGE 中文优化（中文标书更准）",
+        model: EmbeddingModel::BGESmallZHV15,
+    },
+];
+
+/// 配置值 → 模型规格；未知值回落默认。
+pub fn resolve(key: &str) -> &'static EmbedModelSpec {
+    MODELS.iter().find(|m| m.key == key).unwrap_or(&MODELS[0])
+}
+
+/// 常驻语义模型：记录已加载的 model_id，换模型时丢弃重载。
+pub type LoadedEmbedder = Option<(String, TextEmbedding)>;
 
 fn cache_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/bidguard/fastembed"))
@@ -27,9 +63,8 @@ pub fn model_cached() -> bool {
     cache_dir().map(|d| has_onnx(&d, 4)).unwrap_or(false)
 }
 
-fn init_model() -> Option<TextEmbedding> {
-    let mut opts =
-        InitOptions::new(EmbeddingModel::MultilingualE5Small).with_show_download_progress(false);
+fn init_model(model: EmbeddingModel) -> Option<TextEmbedding> {
+    let mut opts = InitOptions::new(model).with_show_download_progress(false);
     // 稳定的绝对缓存目录：打包后 cwd=/ 不可写，必须显式指定，否则模型加载/下载失败
     if let Some(dir) = cache_dir() {
         opts = opts.with_cache_dir(dir);
@@ -37,17 +72,27 @@ fn init_model() -> Option<TextEmbedding> {
     TextEmbedding::try_new(opts).ok()
 }
 
-/// 确保槽位里有常驻模型实例（加载/下载一次，任务间复用）。不可用返回 None。
+/// 确保槽位里有「指定模型」的常驻实例：已加载同一模型则复用；不同则丢弃重载。
 /// allow_download=false（security.allowCloudModel，设计文档 §15.1）且本地无缓存时
 /// 不发起联网下载，调用方走语义降级路径并在报告注明。
-pub fn ensure(slot: &mut Option<TextEmbedding>, allow_download: bool) -> Option<&mut TextEmbedding> {
+pub fn ensure<'a>(
+    slot: &'a mut LoadedEmbedder,
+    spec: &EmbedModelSpec,
+    allow_download: bool,
+) -> Option<&'a mut TextEmbedding> {
+    let loaded_other = slot.as_ref().is_some_and(|(id, _)| id != spec.id);
+    if loaded_other {
+        *slot = None; // 换了模型，释放旧实例
+    }
     if slot.is_none() {
         if !allow_download && !model_cached() {
             return None;
         }
-        *slot = init_model();
+        if let Some(m) = init_model(spec.model.clone()) {
+            *slot = Some((spec.id.to_string(), m));
+        }
     }
-    slot.as_mut()
+    slot.as_mut().map(|(_, m)| m)
 }
 
 /// 用常驻模型嵌入一批文本（E5 推荐加 "passage: " 前缀）。
@@ -78,7 +123,7 @@ mod tests {
     #[ignore] // 需下载模型；用 `cargo test -- --ignored` 手动验证
     fn paraphrase_more_similar_than_unrelated() {
         let mut slot = None;
-        let model = ensure(&mut slot, true).expect("应能加载模型");
+        let model = ensure(&mut slot, &MODELS[0], true).expect("应能加载模型");
         let embs = embed_batch(
             model,
             &[
@@ -91,5 +136,14 @@ mod tests {
         let para = cosine(&embs[0], &embs[1]);
         let diff = cosine(&embs[0], &embs[2]);
         assert!(para > diff, "改写句应比无关句更相似：para={para} diff={diff}");
+    }
+
+    #[test]
+    fn resolve_known_and_unknown() {
+        assert_eq!(resolve("bge-zh").id, "bge-small-zh-v1.5");
+        assert_eq!(resolve("e5-base").id, "multilingual-e5-base");
+        assert_eq!(resolve("不存在").key, "e5-small", "未知值回落默认");
+        // 默认 id 必须沿用历史值（multilingual-e5-small），否则旧缓存失配
+        assert_eq!(resolve("e5-small").id, "multilingual-e5-small");
     }
 }

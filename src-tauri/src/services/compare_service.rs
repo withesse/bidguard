@@ -11,7 +11,7 @@ use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, Fingerprin
 use crate::engine::{candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring};
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
-use fastembed::TextEmbedding;
+use crate::engine::embed::LoadedEmbedder;
 use jieba_rs::Jieba;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,16 @@ pub struct CompareRunConfig {
     pub ignore_templates: bool,
     pub detect_moved_paragraph: bool,
     pub scope: String,
+    /// 语义模型选择（compare.embeddingModel：e5-small | e5-base | bge-zh）。
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
     /// security.allowCloudModel：是否允许联网下载语义模型（本地已缓存时不受限）。
     #[serde(default)]
     pub allow_model_download: bool,
+}
+
+fn default_embedding_model() -> String {
+    "e5-small".to_string()
 }
 
 /// 总览统计（jobs.summary_json）。
@@ -82,7 +89,7 @@ const DELETED_FLOOR: f32 = 0.55;
 pub fn run_compare(
     ctx: &JobCtx,
     jieba: Arc<Jieba>,
-    embedder: Arc<Mutex<Option<TextEmbedding>>>,
+    embedder: Arc<Mutex<LoadedEmbedder>>,
     workspace_id: &str,
     cfg: &CompareRunConfig,
 ) -> AppResult<()> {
@@ -98,7 +105,7 @@ pub fn run_compare(
 fn run_inner(
     ctx: &JobCtx,
     jieba: &Jieba,
-    embedder: &Arc<Mutex<Option<TextEmbedding>>>,
+    embedder: &Arc<Mutex<LoadedEmbedder>>,
     workspace_id: &str,
     cfg: &CompareRunConfig,
 ) -> AppResult<()> {
@@ -148,9 +155,10 @@ fn run_inner(
     ctx.check()?;
     corpus::fill_tfidf(&mut comparable);
 
-    // 2) 语义向量（可选；按 normalized_hash 全局缓存）
+    // 2) 语义向量（可选；按 (normalized_hash, model_id) 全局缓存）
     let (embeddings, semantic_degraded) = if cfg.enable_semantic {
-        embed_chunks(ctx, embedder, &comparable, cfg.allow_model_download)?
+        let spec = embed::resolve(&cfg.embedding_model);
+        embed_chunks(ctx, embedder, &comparable, spec, cfg.allow_model_download)?
     } else {
         (None, false)
     };
@@ -366,8 +374,9 @@ fn run_inner(
 /// （返回 degraded=true，比对退回词面权重组）。
 fn embed_chunks(
     ctx: &JobCtx,
-    embedder: &Arc<Mutex<Option<TextEmbedding>>>,
+    embedder: &Arc<Mutex<embed::LoadedEmbedder>>,
     chunks: &[CmpChunk],
+    spec: &embed::EmbedModelSpec,
     allow_download: bool,
 ) -> AppResult<(Option<ChunkEmbeddings>, bool)> {
     let mut uniq: HashMap<&str, &str> = HashMap::new(); // hash → text
@@ -377,7 +386,7 @@ fn embed_chunks(
     let hashes: Vec<String> = uniq.keys().map(|s| s.to_string()).collect();
     let mut cache = {
         let conn = ctx.db.get()?;
-        embedding_repo::get_many(&conn, &hashes, embed::MODEL_ID)?
+        embedding_repo::get_many(&conn, &hashes, spec.id)?
     };
 
     let missing: Vec<(String, String)> = uniq
@@ -391,7 +400,7 @@ fn embed_chunks(
 
     if !missing.is_empty() {
         let mut guard = embedder.lock().unwrap();
-        let Some(model) = embed::ensure(&mut guard, allow_download) else {
+        let Some(model) = embed::ensure(&mut guard, spec, allow_download) else {
             ctx.progress("semantic", total, total, "语义模型不可用，降级为词面比对");
             return Ok((None, true));
         };
@@ -409,7 +418,7 @@ fn embed_chunks(
                 .collect();
             {
                 let conn = ctx.db.get()?;
-                embedding_repo::insert_many(&conn, &items, embed::MODEL_ID)?;
+                embedding_repo::insert_many(&conn, &items, spec.id)?;
             }
             for (h, v) in items {
                 cache.insert(h, v);
@@ -818,6 +827,7 @@ mod tests {
             ignore_templates: true,
             detect_moved_paragraph: true,
             scope: "full".into(),
+            embedding_model: "e5-small".into(),
             allow_model_download: false,
         }
     }
@@ -872,6 +882,142 @@ mod tests {
     ) -> Vec<crate::db::repo::compare_repo::ClusterSummaryRow> {
         let conn = pool.get().unwrap();
         compare_repo::list_clusters(&conn, job_id, &Default::default(), 0, 500).unwrap()
+    }
+
+    /// 真实标书语料校准（手动运行）：
+    ///   cargo test -p bidguard --lib calibrate_real_corpus -- --ignored --nocapture
+    /// 从 BIDGUARD_CALIB_DIR（默认 ~/Documents/bidguard-test-bids）读 8 份真实标书，
+    /// 跑完整 import+compare 管线，dump 矩阵/围标/八类/冲突/耗时，对照标准答案分析。
+    #[test]
+    #[ignore]
+    fn calibrate_real_corpus() {
+        use std::time::Instant;
+        let dir = std::env::var("BIDGUARD_CALIB_DIR").unwrap_or_else(|_| {
+            format!("{}/Documents/bidguard-test-bids", std::env::var("HOME").unwrap())
+        });
+        let dir = std::path::Path::new(&dir);
+        if !dir.exists() {
+            eprintln!("跳过：语料目录不存在 {dir:?}");
+            return;
+        }
+        // (文件名, 显示标签)；导入顺序即矩阵行列顺序
+        let files = [
+            ("甲-华信智联科技-投标文件.docx", "甲docx"),
+            ("乙-启明数字技术-投标文件.docx", "乙docx"),
+            ("丙-蓝海信息工程-投标文件.pdf", "丙pdf"),
+            ("丁-中科软创-投标文件.docx", "丁docx"),
+            ("戊-东方网御-投标文件.md", "戊md"),
+            ("己-北辰系统集成-投标文件.txt", "己txt"),
+            ("甲-报价清单.xlsx", "甲xls"),
+            ("乙-报价清单.xlsx", "乙xls"),
+        ];
+        let paths: Vec<String> = files
+            .iter()
+            .map(|(f, _)| dir.join(f).to_string_lossy().into_owned())
+            .collect();
+
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "校准").unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+
+        let t0 = Instant::now();
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        let t_import = t0.elapsed();
+
+        let docs = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap()
+        };
+        println!("\n========== 解析结果（导入 {:.1}s）==========", t_import.as_secs_f32());
+        let mut total_chars = 0i64;
+        let mut total_chunks = 0i64;
+        // 按预期文件顺序排列 id
+        let mut ordered_ids = Vec::new();
+        for (fname, label) in &files {
+            let d = docs.iter().find(|d| &d.file_name == fname).unwrap();
+            ordered_ids.push(d.id.clone());
+            total_chars += d.char_count.unwrap_or(0);
+            total_chunks += d.chunk_count;
+            println!(
+                "  {label:6} {:>4}页 {:>9}字 {:>6}块 [{:>10}] {}",
+                d.page_count.unwrap_or(0),
+                d.char_count.unwrap_or(0),
+                d.chunk_count,
+                d.parse_method.as_deref().unwrap_or("?"),
+                if d.status == "parsed" { "✓" } else { &d.status }
+            );
+        }
+        println!("  合计 {total_chars} 字 / {total_chunks} 块（段落级）");
+
+        let t1 = Instant::now();
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        let cfg = CompareRunConfig {
+            enable_fact_conflict: true,
+            ..cfg_with(ordered_ids.clone(), 0.55)
+        };
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg).unwrap();
+        let t_compare = t1.elapsed();
+
+        let (matrix, peak) = matrix_peak(&pool, &cctx.job_id);
+        let conn = pool.get().unwrap();
+        let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+        let summary: serde_json::Value = serde_json::from_str(r.summary_json.as_deref().unwrap_or("{}")).unwrap();
+        let collusion: serde_json::Value = serde_json::from_str(r.collusion_json.as_deref().unwrap_or("{}")).unwrap();
+        let shared: serde_json::Value = serde_json::from_str(r.shared_terms_json.as_deref().unwrap_or("[]")).unwrap();
+
+        println!("\n========== 文档相似度矩阵（比对 {:.1}s, 峰值 {:.0}%）==========", t_compare.as_secs_f32(), peak * 100.0);
+        print!("        ");
+        for (_, l) in &files { print!("{l:>7}"); }
+        println!();
+        for (i, row) in matrix.iter().enumerate() {
+            print!("  {:6}", files[i].1);
+            for v in row { print!("{:>6.0}%", v * 100.0); }
+            println!();
+        }
+
+        let clusters = clusters_of(&pool, &cctx.job_id);
+        let mut by_type: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for c in &clusters { *by_type.entry(c.cluster_type.clone()).or_insert(0) += 1; }
+
+        println!("\n========== 八类统计 ==========");
+        for k in ["sameCount","minorChangeCount","changedCount","rewriteCount","conflictCount","uncertainCount","addedCount","deletedCount"] {
+            println!("  {k:18} {}", summary[k].as_u64().unwrap_or(0));
+        }
+        println!("  clusterCount(总组) {}", summary["clusterCount"].as_u64().unwrap_or(0));
+
+        println!("\n========== 围标判定 ==========");
+        println!("  level={} score={:.2}", collusion["level"].as_str().unwrap_or("?"), collusion["score"].as_f64().unwrap_or(0.0));
+        if let Some(sigs) = collusion["signals"].as_array() {
+            for s in sigs {
+                println!("  · [{}] {} (w={:.2})", s["kind"].as_str().unwrap_or("?"), s["detail"].as_str().unwrap_or(""), s["weight"].as_f64().unwrap_or(0.0));
+            }
+        }
+
+        // 事实冲突详情（前 12 条）
+        let conflict_clusters: Vec<_> = clusters.iter().filter(|c| c.cluster_type == "conflict").collect();
+        println!("\n========== 事实冲突（{} 组，列前 12）==========", conflict_clusters.len());
+        for c in conflict_clusters.iter().take(12) {
+            let d = compare_repo::get_cluster_detail(&conn, &c.id).unwrap();
+            let fields = d.conflict_json.as_deref().unwrap_or("");
+            let topic = c.topic.as_deref().unwrap_or("");
+            // 提取冲突字段名
+            let kinds: Vec<&str> = ["amount","duration","date","percentage","subject"].iter().copied().filter(|k| fields.contains(*k)).collect();
+            println!("  [{}] {} | 字段={:?}", c.severity.as_deref().unwrap_or("?"), &topic.chars().take(24).collect::<String>(), kinds);
+        }
+
+        println!("\n========== 共有罕见词（前 10）==========");
+        if let Some(terms) = shared.as_array() {
+            for t in terms.iter().take(10) {
+                println!("  {} ×{}文档", t["term"].as_str().unwrap_or("?"), t["docs"].as_array().map(|a| a.len()).unwrap_or(0));
+            }
+        }
+        println!("\n========== 性能 ==========");
+        println!("  导入 {:.1}s + 比对 {:.1}s = 总 {:.1}s（{} 字 / {} 块）",
+            t_import.as_secs_f32(), t_compare.as_secs_f32(), (t_import + t_compare).as_secs_f32(), total_chars, total_chunks);
     }
 
     #[test]

@@ -14,6 +14,10 @@ export function useWorkspaces() {
   return useQuery({ queryKey: ["workspaces"], queryFn: api.listWorkspaces });
 }
 
+export function useAppInfo() {
+  return useQuery({ queryKey: ["appInfo"], queryFn: api.getAppInfo, staleTime: Infinity });
+}
+
 export function useWorkspace(workspaceId: string | undefined) {
   return useQuery({
     queryKey: ["workspace", workspaceId],

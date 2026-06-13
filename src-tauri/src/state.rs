@@ -1,7 +1,7 @@
 // 全局共享状态（tauri .manage()，commands 经 State<AppState> 访问）。
 use crate::db::DbPool;
+use crate::engine::embed::LoadedEmbedder;
 use crate::jobs::JobManager;
-use fastembed::TextEmbedding;
 use jieba_rs::Jieba;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -9,8 +9,9 @@ pub struct AppState {
     pub db: DbPool,
     pub jobs: JobManager,
     jieba: OnceLock<Arc<Jieba>>,
-    /// 语义模型槽位：首次启用语义比对时加载并常驻；Mutex 同时充当推理互斥
-    embedder: Arc<Mutex<Option<TextEmbedding>>>,
+    /// 语义模型槽位：(已加载 model_id, 实例)；换模型时由 embed::ensure 重载。
+    /// Mutex 同时充当推理互斥。
+    embedder: Arc<Mutex<LoadedEmbedder>>,
 }
 
 impl AppState {
@@ -29,7 +30,7 @@ impl AppState {
         self.jieba.get_or_init(|| Arc::new(Jieba::new())).clone()
     }
 
-    pub fn embedder(&self) -> Arc<Mutex<Option<TextEmbedding>>> {
+    pub fn embedder(&self) -> Arc<Mutex<LoadedEmbedder>> {
         self.embedder.clone()
     }
 }

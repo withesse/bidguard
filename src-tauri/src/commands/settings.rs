@@ -25,10 +25,19 @@ pub async fn set_app_settings(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EmbedModelInfo {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppInfo {
     pub version: String,
     pub max_docs: usize,
     pub min_docs: usize,
+    /// 可选语义模型清单（前端选择器据此渲染，不硬编码）。
+    pub embedding_models: Vec<EmbedModelInfo>,
 }
 
 #[tauri::command]
@@ -37,6 +46,10 @@ pub async fn get_app_info() -> AppResult<AppInfo> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         max_docs: crate::config::MAX_DOCS,
         min_docs: crate::config::MIN_DOCS,
+        embedding_models: crate::engine::embed::MODELS
+            .iter()
+            .map(|m| EmbedModelInfo { key: m.key.to_string(), label: m.label.to_string() })
+            .collect(),
     })
 }
 

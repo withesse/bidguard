@@ -298,6 +298,7 @@ mod tests {
             ignore_templates: true,
             detect_moved_paragraph: true,
             scope: "full".into(),
+            embedding_model: "e5-small".into(),
             allow_model_download: false,
         };
         // 与 start_compare 一致：运行配置存入任务行（assemble 从这里取 documentIds）

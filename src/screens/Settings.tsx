@@ -7,7 +7,7 @@ import { Button, Toggle, SegControl } from "../components/primitives";
 import { useTheme, type FontScale, type Highlight } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
-import { useAppSettings, useSaveAppSettings } from "../queries/data";
+import { useAppInfo, useAppSettings, useSaveAppSettings } from "../queries/data";
 import { relaunchApp, runUpdate, type UpdateState } from "../utils/updater";
 import { getSettings, setSettings, type Settings as DetectSettings, type Scope } from "../prefs";
 
@@ -21,6 +21,7 @@ const LANGS = ["auto", "zh", "en"];
 const BUILTIN_COMPARE = {
   scope: "full",
   similarityThreshold: 0.7,
+  candidateTopK: 100,
   ignoreTemplates: true,
   enableSemantic: false,
   enableFactConflict: true,
@@ -29,6 +30,7 @@ const BUILTIN_COMPARE = {
   ignorePunctuation: true,
   ignoreCase: true,
   language: "auto",
+  embeddingModel: "e5-small",
 };
 
 /** 与后端 config::ParserDefaults 内置值一致的前端镜像。 */
@@ -36,6 +38,7 @@ const BUILTIN_PARSER = {
   removeHeaderFooter: true,
   preservePageNumber: true,
   detectTable: true,
+  ocrDocxImages: true,
 };
 
 /** 与后端 config::SecurityDefaults 内置值一致的前端镜像。 */
@@ -56,6 +59,8 @@ export function Settings() {
   // 检测偏好（DB · 用户全局层）
   const { data: cfgRaw } = useAppSettings();
   const saveCfg = useSaveAppSettings();
+  const { data: appInfo } = useAppInfo();
+  const embeddingModels = appInfo?.embeddingModels ?? [];
   const cmp = useMemo(() => {
     const patch =
       cfgRaw && typeof cfgRaw === "object"
@@ -186,6 +191,22 @@ export function Settings() {
                 onChange={(i) => changeCmp({ defaultChunkLevel: CHUNK_LEVELS[i] })}
               />
             </Row>
+            <Row label="召回深度" sub="每段保留的候选数：高=更全更慢，低=更快可能漏" ink={ink} mute={mute}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <input
+                  type="range"
+                  min={20}
+                  max={300}
+                  step={20}
+                  value={(cmp.candidateTopK as number) ?? 100}
+                  onChange={(e) => changeCmp({ candidateTopK: Number(e.target.value) })}
+                  style={{ width: 120, accentColor: accent, cursor: "pointer" }}
+                />
+                <span style={{ fontSize: 12, color: ink, fontFamily: C.mono, fontWeight: 600, minWidth: 32 }}>
+                  {(cmp.candidateTopK as number) ?? 100}
+                </span>
+              </div>
+            </Row>
             <Row label="忽略通用模板段落" sub="标准条款、表头、附件目录（查重源库）" ink={ink} mute={mute}>
               <Toggle
                 on={cmp.ignoreTemplates as boolean}
@@ -204,6 +225,30 @@ export function Settings() {
                 onChange={() => changeCmp({ enableSemantic: !cmp.enableSemantic })}
               />
             </Row>
+            {(cmp.enableSemantic as boolean) && embeddingModels.length > 0 && (
+              <Row label="语义模型" sub="切换模型后该模型的语义缓存独立重建（首次需下载）" ink={ink} mute={mute}>
+                <select
+                  value={(cmp.embeddingModel as string) ?? "e5-small"}
+                  onChange={(e) => changeCmp({ embeddingModel: e.target.value })}
+                  style={{
+                    fontSize: 12,
+                    padding: "5px 8px",
+                    borderRadius: 7,
+                    border: `1px solid ${border}`,
+                    background: cardBg,
+                    color: ink,
+                    cursor: "pointer",
+                    maxWidth: 220,
+                  }}
+                >
+                  {embeddingModels.map((m) => (
+                    <option key={m.key} value={m.key}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </Row>
+            )}
             <Row label="围标嫌疑提示" sub="3 份及以上共同高相似片段触发" ink={ink} mute={mute}>
               <Toggle on={s.flagCollusion} onChange={() => change({ flagCollusion: !s.flagCollusion })} />
             </Row>
@@ -248,6 +293,12 @@ export function Settings() {
               <Toggle
                 on={parser.removeHeaderFooter as boolean}
                 onChange={() => changeParser({ removeHeaderFooter: !parser.removeHeaderFooter })}
+              />
+            </Row>
+            <Row label="识别 Word 内嵌图片" sub="OCR 截图式报价表/资质/公章里的文字，图片多时导入变慢" ink={ink} mute={mute}>
+              <Toggle
+                on={parser.ocrDocxImages as boolean}
+                onChange={() => changeParser({ ocrDocxImages: !parser.ocrDocxImages })}
               />
             </Row>
             <Row label="分词语言" sub="自动按内容判定；英文标书可固定 English" ink={ink} mute={mute} last>

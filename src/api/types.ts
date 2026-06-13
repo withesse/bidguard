@@ -56,10 +56,16 @@ export interface TemplateDto {
   createdAt: string;
 }
 
+export interface EmbedModelInfo {
+  key: string;
+  label: string;
+}
+
 export interface AppInfoDto {
   version: string;
   maxDocs: number;
   minDocs: number;
+  embeddingModels: EmbedModelInfo[];
 }
 
 export interface ProgressEvent {
@@ -92,6 +98,7 @@ export interface CompareRequest {
   ignoreTemplates?: boolean;
   detectMovedParagraph?: boolean;
   scope?: "full" | "tech" | "business";
+  embeddingModel?: string;
 }
 
 export interface CompareSummaryDto {
