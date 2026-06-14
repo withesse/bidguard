@@ -1,4 +1,5 @@
 // 任务列表：/history 全部、/starred 仅收藏。星标/删除落库，完成任务带迷你矩阵与围标徽标。
+import { formatDateTime, formatRelative } from "../utils/formatTime";
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Topbar } from "../components/Topbar";
@@ -124,8 +125,8 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                 <Pill fg={st.fg} bg={st.bg} size={10}>
                   {st.label}
                 </Pill>
-                <span style={{ fontSize: 11, color: mute, flexShrink: 0 }}>
-                  {j.createdAt.slice(0, 16).replace("T", " ")}
+                <span style={{ fontSize: 11, color: mute, flexShrink: 0 }} title={formatRelative(j.createdAt)}>
+                  {formatDateTime(j.createdAt)}
                 </span>
                 <span
                   onClick={(e) => {

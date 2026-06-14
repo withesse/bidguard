@@ -1,4 +1,5 @@
 // 首页：工作区列表 + 最近任务。「新建查重任务」一键建工作区直进配置页，
+import { formatDateTime, formatRelative } from "../utils/formatTime";
 // 轻用户无感知工作区概念；重用户可在此管理多个工作区。
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -186,7 +187,9 @@ export function WorkspaceList() {
                       {st.label}
                     </Pill>
                   )}
-                  <span style={{ marginLeft: "auto" }}>{w.updatedAt.slice(0, 10)}</span>
+                  <span style={{ marginLeft: "auto" }} title={`更新于 ${formatDateTime(w.updatedAt)}`}>
+                    {formatDateTime(w.updatedAt)}
+                  </span>
                 </div>
               </div>
             );
@@ -239,7 +242,9 @@ export function WorkspaceList() {
                   <Pill fg={st.fg} bg={st.bg} size={10}>
                     {st.label}
                   </Pill>
-                  <span style={{ fontSize: 11, color: mute }}>{j.createdAt.slice(0, 16).replace("T", " ")}</span>
+                  <span style={{ fontSize: 11, color: mute }} title={formatDateTime(j.createdAt)}>
+                    {formatRelative(j.createdAt)}
+                  </span>
                 </div>
               );
             })}
