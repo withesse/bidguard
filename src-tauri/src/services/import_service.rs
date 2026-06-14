@@ -171,13 +171,16 @@ pub fn run_import(
         });
     }
 
-    // 阶段 B：按文件并行解析入库
+    // 阶段 B：按文件并行解析（CPU 密集），但 DB 写入串行。
+    // SQLite 单写者：并发的大文档写事务会撞 busy_timeout（SQLITE_BUSY）；
+    // 这把写锁让任一时刻只有一个写事务，解析仍并行，从而既快又不冲突。
     let parse_total = work.len();
     let done = AtomicUsize::new(0);
+    let db_write = std::sync::Mutex::new(());
     let results: Vec<AppResult<()>> = work
         .par_iter()
         .map(|item| {
-            let r = import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash);
+            let r = import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash, &db_write);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             ctx.progress("parse", n, parse_total, format!("已解析 {n} / {parse_total}"));
             r
@@ -204,6 +207,8 @@ pub fn run_import(
 }
 
 /// 单文件导入。返回 Err 仅用于数据库错误 / 取消；解析失败落到 documents.status=failed。
+/// 解析（含 OCR）在 db_write 锁外并行；所有 DB 写入持锁串行，避免 SQLite 并发写冲突。
+#[allow(clippy::too_many_arguments)] // 导入单文件的固有上下文集合
 fn import_one(
     ctx: &JobCtx,
     jieba: &Jieba,
@@ -212,6 +217,7 @@ fn import_one(
     chunker_opts: &ChunkerOptions,
     opts: &ImportOptions,
     options_hash: &str,
+    db_write: &std::sync::Mutex<()>,
 ) -> AppResult<()> {
     ctx.check()?;
 
@@ -219,6 +225,9 @@ fn import_one(
     {
         let conn = ctx.db.get()?;
         if let Some(src) = document_repo::find_parsed_by_hash(&conn, &item.file_hash, options_hash)? {
+            drop(conn);
+            let _w = db_write.lock().unwrap();
+            let conn = ctx.db.get()?;
             let doc = document_repo::create_parsing(
                 &conn,
                 workspace_id,
@@ -240,6 +249,7 @@ fn import_one(
     }
 
     let doc = {
+        let _w = db_write.lock().unwrap();
         let conn = ctx.db.get()?;
         document_repo::create_parsing(
             &conn,
@@ -252,10 +262,12 @@ fn import_one(
         )?
     };
 
+    // 解析 + OCR（最重，锁外并行）
     let parsed =
         parse::parse_file_blocks_opt(Path::new(&item.path), ctx.cancel_flag(), opts.ocr_docx_images);
     if ctx.cancelled() {
         // 解析被打断的半成品不保留（该行还没有任何分块）
+        let _w = db_write.lock().unwrap();
         let conn = ctx.db.get()?;
         let _ = document_repo::remove(&conn, &doc.id);
         return Err(AppError::new(AppErrorCode::JobCancelled, "任务已取消"));
@@ -263,6 +275,7 @@ fn import_one(
 
     match parsed {
         Err(e) => {
+            let _w = db_write.lock().unwrap();
             let conn = ctx.db.get()?;
             document_repo::mark_failed(&conn, &doc.id, &e)?;
             Ok(())
@@ -282,6 +295,8 @@ fn import_one(
             let char_count = pb.legacy_text.chars().count();
             let fingerprint_json = serde_json::to_string(&pb.fingerprint)
                 .unwrap_or_else(|_| "{}".to_string());
+            // 写入持锁串行（大文档事务可达数秒，不能与他文档并发写）
+            let _w = db_write.lock().unwrap();
             let mut conn = ctx.db.get()?;
             if let Err(e) = persist_parsed(
                 &mut conn,
@@ -410,6 +425,67 @@ mod tests {
             sink.clone(),
         );
         (ctx, sink)
+    }
+
+    #[test]
+    fn concurrent_import_of_large_docs_on_file_pool() {
+        // 回归：文件库（8 连接）下并行导入多份大文档，写入必须串行不撞 SQLITE_BUSY。
+        // 内存库（max_size=1）池内自动串行复现不了，必须用文件库。
+        let dir = std::env::temp_dir().join(format!("bg_concimp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::open(&dir).unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "并发").unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+        // 每份 ~1200 段（大事务，足以让写锁占用可观时间），4 份内容各异避免去重，并行导入
+        let paras: Vec<Vec<String>> = (0..4)
+            .map(|i| {
+                (0..1200)
+                    .map(|n| format!("文档{i}第{n}段：本项目采用分层解耦的微服务总体架构，支持横向扩展与读写分离。"))
+                    .collect()
+            })
+            .collect();
+        let paths: Vec<String> = (0..4)
+            .map(|i| {
+                let refs: Vec<&str> = paras[i].iter().map(String::as_str).collect();
+                write_min_docx(&dir, &format!("doc{i}.docx"), &refs)
+            })
+            .collect();
+
+        let conn = pool.get().unwrap();
+        let job = job_repo::create(&conn, &ws, "import", None, "{}").unwrap();
+        drop(conn);
+        let ctx = crate::jobs::JobCtx::for_test(
+            job.id,
+            "import".into(),
+            pool.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(CollectSink::default()),
+        );
+        run_import(&ctx, jieba, &ws, &paths, &Default::default()).unwrap();
+
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        assert_eq!(docs.len(), 4);
+        assert!(docs.iter().all(|d| d.status == "parsed"), "并发导入应全部成功：{docs:?}");
+        assert!(docs.iter().all(|d| d.chunk_count > 0));
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_parsing_docs_marked_failed_on_restart() {
+        let (pool, ws, _dir) = setup();
+        let conn = pool.get().unwrap();
+        // 手造一个卡在 parsing 的孤儿文档（模拟上次被杀）
+        document_repo::create_parsing(&conn, &ws, "orphan.docx", "/x", "h", "docx", "oh").unwrap();
+        assert_eq!(document_repo::mark_stale_parsing_as_failed(&conn).unwrap(), 1);
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        assert_eq!(docs[0].status, "failed");
+        assert!(docs[0].parse_error.as_deref().unwrap().contains("中断"));
     }
 
     fn write(dir: &Path, name: &str, content: &str) -> String {

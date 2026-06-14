@@ -67,6 +67,10 @@ pub fn run() {
                     if let Err(e) = db::repo::job_repo::mark_stale_as_failed(&conn) {
                         log::error!("启动清理残留任务失败：{e}");
                     }
+                    // 卡在 'parsing' 的孤儿文档（上次被杀/崩溃）也判失败，否则界面永显「解析中」
+                    if let Err(e) = db::repo::document_repo::mark_stale_parsing_as_failed(&conn) {
+                        log::error!("启动清理残留文档失败：{e}");
+                    }
                 }
                 Err(e) => log::error!("启动清理取连接失败：{e}"),
             }

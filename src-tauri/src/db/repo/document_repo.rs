@@ -102,6 +102,17 @@ pub fn find_by_hash(
         .optional()?)
 }
 
+/// 启动清理：把残留在 'parsing' 的文档标记失败。导入任务不可能跨进程存活，
+/// 上次运行被杀/崩溃时卡在 parsing 的文档是孤儿，否则界面会永远显示「解析中」。
+pub fn mark_stale_parsing_as_failed(conn: &rusqlite::Connection) -> AppResult<usize> {
+    Ok(conn.execute(
+        "UPDATE documents SET status = 'failed',
+         parse_error = '上次导入被中断（应用重启）', updated_at = ?1
+         WHERE status = 'parsing'",
+        [now_iso()],
+    )?)
+}
+
 /// 清理同工作区同 hash 的失败残留行（重试导入成功路径的前置）。
 pub fn remove_failed_by_hash(
     conn: &rusqlite::Connection,
