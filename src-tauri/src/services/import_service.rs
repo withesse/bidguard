@@ -94,14 +94,14 @@ pub fn run_import(
     // 启用中的查重源模板 → 分词，供分块阶段标记样板段落
     let chunker_opts = {
         let conn = ctx.db.get()?;
-        let template_tokens: Vec<Vec<String>> = template_repo::list_enabled_texts(&conn)?
-            .iter()
-            .map(|t| tokenize(&jieba, t))
-            .filter(|t| !t.is_empty())
+        let templates: Vec<(String, Vec<String>)> = template_repo::list_enabled(&conn)?
+            .into_iter()
+            .map(|(id, t)| (id, tokenize(&jieba, &t)))
+            .filter(|(_, t)| !t.is_empty())
             .collect();
         ChunkerOptions {
             min_chars: opts.min_paragraph_chars,
-            template_tokens,
+            templates,
             normalize: opts.normalize.clone(),
             detect_table: opts.detect_table,
             preserve_page_number: opts.preserve_page_number,

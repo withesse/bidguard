@@ -11,9 +11,10 @@ use jieba_rs::Jieba;
 
 pub struct ChunkerOptions {
     pub min_chars: usize,
-    /// 查重源模板的分词结果；命中（余弦 ≥ 0.7）的分块标记 is_template，
-    /// 召回阶段剔除，但仍可见可解释。
-    pub template_tokens: Vec<Vec<String>>,
+    /// 查重源模板：(模板 id, 分词结果)。命中（余弦 ≥ 0.7）的分块标记 is_template，
+    /// 并记录命中的模板 id（取余弦最高者），用于统计每条样板命中过多少文档。
+    /// 召回阶段剔除样板段，但仍可见可解释。
+    pub templates: Vec<(String, Vec<String>)>,
     pub normalize: NormalizeOptions,
     /// false 时表格行退化为普通段落文本（parser.detectTable）。
     pub detect_table: bool,
@@ -27,7 +28,7 @@ impl Default for ChunkerOptions {
     fn default() -> Self {
         Self {
             min_chars: 10,
-            template_tokens: Vec::new(),
+            templates: Vec::new(),
             normalize: NormalizeOptions::default(),
             detect_table: true,
             preserve_page_number: true,
@@ -361,11 +362,17 @@ fn make(
     let page = if ctx.opts.preserve_page_number { page } else { None };
     let normalized = normalize::normalize(text, &ctx.opts.normalize);
     let tokens = tokenize_lang(ctx.jieba, text, &ctx.opts.language);
-    let is_template = ctx
-        .opts
-        .template_tokens
-        .iter()
-        .any(|tt| cosine(&tokens, tt) >= TEMPLATE_MATCH);
+    // 命中余弦最高的样板（≥ 阈值）：标记 is_template 并记录其 id 供命中统计。
+    let mut template_id: Option<String> = None;
+    let mut best = -1.0f32;
+    for (id, tt) in &ctx.opts.templates {
+        let c = cosine(&tokens, tt);
+        if c >= TEMPLATE_MATCH && c > best {
+            best = c;
+            template_id = Some(id.clone());
+        }
+    }
+    let is_template = template_id.is_some();
     let section_kind = match segment::classify(text) {
         Section::Tech => "tech",
         Section::Business => "business",
@@ -379,6 +386,7 @@ fn make(
         section_path: ctx.sect_path_json.clone(),
         section_kind: Some(section_kind.to_string()),
         is_template,
+        template_id,
         text: text.to_string(),
         normalized_text: normalized.clone(),
         page,
@@ -616,7 +624,7 @@ mod tests {
         let jieba = Jieba::new();
         let tpl = "我方承诺提供7×24小时技术支持服务，质保期内免费维护，确保系统稳定运行";
         let opts = ChunkerOptions {
-            template_tokens: vec![tokenize(&jieba, tpl)],
+            templates: vec![("tpl-1".to_string(), tokenize(&jieba, tpl))],
             ..Default::default()
         };
         let text = format!("{tpl}。\n本项目采用独有的边缘计算架构与自研调度算法。");
@@ -626,11 +634,13 @@ mod tests {
             .find(|c| c.chunk_level == "paragraph" && c.text.contains("7×24"))
             .unwrap();
         assert!(tpl_chunk.is_template, "命中模板应标记");
+        assert_eq!(tpl_chunk.template_id.as_deref(), Some("tpl-1"), "应记录命中的样板 id");
         let normal = chunks
             .iter()
             .find(|c| c.chunk_level == "paragraph" && c.text.contains("边缘计算"))
             .unwrap();
         assert!(!normal.is_template);
+        assert!(normal.template_id.is_none());
     }
 
     #[test]

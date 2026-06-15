@@ -16,6 +16,8 @@ import type {
   JobDto,
   PageResult,
   TemplateDto,
+  NewTemplateDto,
+  BatchTemplateResult,
   WorkspaceDto,
 } from "./types";
 import type { PairMatchDto } from "./types";
@@ -105,10 +107,25 @@ export const setAppSettings = (settings: Record<string, unknown>) =>
   call<void>("set_app_settings", { settings });
 export const getAppInfo = () => call<AppInfoDto>("get_app_info");
 export const listSourceTemplates = () => call<TemplateDto[]>("list_source_templates");
-export const saveSourceTemplate = (name: string, text: string, id?: string) =>
-  call<TemplateDto>("save_source_template", { id: id ?? null, name, text });
+export const saveSourceTemplate = (
+  name: string,
+  text: string,
+  opts?: { id?: string; category?: string | null },
+) =>
+  call<TemplateDto>("save_source_template", {
+    id: opts?.id ?? null,
+    name,
+    text,
+    category: opts?.category ?? null,
+  });
+export const setSourceTemplateEnabled = (id: string, enabled: boolean) =>
+  call<void>("set_source_template_enabled", { id, enabled });
+export const batchSaveSourceTemplates = (items: NewTemplateDto[]) =>
+  call<BatchTemplateResult>("batch_save_source_templates", { items });
 export const deleteSourceTemplate = (id: string) =>
   call<void>("delete_source_template", { id });
+/** 读取文本文件内容（批量导入选 .txt/.csv/.json）。UTF-8 优先，GB18030 兜底。 */
+export const readTextFile = (path: string) => call<string>("read_text_file", { path });
 
 // —— 比对 ——
 export const startCompare = (workspaceId: string, request: CompareRequest) =>

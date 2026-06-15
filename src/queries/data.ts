@@ -8,7 +8,13 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import * as api from "../api";
-import type { ClusterFilter, CompareRequest, JobDto } from "../api/types";
+import type {
+  ClusterFilter,
+  CompareRequest,
+  JobDto,
+  NewTemplateDto,
+  TemplateDto,
+} from "../api/types";
 
 export function useWorkspaces() {
   return useQuery({ queryKey: ["workspaces"], queryFn: api.listWorkspaces });
@@ -319,8 +325,46 @@ export function useTemplates() {
 export function useSaveTemplate() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ name, text, id }: { name: string; text: string; id?: string }) =>
-      api.saveSourceTemplate(name, text, id),
+    mutationFn: ({
+      name,
+      text,
+      id,
+      category,
+    }: {
+      name: string;
+      text: string;
+      id?: string;
+      category?: string | null;
+    }) => api.saveSourceTemplate(name, text, { id, category }),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["templates"] }),
+  });
+}
+
+export function useSetTemplateEnabled() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.setSourceTemplateEnabled(id, enabled),
+    // 乐观更新：列表立即生效，失败回滚由失效兜底
+    onMutate: async ({ id, enabled }) => {
+      await qc.cancelQueries({ queryKey: ["templates"] });
+      const prev = qc.getQueryData<TemplateDto[]>(["templates"]);
+      qc.setQueryData<TemplateDto[]>(["templates"], (old) =>
+        old?.map((t) => (t.id === id ? { ...t, enabled } : t)),
+      );
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["templates"], ctx.prev);
+    },
+    onSettled: () => void qc.invalidateQueries({ queryKey: ["templates"] }),
+  });
+}
+
+export function useBatchSaveTemplates() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (items: NewTemplateDto[]) => api.batchSaveSourceTemplates(items),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["templates"] }),
   });
 }

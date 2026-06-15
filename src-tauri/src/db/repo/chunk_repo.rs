@@ -13,6 +13,8 @@ pub struct NewChunk {
     pub section_path: Option<String>,
     pub section_kind: Option<String>,
     pub is_template: bool,
+    /// 命中的查重源样板 id（用于命中统计）；未命中为 None。
+    pub template_id: Option<String>,
     pub text: String,
     pub normalized_text: String,
     pub page: Option<u32>,
@@ -48,9 +50,9 @@ pub fn insert_all(
     let now = now_iso();
     let mut ins_chunk = conn.prepare(
         "INSERT INTO chunks (id, document_id, chunk_type, chunk_level, section_path, section_kind,
-         is_template, text, normalized_text, char_count, page, order_index, start_offset,
+         is_template, template_id, text, normalized_text, char_count, page, order_index, start_offset,
          end_offset, exact_hash, normalized_hash, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )?;
     let mut ins_feat = conn.prepare(
         "INSERT INTO chunk_features (chunk_id, token_json, entity_json, minhash_blob, created_at)
@@ -66,6 +68,7 @@ pub fn insert_all(
             c.section_path,
             c.section_kind,
             c.is_template as i64,
+            c.template_id,
             c.text,
             c.normalized_text,
             c.text.chars().count() as i64,
@@ -147,19 +150,20 @@ pub fn copy_all(conn: &rusqlite::Connection, from_doc: &str, to_doc: &str) -> Ap
         "SELECT c.id, c.chunk_type, c.chunk_level, c.section_path, c.section_kind, c.is_template,
          c.text, c.normalized_text, c.char_count, c.page, c.order_index, c.start_offset,
          c.end_offset, c.exact_hash, c.normalized_hash, f.token_json, f.char_ngram_json,
-         f.entity_json, f.minhash_blob, f.extra_json
+         f.entity_json, f.minhash_blob, f.extra_json, c.template_id
          FROM chunks c LEFT JOIN chunk_features f ON f.chunk_id = c.id
          WHERE c.document_id = ?1 ORDER BY c.order_index",
     )?;
     let rows: Vec<_> = sel
         .query_map([from_doc], |r| {
             Ok((
-                r.get::<_, String>(1)?,         // chunk_type
-                r.get::<_, String>(2)?,         // chunk_level
-                r.get::<_, Option<String>>(3)?, // section_path
-                r.get::<_, Option<String>>(4)?, // section_kind
-                r.get::<_, i64>(5)?,            // is_template
-                r.get::<_, String>(6)?,         // text
+                r.get::<_, String>(1)?,          // chunk_type
+                r.get::<_, String>(2)?,          // chunk_level
+                r.get::<_, Option<String>>(3)?,  // section_path
+                r.get::<_, Option<String>>(4)?,  // section_kind
+                r.get::<_, i64>(5)?,             // is_template
+                r.get::<_, Option<String>>(20)?, // template_id
+                r.get::<_, String>(6)?,          // text
                 r.get::<_, String>(7)?,         // normalized_text
                 r.get::<_, Option<i64>>(8)?,    // char_count
                 r.get::<_, Option<i64>>(9)?,    // page
@@ -181,9 +185,9 @@ pub fn copy_all(conn: &rusqlite::Connection, from_doc: &str, to_doc: &str) -> Ap
 
     let mut ins_chunk = conn.prepare(
         "INSERT INTO chunks (id, document_id, chunk_type, chunk_level, section_path, section_kind,
-         is_template, text, normalized_text, char_count, page, order_index, start_offset,
+         is_template, template_id, text, normalized_text, char_count, page, order_index, start_offset,
          end_offset, exact_hash, normalized_hash, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )?;
     let mut ins_feat = conn.prepare(
         "INSERT INTO chunk_features (chunk_id, token_json, char_ngram_json, entity_json,
@@ -192,9 +196,9 @@ pub fn copy_all(conn: &rusqlite::Connection, from_doc: &str, to_doc: &str) -> Ap
     let n = rows.len();
     for row in rows {
         let id = uuid::Uuid::new_v4().to_string();
-        let (ct, cl, sp, sk, tpl, text, norm, cc, page, oi, so, eo, eh, nh, feat) = row;
+        let (ct, cl, sp, sk, tpl, tid, text, norm, cc, page, oi, so, eo, eh, nh, feat) = row;
         ins_chunk.execute(params![
-            id, to_doc, ct, cl, sp, sk, tpl, text, norm, cc, page, oi, so, eo, eh, nh, now
+            id, to_doc, ct, cl, sp, sk, tpl, tid, text, norm, cc, page, oi, so, eo, eh, nh, now
         ])?;
         ins_feat.execute(params![id, feat.0, feat.1, feat.2, feat.3, feat.4, now])?;
     }

@@ -52,8 +52,24 @@ export interface TemplateDto {
   id: string;
   name: string;
   text: string;
+  /** 分类（旧行/未填为 null，前端归一显示「未分类」）。 */
+  category: string | null;
   enabled: boolean;
   createdAt: string;
+  /** 命中过该样板的文档数（仅反映重新导入后记录的命中）。 */
+  hitCount: number;
+}
+
+/** 批量导入解析后的单条。 */
+export interface NewTemplateDto {
+  category?: string | null;
+  name: string;
+  text: string;
+}
+
+export interface BatchTemplateResult {
+  inserted: number;
+  skipped: number;
 }
 
 export interface EmbedModelInfo {

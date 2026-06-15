@@ -3,7 +3,15 @@
 use crate::error::{AppError, AppErrorCode, AppResult};
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SEED_TEMPLATES_V2, PARSE_OPTIONS_V3, CLUSTER_LOCATION_V4, PREVIEW_NOTES_V5];
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1,
+    SEED_TEMPLATES_V2,
+    PARSE_OPTIONS_V3,
+    CLUSTER_LOCATION_V4,
+    PREVIEW_NOTES_V5,
+    CATEGORY_V6,
+    CHUNK_TEMPLATE_V7,
+];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -259,6 +267,24 @@ CREATE TABLE annotations (
 );
 CREATE INDEX idx_annotations_ws ON annotations(workspace_id);
 CREATE INDEX idx_annotations_doc ON annotations(document_id);
+";
+
+// V6：source_templates 增 category（查重源按分类展示/筛选）。
+// 旧行该列 NULL，前端统一归一为「未分类」；同时为三条内置种子补默认分类。
+// 纯 ADD COLUMN，向后兼容；不触碰 enabled 列，list_enabled 契约不受影响。
+const CATEGORY_V6: &str = "
+ALTER TABLE source_templates ADD COLUMN category TEXT;
+UPDATE source_templates SET category='法律法规' WHERE id='t-law' AND category IS NULL;
+UPDATE source_templates SET category='资质证照' WHERE id='t-qual' AND category IS NULL;
+UPDATE source_templates SET category='售后承诺' WHERE id='t-after' AND category IS NULL;
+";
+
+// V7：chunks 增 template_id（命中的查重源样板 id），统计「每条样板命中过多少文档」。
+// 旧行 NULL（命中信息仅在重新导入后才记录）；命中数按 COUNT(DISTINCT document_id) 聚合。
+// 索引加速按 template_id 的统计查询。
+const CHUNK_TEMPLATE_V7: &str = "
+ALTER TABLE chunks ADD COLUMN template_id TEXT;
+CREATE INDEX idx_chunks_template_id ON chunks(template_id);
 ";
 
 #[cfg(test)]

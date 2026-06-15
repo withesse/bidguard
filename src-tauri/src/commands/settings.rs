@@ -1,10 +1,10 @@
 // 设置与模板 commands：用户全局配置（app_settings 表 "config" 键）、查重源模板、应用信息。
 use super::conn;
+use crate::db::repo::template_repo::{BatchResult, NewTemplate, TemplateRow};
 use crate::db::repo::{settings_repo, template_repo};
-use crate::db::repo::template_repo::TemplateRow;
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::state::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 /// 用户全局配置 patch（覆盖内置默认；工作区/任务层再往上叠）。
@@ -65,6 +65,7 @@ pub async fn save_source_template(
     id: Option<String>,
     name: String,
     text: String,
+    category: Option<String>,
     state: State<'_, AppState>,
 ) -> AppResult<TemplateRow> {
     let name = name.trim();
@@ -72,10 +73,55 @@ pub async fn save_source_template(
     if name.is_empty() || text.is_empty() {
         return Err(AppError::new(AppErrorCode::InvalidConfig, "模板名称与内容不能为空"));
     }
-    template_repo::save(&*conn(&state)?, id.as_deref(), name, text)
+    template_repo::save(&*conn(&state)?, id.as_deref(), name, text, category.as_deref())
+}
+
+#[tauri::command]
+pub async fn set_source_template_enabled(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    template_repo::set_enabled(&*conn(&state)?, &id, enabled)
+}
+
+/// 批量导入的单条 DTO（前端解析后传入）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewTemplateDto {
+    #[serde(default)]
+    pub category: Option<String>,
+    pub name: String,
+    pub text: String,
+}
+
+#[tauri::command]
+pub async fn batch_save_source_templates(
+    items: Vec<NewTemplateDto>,
+    state: State<'_, AppState>,
+) -> AppResult<BatchResult> {
+    let rows: Vec<NewTemplate> = items
+        .into_iter()
+        .map(|d| NewTemplate { category: d.category, name: d.name, text: d.text })
+        .collect();
+    let mut c = conn(&state)?;
+    template_repo::batch_save(&mut c, &rows)
 }
 
 #[tauri::command]
 pub async fn delete_source_template(id: String, state: State<'_, AppState>) -> AppResult<()> {
     template_repo::delete(&*conn(&state)?, &id)
+}
+
+/// 读取文本文件内容（批量导入选 .txt/.csv/.json 时用）。UTF-8 优先，GB18030 兜底。
+/// 与放开 fs 全盘 scope 相比更收敛：仅此一处按用户经对话框选定的路径读取。
+#[tauri::command]
+pub async fn read_text_file(path: String) -> AppResult<String> {
+    tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|e| AppError::new(AppErrorCode::Unknown, "读取文件失败").with_detail(e.to_string()))?
+        .map(|bytes| crate::engine::parse::decode_text(&bytes))
+        .map_err(|e| {
+            AppError::new(AppErrorCode::FileNotFound, "文件不存在或不可读").with_detail(e.to_string())
+        })
 }

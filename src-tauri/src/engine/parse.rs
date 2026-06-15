@@ -293,7 +293,7 @@ fn is_page_number_line(line: &str) -> bool {
 }
 
 /// 解码文本：优先 UTF-8（含 BOM），无效时回落 GB18030（覆盖 GBK/GB2312）。
-fn decode_text(bytes: &[u8]) -> String {
+pub fn decode_text(bytes: &[u8]) -> String {
     let body = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         &bytes[3..]
     } else {
