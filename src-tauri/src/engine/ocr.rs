@@ -35,6 +35,16 @@ fn model_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
     None
 }
 
+/// OCR 模型是否就位（工具屏/自检用）。
+pub fn model_present() -> bool {
+    model_paths().is_some()
+}
+
+/// 命中的模型目录（就位时返回所在目录，供工具屏展示路径）。
+pub fn model_location() -> Option<PathBuf> {
+    model_paths().map(|(det, _, _)| det.parent().map(Path::to_path_buf).unwrap_or(det))
+}
+
 /// 一行识别文本及其在页内的归一化位置（0..1，原点左上）。
 /// 供前端在页图上叠加隐形可选中文本层（原文版式预览）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -3,6 +3,9 @@ import { call } from "./client";
 import type {
   AnnotationDto,
   AppInfoDto,
+  DiagnosticItem,
+  ModelStatusDto,
+  StorageInfoDto,
   ClusterDetailDto,
   ClusterFilter,
   ClusterSummaryDto,
@@ -84,6 +87,17 @@ export const cleanupOldJobs = (days: number) => call<number>("cleanup_old_jobs",
 // —— 导出 ——
 export const exportReport = (jobId: string, format: string, path: string) =>
   call<{ path: string; format: string }>("export_report", { jobId, format, path });
+
+// —— 工具：模型 / 存储 / 自检 ——
+export const getModelStatus = () => call<ModelStatusDto>("get_model_status");
+export const downloadEmbeddingModel = (modelKey: string) =>
+  call<void>("download_embedding_model", { modelKey });
+export const clearEmbeddingModel = (modelKey: string) =>
+  call<number>("clear_embedding_model", { modelKey });
+export const getStorageInfo = () => call<StorageInfoDto>("get_storage_info");
+export const clearEmbeddingCache = () => call<number>("clear_embedding_cache");
+export const vacuumDb = () => call<void>("vacuum_db");
+export const runDiagnostics = () => call<DiagnosticItem[]>("run_diagnostics");
 
 // —— 设置 / 模板 / 应用信息 ——
 export const getAppSettings = () => call<Record<string, unknown> | null>("get_app_settings");

@@ -18,6 +18,55 @@ export function useAppInfo() {
   return useQuery({ queryKey: ["appInfo"], queryFn: api.getAppInfo, staleTime: Infinity });
 }
 
+// —— 工具：模型 / 存储 / 自检 ——
+export function useModelStatus() {
+  return useQuery({ queryKey: ["modelStatus"], queryFn: api.getModelStatus });
+}
+export function useStorageInfo() {
+  return useQuery({ queryKey: ["storageInfo"], queryFn: api.getStorageInfo });
+}
+export function useDiagnostics(enabled: boolean) {
+  return useQuery({ queryKey: ["diagnostics"], queryFn: api.runDiagnostics, enabled });
+}
+export function useDownloadModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.downloadEmbeddingModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useClearModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearEmbeddingModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useClearEmbeddingCache() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearEmbeddingCache,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["storageInfo"] }),
+  });
+}
+export function useVacuumDb() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.vacuumDb,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["storageInfo"] }),
+  });
+}
+export function useCleanupOldJobs() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.cleanupOldJobs,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["jobs"] });
+      void qc.invalidateQueries({ queryKey: ["storageInfo"] });
+    },
+  });
+}
+
 export function useWorkspace(workspaceId: string | undefined) {
   return useQuery({
     queryKey: ["workspace", workspaceId],

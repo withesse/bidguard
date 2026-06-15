@@ -18,6 +18,7 @@ import { ClustersScreen } from "../screens/ClustersScreen";
 import { ClusterDetail } from "../screens/ClusterDetail";
 import { DocPreview } from "../screens/DocPreview";
 import { Library } from "../screens/Library";
+import { Tools } from "../screens/Tools";
 import { Settings } from "../screens/Settings";
 import { MatrixScreen } from "../screens/Matrix";
 import { Compare } from "../screens/Compare";
@@ -28,6 +29,7 @@ const NAV_PATH: Record<NavKey, string> = {
   tasks: "/starred",
   history: "/history",
   library: "/library",
+  tools: "/tools",
   settings: "/settings",
 };
 
@@ -36,6 +38,7 @@ function activeKey(path: string): NavKey {
   if (path.startsWith("/starred")) return "tasks";
   if (path.startsWith("/history")) return "history";
   if (path.startsWith("/library")) return "library";
+  if (path.startsWith("/tools")) return "tools";
   if (path.startsWith("/settings")) return "settings";
   if (path.includes("/job/")) return "tasks";
   return "home";
@@ -187,6 +190,7 @@ export const router = createHashRouter([
       { path: "/starred", element: <JobsList title="我的任务" mode="starred" /> },
       { path: "/history", element: <JobsList title="历史记录" mode="all" /> },
       { path: "/library", element: <Library /> },
+      { path: "/tools", element: <Tools /> },
       { path: "/settings", element: <Settings /> },
       { path: "/workspace/:wsId/new", element: <CompareSetup /> },
       { path: "/workspace/:wsId/doc/:docId", element: <DocPreview /> },

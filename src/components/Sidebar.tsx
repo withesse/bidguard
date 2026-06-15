@@ -5,7 +5,7 @@ import { Icon } from "../design/Icon";
 import { useTheme } from "../theme";
 import type { Screen } from "../routes";
 
-export type NavKey = "home" | "tasks" | "history" | "library" | "settings";
+export type NavKey = "home" | "tasks" | "history" | "library" | "tools" | "settings";
 
 export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) => void }) {
   const { dark, layout } = useTheme();
@@ -83,6 +83,7 @@ export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) 
       <SidebarLabel collapsed={compact}>工具</SidebarLabel>
       <div style={{ padding: "0 8px", display: "flex", flexDirection: "column", gap: 1 }}>
         {nav("library", "查重源", "book")}
+        {nav("tools", "工具箱", "wrench")}
       </div>
 
       <div style={{ flex: 1 }} />

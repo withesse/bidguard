@@ -44,23 +44,76 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache/bidguard/fastembed"))
 }
 
-/// 模型文件是否已在本地缓存（无需联网即可加载）。
-pub fn model_cached() -> bool {
-    fn has_onnx(dir: &std::path::Path, depth: u8) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else { return false };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                if depth > 0 && has_onnx(&p, depth - 1) {
-                    return true;
-                }
-            } else if p.extension().is_some_and(|x| x == "onnx") {
-                return true;
+/// 语义模型缓存目录（工具屏展示用）。
+pub fn cache_dir_path() -> Option<std::path::PathBuf> {
+    cache_dir()
+}
+
+/// 递归收集缓存目录下所有文件 (路径, 字节)，最深 5 层。
+fn walk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(std::path::PathBuf, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() && depth > 0 => walk_files(&p, depth - 1, out),
+            Ok(t) if t.is_file() => {
+                let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push((p, sz));
             }
+            _ => {}
         }
-        false
     }
-    cache_dir().map(|d| has_onnx(&d, 4)).unwrap_or(false)
+}
+
+/// 模型文件是否已在本地缓存（任一模型，无需联网即可加载）。
+pub fn model_cached() -> bool {
+    let Some(d) = cache_dir() else { return false };
+    let mut files = Vec::new();
+    walk_files(&d, 5, &mut files);
+    files.iter().any(|(p, _)| p.extension().is_some_and(|x| x == "onnx"))
+}
+
+/// 指定模型是否已缓存（fastembed 缓存目录名含模型 id，据此匹配）。
+pub fn model_cached_for(spec: &EmbedModelSpec) -> bool {
+    let Some(d) = cache_dir() else { return false };
+    let id = spec.id.to_ascii_lowercase();
+    let mut files = Vec::new();
+    walk_files(&d, 5, &mut files);
+    files.iter().any(|(p, _)| {
+        p.extension().is_some_and(|x| x == "onnx")
+            && p.to_string_lossy().to_ascii_lowercase().contains(&id)
+    })
+}
+
+/// 指定模型缓存占用字节数（0 = 未缓存）。
+pub fn model_cache_bytes(spec: &EmbedModelSpec) -> u64 {
+    let Some(d) = cache_dir() else { return 0 };
+    let id = spec.id.to_ascii_lowercase();
+    let mut files = Vec::new();
+    walk_files(&d, 5, &mut files);
+    files
+        .iter()
+        .filter(|(p, _)| p.to_string_lossy().to_ascii_lowercase().contains(&id))
+        .map(|(_, sz)| *sz)
+        .sum()
+}
+
+/// 删除指定模型的本地缓存（含其 fastembed 目录）。返回删除的字节数。
+pub fn clear_model_cache(spec: &EmbedModelSpec) -> u64 {
+    let Some(d) = cache_dir() else { return 0 };
+    let id = spec.id.to_ascii_lowercase();
+    let mut removed = 0u64;
+    let Ok(entries) = std::fs::read_dir(&d) else { return 0 };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() && p.to_string_lossy().to_ascii_lowercase().contains(&id) {
+            let mut files = Vec::new();
+            walk_files(&p, 5, &mut files);
+            removed += files.iter().map(|(_, sz)| *sz).sum::<u64>();
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    removed
 }
 
 fn init_model(model: EmbeddingModel) -> Option<TextEmbedding> {

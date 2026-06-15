@@ -5,6 +5,7 @@ pub mod document;
 pub mod export;
 pub mod job;
 pub mod settings;
+pub mod tools;
 pub mod workspace;
 
 use crate::db::repo::{settings_repo, workspace_repo};

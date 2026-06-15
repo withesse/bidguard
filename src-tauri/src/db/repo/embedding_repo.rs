@@ -4,6 +4,16 @@ use crate::error::AppResult;
 use rusqlite::params;
 use std::collections::HashMap;
 
+/// 缓存中的向量条数（工具屏展示）。
+pub fn count(conn: &rusqlite::Connection) -> AppResult<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?)
+}
+
+/// 清空语义向量缓存，返回删除条数。换模型/释放空间用；下次比对会按需重算。
+pub fn clear(conn: &rusqlite::Connection) -> AppResult<usize> {
+    Ok(conn.execute("DELETE FROM embeddings", [])?)
+}
+
 fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

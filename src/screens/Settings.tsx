@@ -119,7 +119,7 @@ export function Settings() {
     );
   };
 
-  // 无后端对应的本地偏好（围标提示/工商联动/自动清理）
+  // 无后端对应的本地偏好（围标提示/工商联动）；任务清理已迁至「工具箱」的手动入口
   const [s, setS] = useState<DetectSettings>(() => getSettings());
   const change = (patch: Partial<DetectSettings>) => setS(setSettings(patch));
   const pct = Math.round((cmp.similarityThreshold as number) * 100);
@@ -323,14 +323,12 @@ export function Settings() {
               sub="首次启用语义查重需下载模型（~120MB，仅此一次）；关闭则无缓存时自动降级词面比对"
               ink={ink}
               mute={mute}
+              last
             >
               <Toggle
                 on={sec.allowCloudModel as boolean}
                 onChange={() => changeSec({ allowCloudModel: !sec.allowCloudModel })}
               />
-            </Row>
-            <Row label="自动清理 30 天前的任务" sub="启动时清理已完结的历史任务与报告" ink={ink} mute={mute} last>
-              <Toggle on={s.autoClean} onChange={() => change({ autoClean: !s.autoClean })} />
             </Row>
           </Card>
 

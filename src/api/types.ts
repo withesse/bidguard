@@ -248,3 +248,29 @@ export interface OcrLine {
   w: number;
   h: number;
 }
+
+// —— 工具：模型 / 存储 / 自检 ——
+export interface EmbedModelStatus {
+  key: string;
+  label: string;
+  cached: boolean;
+  sizeBytes: number;
+}
+export interface ModelStatusDto {
+  ocrPresent: boolean;
+  ocrLocation: string | null;
+  embedCacheDir: string | null;
+  embeddingModels: EmbedModelStatus[];
+}
+export interface StorageInfoDto {
+  dbBytes: number;
+  embeddingRows: number;
+  documentCount: number;
+  jobCount: number;
+}
+export interface DiagnosticItem {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+}

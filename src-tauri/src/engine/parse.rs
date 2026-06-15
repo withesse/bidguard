@@ -476,6 +476,11 @@ fn bind_pdfium() -> Option<Pdfium> {
     None
 }
 
+/// pdfium 库是否可绑定（环境自检用）。
+pub fn pdfium_available() -> bool {
+    bind_pdfium().is_some()
+}
+
 fn pdfium_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(p) = std::env::var("BIDGUARD_PDFIUM_DIR") {

@@ -113,7 +113,14 @@ pub fn run() {
             commands::settings::list_source_templates,
             commands::settings::save_source_template,
             commands::settings::delete_source_template,
-            commands::export::export_report
+            commands::export::export_report,
+            commands::tools::get_model_status,
+            commands::tools::download_embedding_model,
+            commands::tools::clear_embedding_model,
+            commands::tools::get_storage_info,
+            commands::tools::clear_embedding_cache,
+            commands::tools::vacuum_db,
+            commands::tools::run_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

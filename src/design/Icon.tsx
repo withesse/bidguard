@@ -33,6 +33,9 @@ const paths: Record<string, ReactNode> = {
   home: (
     <path d="M2.5 7L8 2.5 13.5 7v6A.5.5 0 0 1 13 13.5h-3v-4h-4v4h-3A.5.5 0 0 1 2.5 13z" />
   ),
+  wrench: (
+    <path d="M10.5 2.2a3 3 0 0 0-3.7 3.9L2.4 10.5a1.2 1.2 0 0 0 1.7 1.7l4.4-4.4a3 3 0 0 0 3.9-3.7L10.6 5.4 8.9 5.1 8.6 3.4z" />
+  ),
   history: <path d="M3 8a5 5 0 1 0 1.4-3.5L3 6M3 3v3h3M8 5.5V8l2 1.5" />,
   check: <path d="M3 8.5l3 3 7-7" />,
   plus: <path d="M8 3.5v9M3.5 8h9" />,
