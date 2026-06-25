@@ -38,14 +38,21 @@ pub struct ParsedBlocks {
 /// 新 API：结构化段块 + 取消旗标（OCR/栅格化等长阶段逐页检查）。
 /// 取消时尽快返回 Err；调用方应先自查旗标再决定如何归类该错误。
 pub fn parse_file_blocks(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
-    parse_file_blocks_opt(path, cancel, false)
+    parse_file_blocks_opt(
+        path,
+        cancel,
+        false,
+        crate::engine::ocr::resolve(crate::engine::ocr::DEFAULT_OCR_MODEL),
+    )
 }
 
 /// 带选项的解析。ocr_docx_images=true 时对 docx 内嵌图片做 OCR（截图式表格/资质里的文字）。
+/// ocr_model 选定扫描件/图片 OCR 的档位（PP-OCRv6 tiny/small/medium）。
 pub fn parse_file_blocks_opt(
     path: &Path,
     cancel: &AtomicBool,
     ocr_docx_images: bool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
 ) -> Result<ParsedBlocks, String> {
     let ext = path
         .extension()
@@ -53,9 +60,9 @@ pub fn parse_file_blocks_opt(
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "docx" => parse_docx(path, cancel, ocr_docx_images),
+        "docx" => parse_docx(path, cancel, ocr_docx_images, ocr_model),
         "txt" | "md" => parse_txt(path),
-        "pdf" => parse_pdf(path, cancel),
+        "pdf" => parse_pdf(path, cancel, ocr_model),
         "xlsx" | "xls" => parse_spreadsheet(path),
         other => Err(format!("暂不支持的文件类型: .{other}")),
     }
@@ -306,7 +313,11 @@ pub fn decode_text(bytes: &[u8]) -> String {
     cow.into_owned()
 }
 
-fn parse_pdf(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
+fn parse_pdf(
+    path: &Path,
+    cancel: &AtomicBool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+) -> Result<ParsedBlocks, String> {
     // 1) pdfium 文本（最鲁棒）；2) pdf-extract 回落；3) 扫描件 → OCR
     if let Some(pd) = parse_pdf_pdfium(path, cancel) {
         return Ok(pd);
@@ -317,18 +328,22 @@ fn parse_pdf(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
     if let Ok(pd) = parse_pdf_extract(path) {
         return Ok(pd);
     }
-    parse_pdf_ocr(path, cancel)
+    parse_pdf_ocr(path, cancel, ocr_model)
 }
 
 /// 扫描件路径：pdfium 栅格化每页 → oar-ocr 识别 → 按页拼接文本 + 行级版面。
-fn parse_pdf_ocr(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
+fn parse_pdf_ocr(
+    path: &Path,
+    cancel: &AtomicBool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+) -> Result<ParsedBlocks, String> {
     let imgs =
         rasterize_pdf(path, cancel).ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
     if imgs.is_empty() {
         return Err("PDF 无可渲染页面".into());
     }
     let pages = imgs.len() as u32;
-    let ocr_pages = crate::engine::ocr::ocr_images(imgs, cancel)
+    let ocr_pages = crate::engine::ocr::ocr_images(imgs, cancel, ocr_model)
         .ok_or_else(|| "OCR 不可用（缺模型或识别失败）".to_string())?;
     if cancel.load(Ordering::SeqCst) {
         return Err(CANCELLED.into());
@@ -547,7 +562,12 @@ fn pdf_decode_string(bytes: &[u8]) -> String {
     }
 }
 
-fn parse_docx(path: &Path, cancel: &AtomicBool, ocr_images: bool) -> Result<ParsedBlocks, String> {
+fn parse_docx(
+    path: &Path,
+    cancel: &AtomicBool,
+    ocr_images: bool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+) -> Result<ParsedBlocks, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("非法 docx (zip): {e}"))?;
 
@@ -557,7 +577,7 @@ fn parse_docx(path: &Path, cancel: &AtomicBool, ocr_images: bool) -> Result<Pars
 
     // 内嵌图片 OCR：截图式报价表/资质/公章里的文字，否则纯文本管线完全看不到
     if ocr_images {
-        let img_blocks = docx_image_ocr(&mut zip, cancel);
+        let img_blocks = docx_image_ocr(&mut zip, cancel, ocr_model);
         for b in &img_blocks {
             legacy_text.push_str(&b.text);
             legacy_text.push('\n');
@@ -596,12 +616,13 @@ const MIN_OCR_IMAGE_PX: u32 = 80; // 短边阈值，跳过图标/项目符号/�
 fn docx_image_ocr<R: Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     cancel: &AtomicBool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
 ) -> Vec<Block> {
     let imgs = collect_docx_images(zip, cancel);
     if imgs.is_empty() {
         return Vec::new();
     }
-    let Some(pages) = crate::engine::ocr::ocr_images(imgs, cancel) else {
+    let Some(pages) = crate::engine::ocr::ocr_images(imgs, cancel, ocr_model) else {
         return Vec::new(); // 模型不可用 / 被取消
     };
     pages
@@ -1126,8 +1147,9 @@ mod tests {
         // 无图片的 docx：开启 ocr_docx_images 不应改变结果、不应崩
         let body = "<w:p><w:r><w:t>本项目采用分层解耦的微服务架构设计方案。</w:t></w:r></w:p>";
         let p = write_docx_with_media(&dir, "plain.docx", body, &[]);
-        let off = parse_file_blocks_opt(Path::new(&p), &no_cancel(), false).unwrap();
-        let on = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true).unwrap();
+        let m = crate::engine::ocr::resolve("v6-small");
+        let off = parse_file_blocks_opt(Path::new(&p), &no_cancel(), false, m).unwrap();
+        let on = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true, m).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(off.blocks.len(), on.blocks.len(), "无图片时开关不影响块数");
         assert!(on.blocks.iter().any(|b| b.text.contains("微服务架构")));
@@ -1157,7 +1179,9 @@ mod tests {
             "<w:p><w:r><w:t>下表为截图。</w:t></w:r></w:p>",
             &[("page1.png", png.into_inner())],
         );
-        let pb = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true).unwrap();
+        let pb =
+            parse_file_blocks_opt(Path::new(&p), &no_cancel(), true, crate::engine::ocr::resolve("v6-small"))
+                .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let joined = pb.blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n").to_lowercase();
         assert!(
@@ -1272,7 +1296,7 @@ mod tests {
         }
         let imgs = rasterize_pdf(&fixture, &no_cancel()).expect("应能栅格化 PDF");
         assert!(!imgs.is_empty(), "应渲染出至少一页");
-        let pages = crate::engine::ocr::ocr_images(imgs, &no_cancel())
+        let pages = crate::engine::ocr::ocr_images(imgs, &no_cancel(), crate::engine::ocr::resolve("v6-small"))
             .expect("OCR 应可用（模型在 src-tauri/models）");
         let text = pages.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n").to_lowercase();
         assert!(

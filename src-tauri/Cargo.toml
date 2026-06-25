@@ -36,6 +36,8 @@ similar = "2"        # 字符级 diff（逐对对比高亮）
 rust_xlsxwriter = "0.79" # 导出 Excel 报告
 fastembed = "5"      # 语义查重（中文 embedding；ort rc.12，与 oar-ocr 对齐）
 oar-ocr = "0.7"      # 扫描件中文 OCR（PaddleOCR ONNX via ort rc.12）
+ureq = "3"           # 按需下载 OCR 高精档 .tar（已在依赖树，提升为直接依赖）
+tar = "0.4"          # 解压 PaddleOCR .tar 推理包取 inference.onnx
 image = "0.25"       # 栅格化 PDF 页 → RgbImage 喂 OCR
 encoding_rs = "0.8"  # GBK/GB18030 文本解码（国标编码标书）
 r2d2_sqlite = { version = "0.34.0", features = ["bundled"] }

@@ -28,6 +28,8 @@ pub struct ImportOptions {
     pub preserve_page_number: bool,
     pub remove_header_footer: bool,
     pub ocr_docx_images: bool,
+    /// OCR 档位 key（PP-OCRv6 tiny/small/medium）。
+    pub ocr_model: String,
     pub language: String, // auto | zh | en
 }
 
@@ -50,6 +52,7 @@ impl ImportOptions {
             preserve_page_number: cfg.parser.preserve_page_number,
             remove_header_footer: cfg.parser.remove_header_footer,
             ocr_docx_images: cfg.parser.ocr_docx_images,
+            ocr_model: cfg.parser.ocr_model.clone(),
             language: cfg.compare.language.clone(),
         }
     }
@@ -57,7 +60,7 @@ impl ImportOptions {
     /// 配置指纹：跨工作区分块缓存复用的匹配键（配置不同 → 分块不可互换）。
     pub fn options_hash(&self) -> String {
         let s = format!(
-            "v3|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|lang={}",
+            "v4|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|lang={}",
             self.min_paragraph_chars,
             self.normalize.ignore_case,
             self.normalize.ignore_punctuation,
@@ -66,6 +69,7 @@ impl ImportOptions {
             self.preserve_page_number,
             self.remove_header_footer,
             self.ocr_docx_images,
+            self.ocr_model,
             self.language,
         );
         crate::engine::normalize::sha256_hex(s.as_bytes())
@@ -263,8 +267,12 @@ fn import_one(
     };
 
     // 解析 + OCR（最重，锁外并行）
-    let parsed =
-        parse::parse_file_blocks_opt(Path::new(&item.path), ctx.cancel_flag(), opts.ocr_docx_images);
+    let parsed = parse::parse_file_blocks_opt(
+        Path::new(&item.path),
+        ctx.cancel_flag(),
+        opts.ocr_docx_images,
+        crate::engine::ocr::resolve(&opts.ocr_model),
+    );
     if ctx.cancelled() {
         // 解析被打断的半成品不保留（该行还没有任何分块）
         let _w = db_write.lock().unwrap();

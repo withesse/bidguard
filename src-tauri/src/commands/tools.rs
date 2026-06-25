@@ -71,6 +71,25 @@ pub async fn clear_embedding_model(model_key: String) -> AppResult<u64> {
     Ok(embed::clear_model_cache(embed::resolve(&model_key)))
 }
 
+/// 按需下载某 OCR 高精档（medium）。阻塞下载/解压，放 spawn_blocking。返回写入字节数。
+#[tauri::command]
+pub async fn download_ocr_model(model_key: String) -> AppResult<u64> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ocr::download_model(ocr::resolve(&model_key)).map_err(|e| {
+            AppError::new(AppErrorCode::CompareFailed, "OCR 模型下载失败（检查网络或磁盘）")
+                .with_detail(e)
+        })
+    })
+    .await
+    .map_err(|e| AppError::new(AppErrorCode::Unknown, "下载任务失败").with_detail(e.to_string()))?
+}
+
+/// 删除某已下载的 OCR 高精档。返回释放字节数。
+#[tauri::command]
+pub async fn clear_ocr_model(model_key: String) -> AppResult<u64> {
+    Ok(ocr::clear_model(ocr::resolve(&model_key)))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageInfo {

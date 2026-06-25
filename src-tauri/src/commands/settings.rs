@@ -30,6 +30,19 @@ pub struct EmbedModelInfo {
     pub label: String,
 }
 
+/// OCR 档位（PP-OCRv6 tiny/small/medium）；前端选择器与档位管理据此渲染。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrModelInfo {
+    pub key: String,
+    pub label: String,
+    pub size_label: String,
+    /// 是否随应用打包（false = 需下载）。
+    pub bundled: bool,
+    /// 当前是否就位（打包或已下载）。
+    pub present: bool,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
@@ -38,6 +51,9 @@ pub struct AppInfo {
     pub min_docs: usize,
     /// 可选语义模型清单（前端选择器据此渲染，不硬编码）。
     pub embedding_models: Vec<EmbedModelInfo>,
+    /// 可选 OCR 档位清单。
+    pub ocr_models: Vec<OcrModelInfo>,
+    pub default_ocr_model: String,
 }
 
 #[tauri::command]
@@ -50,6 +66,17 @@ pub async fn get_app_info() -> AppResult<AppInfo> {
             .iter()
             .map(|m| EmbedModelInfo { key: m.key.to_string(), label: m.label.to_string() })
             .collect(),
+        ocr_models: crate::engine::ocr::OCR_MODELS
+            .iter()
+            .map(|m| OcrModelInfo {
+                key: m.key.to_string(),
+                label: m.label.to_string(),
+                size_label: m.size_label.to_string(),
+                bundled: m.bundled,
+                present: crate::engine::ocr::model_present_for(m.key),
+            })
+            .collect(),
+        default_ocr_model: crate::engine::ocr::DEFAULT_OCR_MODEL.to_string(),
     })
 }
 

@@ -120,6 +120,8 @@ pub fn run() {
             commands::tools::get_model_status,
             commands::tools::download_embedding_model,
             commands::tools::clear_embedding_model,
+            commands::tools::download_ocr_model,
+            commands::tools::clear_ocr_model,
             commands::tools::get_storage_info,
             commands::tools::clear_embedding_cache,
             commands::tools::vacuum_db,

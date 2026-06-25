@@ -57,6 +57,8 @@ pub struct ParserDefaults {
     /// 对 docx 内嵌图片做 OCR（截图式报价表/资质/公章里的文字，否则文本管线完全看不到，
     /// 是围标规避文本查重的常见手法）。仅当图片存在且 OCR 模型可用时实际耗时。
     pub ocr_docx_images: bool,
+    /// 扫描件/图片 OCR 档位（PP-OCRv6 tiny/small/medium）。
+    pub ocr_model: String,
     pub min_paragraph_length: usize,
 }
 
@@ -67,6 +69,7 @@ impl Default for ParserDefaults {
             preserve_page_number: true,
             detect_table: true,
             ocr_docx_images: true,
+            ocr_model: "v6-small".into(),
             min_paragraph_length: 10,
         }
     }
