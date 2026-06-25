@@ -77,11 +77,22 @@ export interface EmbedModelInfo {
   label: string;
 }
 
+/** OCR 档位（PP-OCRv6 tiny/small/medium）。 */
+export interface OcrModelInfo {
+  key: string;
+  label: string;
+  sizeLabel: string;
+  bundled: boolean;
+  present: boolean;
+}
+
 export interface AppInfoDto {
   version: string;
   maxDocs: number;
   minDocs: number;
   embeddingModels: EmbedModelInfo[];
+  ocrModels: OcrModelInfo[];
+  defaultOcrModel: string;
 }
 
 export interface ProgressEvent {

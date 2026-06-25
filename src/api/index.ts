@@ -96,6 +96,11 @@ export const downloadEmbeddingModel = (modelKey: string) =>
   call<void>("download_embedding_model", { modelKey });
 export const clearEmbeddingModel = (modelKey: string) =>
   call<number>("clear_embedding_model", { modelKey });
+/** 按需下载某 OCR 高精档（medium）。返回写入字节数。 */
+export const downloadOcrModel = (modelKey: string) =>
+  call<number>("download_ocr_model", { modelKey });
+export const clearOcrModel = (modelKey: string) =>
+  call<number>("clear_ocr_model", { modelKey });
 export const getStorageInfo = () => call<StorageInfoDto>("get_storage_info");
 export const clearEmbeddingCache = () => call<number>("clear_embedding_cache");
 export const vacuumDb = () => call<void>("vacuum_db");

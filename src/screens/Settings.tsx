@@ -39,6 +39,7 @@ const BUILTIN_PARSER = {
   preservePageNumber: true,
   detectTable: true,
   ocrDocxImages: true,
+  ocrModel: "v6-small",
 };
 
 /** 与后端 config::SecurityDefaults 内置值一致的前端镜像。 */
@@ -301,6 +302,36 @@ export function Settings() {
                 onChange={() => changeParser({ ocrDocxImages: !parser.ocrDocxImages })}
               />
             </Row>
+            {(appInfo?.ocrModels ?? []).length > 0 && (
+              <Row
+                label="扫描件 OCR 档位"
+                sub="PP-OCRv6：tiny 极速 / small 标准 / medium 高精（需在工具箱下载）"
+                ink={ink}
+                mute={mute}
+              >
+                <select
+                  value={(parser.ocrModel as string) ?? "v6-small"}
+                  onChange={(e) => changeParser({ ocrModel: e.target.value })}
+                  style={{
+                    fontSize: 12,
+                    padding: "5px 8px",
+                    borderRadius: 7,
+                    border: `1px solid ${border}`,
+                    background: cardBg,
+                    color: ink,
+                    cursor: "pointer",
+                    maxWidth: 260,
+                  }}
+                >
+                  {(appInfo?.ocrModels ?? []).map((m) => (
+                    <option key={m.key} value={m.key}>
+                      {m.label} {m.sizeLabel}
+                      {m.present ? "" : " · 未下载"}
+                    </option>
+                  ))}
+                </select>
+              </Row>
+            )}
             <Row label="分词语言" sub="自动按内容判定；英文标书可固定 English" ink={ink} mute={mute} last>
               <SegControl
                 options={["自动", "中文", "English"]}

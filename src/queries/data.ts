@@ -48,6 +48,26 @@ export function useClearModel() {
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
   });
 }
+export function useDownloadOcrModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.downloadOcrModel,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["appInfo"] });
+      void qc.invalidateQueries({ queryKey: ["modelStatus"] });
+    },
+  });
+}
+export function useClearOcrModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearOcrModel,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["appInfo"] });
+      void qc.invalidateQueries({ queryKey: ["modelStatus"] });
+    },
+  });
+}
 export function useClearEmbeddingCache() {
   const qc = useQueryClient();
   return useMutation({

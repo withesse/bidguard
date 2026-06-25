@@ -8,11 +8,14 @@ import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
 import {
+  useAppInfo,
   useCleanupOldJobs,
   useClearEmbeddingCache,
   useClearModel,
+  useClearOcrModel,
   useDiagnostics,
   useDownloadModel,
+  useDownloadOcrModel,
   useModelStatus,
   useStorageInfo,
   useVacuumDb,
@@ -34,9 +37,12 @@ export function Tools() {
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
 
   const models = useModelStatus();
+  const appInfo = useAppInfo();
   const storage = useStorageInfo();
   const download = useDownloadModel();
   const clearModel = useClearModel();
+  const downloadOcr = useDownloadOcrModel();
+  const clearOcr = useClearOcrModel();
   const clearCache = useClearEmbeddingCache();
   const vacuum = useVacuumDb();
   const cleanup = useCleanupOldJobs();
@@ -56,6 +62,16 @@ export function Tools() {
     });
   };
 
+  const onDownloadOcr = (key: string, label: string) => {
+    setDownloading(key);
+    toast.show(`正在下载 ${label}（约 132MB），可能需要几分钟…`, "info");
+    downloadOcr.mutate(key, {
+      onSuccess: (n) => toast.show(`${label} 已就绪（${mb(n)}）`, "success"),
+      onError: (e) => toast.show("下载失败：" + errMsg(e), "error"),
+      onSettled: () => setDownloading(null),
+    });
+  };
+
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar title="工具箱" sub="模型、存储与环境自检" />
@@ -63,20 +79,37 @@ export function Tools() {
         <div style={{ maxWidth: 760, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
           {/* —— 模型管理 —— */}
           <Card title="模型管理" cardBg={cardBg} border={border} mute={mute}>
-            {/* OCR */}
-            <Row ink={ink} mute={mute} border={border}>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>扫描件 OCR 模型</div>
-                <div style={{ fontSize: 11, color: mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  PP-OCRv5 mobile · {ms?.ocrLocation ?? "随应用打包"}
+            {/* 扫描件 OCR 档位（PP-OCRv6 tiny/small/medium）*/}
+            {(appInfo.data?.ocrModels ?? []).map((m) => (
+              <Row key={m.key} ink={ink} mute={mute} border={border}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</div>
+                  <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
+                    {m.bundled
+                      ? `扫描件 OCR · 随应用打包 · ${m.sizeLabel}`
+                      : m.present
+                        ? `扫描件 OCR · 已下载 · ${m.sizeLabel}`
+                        : `扫描件 OCR · 未下载 · ${m.sizeLabel}`}
+                  </div>
                 </div>
-              </div>
-              {ms?.ocrPresent ? (
-                <Pill fg="#0F6E56" bg="rgba(15,110,86,0.13)" size={10}>已就位</Pill>
-              ) : (
-                <Pill fg="#A32D2D" bg="rgba(163,45,45,0.13)" size={10}>缺失</Pill>
-              )}
-            </Row>
+                {m.bundled ? (
+                  <Pill fg="#0F6E56" bg="rgba(15,110,86,0.13)" size={10}>已就位</Pill>
+                ) : m.present ? (
+                  <Button kind="ghost" size="sm" onClick={() =>
+                    clearOcr.mutate(m.key, {
+                      onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
+                      onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
+                    })
+                  }>
+                    删除
+                  </Button>
+                ) : (
+                  <Button kind="secondary" size="sm" disabled={downloading != null} onClick={() => onDownloadOcr(m.key, m.label)}>
+                    {downloading === m.key ? "下载中…" : "下载"}
+                  </Button>
+                )}
+              </Row>
+            ))}
 
             {/* 语义模型们 */}
             {(ms?.embeddingModels ?? []).map((m, i, arr) => (
