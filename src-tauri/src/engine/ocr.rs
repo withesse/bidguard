@@ -25,9 +25,9 @@ fn model_dirs() -> Vec<PathBuf> {
 /// 返回 (det, rec, dict) 三个模型路径，全部存在才返回。
 fn model_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
     for dir in model_dirs() {
-        let det = dir.join("ch_PP-OCRv4_det.onnx");
-        let rec = dir.join("ch_PP-OCRv4_rec.onnx");
-        let dict = dir.join("ppocr_keys_v1.txt");
+        let det = dir.join("pp-ocrv5_mobile_det.onnx");
+        let rec = dir.join("pp-ocrv5_mobile_rec.onnx");
+        let dict = dir.join("ppocrv5_dict.txt");
         if det.exists() && rec.exists() && dict.exists() {
             return Some((det, rec, dict));
         }

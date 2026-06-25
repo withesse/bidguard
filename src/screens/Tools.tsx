@@ -68,7 +68,7 @@ export function Tools() {
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>扫描件 OCR 模型</div>
                 <div style={{ fontSize: 11, color: mute, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  PP-OCRv4 · {ms?.ocrLocation ?? "随应用打包"}
+                  PP-OCRv5 mobile · {ms?.ocrLocation ?? "随应用打包"}
                 </div>
               </div>
               {ms?.ocrPresent ? (
