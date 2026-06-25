@@ -4,6 +4,8 @@ version = "0.2.0"
 description = "原本 · 标书查重 — 离线标书交叉比对与围标识别"
 authors = ["原本 Verum"]
 edition = "2021"
+# MSRV：oar-ocr 0.7.1 要求 Rust ≥ 1.95；显式声明使旧工具链得到清晰报错而非深处编译失败。
+rust-version = "1.95"
 
 [lib]
 # `_lib` 后缀避免与 bin 重名（Windows 下的已知问题）
