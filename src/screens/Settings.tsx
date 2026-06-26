@@ -30,7 +30,7 @@ const BUILTIN_COMPARE = {
   ignorePunctuation: true,
   ignoreCase: true,
   language: "auto",
-  embeddingModel: "e5-small",
+  embeddingModel: "bge-zh",
 };
 
 /** 与后端 config::ParserDefaults 内置值一致的前端镜像。 */
@@ -229,7 +229,7 @@ export function Settings() {
             {(cmp.enableSemantic as boolean) && embeddingModels.length > 0 && (
               <Row label="语义模型" sub="切换模型后该模型的语义缓存独立重建（首次需下载）" ink={ink} mute={mute}>
                 <select
-                  value={(cmp.embeddingModel as string) ?? "e5-small"}
+                  value={(cmp.embeddingModel as string) ?? "bge-zh"}
                   onChange={(e) => changeCmp({ embeddingModel: e.target.value })}
                   style={{
                     fontSize: 12,

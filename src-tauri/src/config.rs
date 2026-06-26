@@ -24,7 +24,7 @@ pub struct CompareDefaults {
     pub ignore_templates: bool, // 剔除查重源模板段落（BidGuard 扩展项）
     /// 分词语言：auto（按 CJK 占比逐块判定）| zh（恒 jieba）| en（恒单词切分）。
     pub language: String,
-    /// 语义模型：e5-small（默认）| e5-base | bge-zh（见 engine::embed::MODELS）。
+    /// 语义模型：bge-zh（默认）| bge-large-zh | e5-large | e5-small | e5-base（见 engine::embed::MODELS）。
     pub embedding_model: String,
 }
 
@@ -43,7 +43,7 @@ impl Default for CompareDefaults {
             scope: "full".into(),
             ignore_templates: true,
             language: "auto".into(),
-            embedding_model: "e5-small".into(),
+            embedding_model: "bge-zh".into(),
         }
     }
 }

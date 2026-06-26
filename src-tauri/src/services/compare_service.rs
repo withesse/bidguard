@@ -33,7 +33,7 @@ pub struct CompareRunConfig {
     pub ignore_templates: bool,
     pub detect_moved_paragraph: bool,
     pub scope: String,
-    /// 语义模型选择（compare.embeddingModel：e5-small | e5-base | bge-zh）。
+    /// 语义模型选择（compare.embeddingModel：bge-zh(默认) | bge-large-zh | e5-large | e5-small | e5-base）。
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// security.allowCloudModel：是否允许联网下载语义模型（本地已缓存时不受限）。
@@ -42,7 +42,7 @@ pub struct CompareRunConfig {
 }
 
 fn default_embedding_model() -> String {
-    "e5-small".to_string()
+    "bge-zh".to_string()
 }
 
 /// 总览统计（jobs.summary_json）。
@@ -407,7 +407,7 @@ fn embed_chunks(
         for (bi, batch) in missing.chunks(EMBED_BATCH).enumerate() {
             ctx.check()?;
             let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-            let Some(vecs) = embed::embed_batch(model, &texts) else {
+            let Some(vecs) = embed::embed_batch(model, &texts, spec.id) else {
                 ctx.progress("semantic", total, total, "语义嵌入失败，降级为词面比对");
                 return Ok((None, true));
             };

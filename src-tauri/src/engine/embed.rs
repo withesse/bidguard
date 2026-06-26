@@ -13,22 +13,34 @@ pub struct EmbedModelSpec {
 /// 可选模型注册表。默认项（e5-small）的 id 沿用历史值，保证旧缓存继续命中。
 pub const MODELS: &[EmbedModelSpec] = &[
     EmbedModelSpec {
+        key: "bge-zh",
+        id: "bge-small-zh-v1.5",
+        label: "BGE 中文 · 小（默认，快，~95MB）",
+        model: EmbeddingModel::BGESmallZHV15,
+    },
+    EmbedModelSpec {
+        key: "bge-large-zh",
+        id: "bge-large-zh-v1.5",
+        label: "BGE 中文 · 大（中文最准，~1.2GB）",
+        model: EmbeddingModel::BGELargeZHV15,
+    },
+    EmbedModelSpec {
+        key: "e5-large",
+        id: "multilingual-e5-large",
+        label: "E5 多语种 · 大（中英混排最准，~2.1GB）",
+        model: EmbeddingModel::MultilingualE5Large,
+    },
+    EmbedModelSpec {
         key: "e5-small",
         id: "multilingual-e5-small",
-        label: "E5 多语种 · 小（默认，快）",
+        label: "E5 多语种 · 小（轻量，~450MB）",
         model: EmbeddingModel::MultilingualE5Small,
     },
     EmbedModelSpec {
         key: "e5-base",
         id: "multilingual-e5-base",
-        label: "E5 多语种 · 大（更准，慢）",
+        label: "E5 多语种 · 中（~1GB）",
         model: EmbeddingModel::MultilingualE5Base,
-    },
-    EmbedModelSpec {
-        key: "bge-zh",
-        id: "bge-small-zh-v1.5",
-        label: "BGE 中文优化（中文标书更准）",
-        model: EmbeddingModel::BGESmallZHV15,
     },
 ];
 
@@ -148,12 +160,15 @@ pub fn ensure<'a>(
     slot.as_mut().map(|(_, m)| m)
 }
 
-/// 用常驻模型嵌入一批文本（E5 推荐加 "passage: " 前缀）。
-pub fn embed_batch(model: &mut TextEmbedding, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+/// 用常驻模型嵌入一批文本。前缀按模型家族区分（id 传 spec.id）：
+/// E5 系（multilingual-e5-*）对称相似两侧统一加 "query: "；BGE / 其它一律不加前缀
+/// （"passage:" 是 E5 专属约定，对 BGE 是噪声会拉低中文精度）。
+pub fn embed_batch(model: &mut TextEmbedding, texts: &[String], id: &str) -> Option<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Some(Vec::new());
     }
-    let docs: Vec<String> = texts.iter().map(|t| format!("passage: {t}")).collect();
+    let prefix = if id.starts_with("multilingual-e5-") { "query: " } else { "" };
+    let docs: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
     model.embed(docs, None).ok()
 }
 
@@ -184,6 +199,7 @@ mod tests {
                 "本方案使用分层解耦的微服务体系，经由 API 网关统一对外提供能力".to_string(),
                 "本项目聚焦数据治理与隐私合规，强调本地化部署与最小权限".to_string(),
             ],
+            MODELS[0].id,
         )
         .expect("应能嵌入");
         let para = cosine(&embs[0], &embs[1]);
@@ -195,8 +211,10 @@ mod tests {
     fn resolve_known_and_unknown() {
         assert_eq!(resolve("bge-zh").id, "bge-small-zh-v1.5");
         assert_eq!(resolve("e5-base").id, "multilingual-e5-base");
-        assert_eq!(resolve("不存在").key, "e5-small", "未知值回落默认");
-        // 默认 id 必须沿用历史值（multilingual-e5-small），否则旧缓存失配
+        assert_eq!(resolve("不存在").key, "bge-zh", "未知值回落默认（MODELS[0]=bge-zh）");
+        // 各 id 必须沿用历史值（如 multilingual-e5-small），否则旧缓存按 model_id 失配
         assert_eq!(resolve("e5-small").id, "multilingual-e5-small");
+        assert_eq!(resolve("bge-large-zh").id, "bge-large-zh-v1.5");
+        assert_eq!(resolve("e5-large").id, "multilingual-e5-large");
     }
 }

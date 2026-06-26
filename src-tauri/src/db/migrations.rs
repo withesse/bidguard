@@ -11,6 +11,7 @@ const MIGRATIONS: &[&str] = &[
     PREVIEW_NOTES_V5,
     CATEGORY_V6,
     CHUNK_TEMPLATE_V7,
+    EMBEDDINGS_RESET_V8,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -285,6 +286,13 @@ UPDATE source_templates SET category='售后承诺' WHERE id='t-after' AND categ
 const CHUNK_TEMPLATE_V7: &str = "
 ALTER TABLE chunks ADD COLUMN template_id TEXT;
 CREATE INDEX idx_chunks_template_id ON chunks(template_id);
+";
+
+// V8：清空语义向量缓存。embed_batch 前缀策略改为按模型家族（E5→\"query: \"、BGE→无），
+// 改变了喂给模型的实际文本，旧缓存（键含 model_id 但不含前缀）与新策略不一致，
+// 一次性清空让下次比对按新策略重算。embeddings 仅为缓存、可再生，清空无损正确性。
+const EMBEDDINGS_RESET_V8: &str = "
+DELETE FROM embeddings;
 ";
 
 #[cfg(test)]
