@@ -87,8 +87,19 @@ export const deleteJob = (jobId: string) => call<void>("delete_job", { jobId });
 export const cleanupOldJobs = (days: number) => call<number>("cleanup_old_jobs", { days });
 
 // —— 导出 ——
-export const exportReport = (jobId: string, format: string, path: string) =>
-  call<{ path: string; format: string }>("export_report", { jobId, format, path });
+export const exportReport = (
+  jobId: string,
+  format: string,
+  path: string,
+  opts?: { includeRawText?: boolean; includeConfig?: boolean },
+) =>
+  call<{ path: string; format: string }>("export_report", {
+    jobId,
+    format,
+    path,
+    includeRawText: opts?.includeRawText ?? null,
+    includeConfig: opts?.includeConfig ?? null,
+  });
 
 // —— 工具：模型 / 存储 / 自检 ——
 export const getModelStatus = () => call<ModelStatusDto>("get_model_status");

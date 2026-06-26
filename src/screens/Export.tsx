@@ -1,15 +1,18 @@
-// 屏 7 · 导出报告 —— 移植自 app-design/project/src/c/bid-c.jsx (BidScrExport)
-// 有 jobId 时走新通路（后端从 DB 装配，报告含八类统计/事实冲突/配置快照）。
-import { Fragment, useState, type ReactNode } from "react";
+// 屏 7 · 导出报告 —— 从 DB 装配（含八类统计/事实冲突/配置快照）。
+// 预览为真实任务概要；导出选项（正文全文 / 配置快照）按 per-export 覆盖传给后端。
+import { useState, type ReactNode } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
-import { C, severityColor } from "../design/tokens";
+import { C } from "../design/tokens";
 import { Topbar } from "../components/Topbar";
-import { Button, DocChip, Toggle } from "../components/primitives";
+import { Button, DocChip, Pill, Toggle } from "../components/primitives";
 import { useTheme } from "../theme";
 import { errMsg, isTauri } from "../api/client";
 import { exportReport as exportReportV2 } from "../api";
-import { useAppSettings } from "../queries/data";
+import { useAppSettings, useCompareSummary } from "../queries/data";
 import { useToast } from "../components/Toast";
+import { typeUi } from "../utils/clusterUi";
+import { docColor, docTag } from "../utils/docTag";
+import { formatDateTime } from "../utils/formatTime";
 
 const FORMATS: { t: string; label: string; sub: string; kind: string; ext: string }[] = [
   { t: "html", label: "网页 / PDF", sub: "浏览器可打印为 PDF", kind: "html", ext: "html" },
@@ -20,14 +23,14 @@ const FORMATS: { t: string; label: string; sub: string; kind: string; ext: strin
   { t: "csv", label: "CSV", sub: "条款明细表格化", kind: "csv", ext: "csv" },
 ];
 
-const INCLUDE = [
+// 报告固定包含的章节（始终生成，不可单独关闭——只作信息展示）。
+const SECTIONS = [
   "封面 + 评审摘要",
-  "N × N 相似度矩阵",
+  "N × N 相似度矩阵 + 章节热力",
   "围标嫌疑结论与证据链",
+  "重复条款明细（按八类分组）",
+  "事实冲突明细（金额/工期/日期）",
   "逐对左右对比快照",
-  "重复条款明细清单（全部 12 组）",
-  "章节级热力图",
-  "工商关联辅助参考（若启用）",
 ];
 
 export function Export({ jobId }: { jobId?: string }) {
@@ -39,20 +42,21 @@ export function Export({ jobId }: { jobId?: string }) {
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
   const toast = useToast();
 
-  // 默认格式来自用户全局设置（export.defaultFormat），未设置时 html
+  // 默认格式与导出选项来自用户全局设置（export.*），未设置时取合理默认
   const { data: appCfg } = useAppSettings();
-  const defaultKind =
-    ((appCfg as Record<string, Record<string, unknown>> | undefined)?.export
-      ?.defaultFormat as string) ?? "html";
+  const exportCfg =
+    ((appCfg as Record<string, Record<string, unknown>> | undefined)?.export) ?? {};
+  const defaultKind = (exportCfg.defaultFormat as string) ?? "html";
   const [fmt, setFmt] = useState(() =>
     Math.max(0, FORMATS.findIndex((f) => f.kind === defaultKind)),
   );
-  const [checks, setChecks] = useState<boolean[]>(INCLUDE.map((_, i) => i < 6));
-  const [security, setSecurity] = useState<boolean[]>([true, true, true]);
+  const [includeRawText, setIncludeRawText] = useState<boolean>(
+    (exportCfg.includeRawText as boolean) ?? true,
+  );
+  const [includeConfig, setIncludeConfig] = useState<boolean>(
+    (exportCfg.includeConfig as boolean) ?? true,
+  );
   const [lastExport, setLastExport] = useState<{ path: string; label: string } | null>(null);
-
-  const toggleCheck = (i: number) => setChecks((c) => c.map((v, j) => (j === i ? !v : v)));
-  const toggleSec = (i: number) => setSecurity((s) => s.map((v, j) => (j === i ? !v : v)));
 
   const onExport = async () => {
     if (!isTauri()) {
@@ -71,7 +75,7 @@ export function Export({ jobId }: { jobId?: string }) {
         filters: [{ name: f.label, extensions: [f.ext] }],
       });
       if (!path) return;
-      await exportReportV2(jobId, f.kind, path);
+      await exportReportV2(jobId, f.kind, path, { includeRawText, includeConfig });
       setLastExport({ path, label: f.label });
       toast.show(`已导出 ${f.label} 报告`, "success");
     } catch (e) {
@@ -102,14 +106,9 @@ export function Export({ jobId }: { jobId?: string }) {
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
         title="导出报告"
-        sub="选择格式与范围，导出本地查重报告（含八类统计与事实冲突）"
+        sub="选择格式与选项，导出本地查重报告（含八类统计与事实冲突）"
         actions={
-          <Button
-            kind="primary"
-            size="md"
-            icon="download"
-            onClick={onExport}
-          >
+          <Button kind="primary" size="md" icon="download" onClick={onExport}>
             立即导出
           </Button>
         }
@@ -175,47 +174,224 @@ export function Export({ jobId }: { jobId?: string }) {
             </div>
 
             <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 18 }}>
-              <CardLabel mute={mute}>包含内容</CardLabel>
-              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-                {INCLUDE.map((label, i) => (
-                  <Check key={i} label={label} checked={checks[i]} onClick={() => toggleCheck(i)} />
-                ))}
-              </div>
+              <CardLabel mute={mute}>导出选项</CardLabel>
+              <Row label="包含条款正文全文" sub="关闭则正文截为前 40 字摘要（保留定位，不含全文）" ink={ink} mute={mute}>
+                <Toggle on={includeRawText} onChange={() => setIncludeRawText((v) => !v)} />
+              </Row>
+              <Row label="附比对配置快照" sub="报告末尾附本次比对的参数（阈值/范围/模型等）" ink={ink} mute={mute} last>
+                <Toggle on={includeConfig} onChange={() => setIncludeConfig((v) => !v)} />
+              </Row>
             </div>
 
             <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 18 }}>
-              <CardLabel mute={mute}>安全与签发</CardLabel>
-              <Row label="添加评审水印" sub="评审人 · 时间 · 文件编号" ink={ink} mute={mute}>
-                <Toggle on={security[0]} onChange={() => toggleSec(0)} />
-              </Row>
-              <Row label="文件密码保护" sub="打开报告时需输入密码" ink={ink} mute={mute}>
-                <Toggle on={security[1]} onChange={() => toggleSec(1)} />
-              </Row>
-              <Row label="附带源文件清单" sub="不包含标书原文" ink={ink} mute={mute} last>
-                <Toggle on={security[2]} onChange={() => toggleSec(2)} />
-              </Row>
+              <CardLabel mute={mute}>报告包含（固定章节）</CardLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {SECTIONS.map((label, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ flexShrink: 0 }}>
+                      <path d="M3 7.5l2.5 2.5L11 4.5" stroke={accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    <span style={{ fontSize: 12, color: dark ? "rgba(255,255,255,0.8)" : C.ink2 }}>{label}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
 
-          {/* 右：预览 */}
+          {/* 右：真实报告概要 */}
+          <ReportPreview jobId={jobId} accent={accent} mute={mute} dark={dark} border={border} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const COLLUSION: Record<string, { label: string; danger?: boolean }> = {
+  high: { label: "围标嫌疑（高）", danger: true },
+  medium: { label: "疑似围标（中）", danger: true },
+  low: { label: "弱信号（低）" },
+  none: { label: "未发现围标信号" },
+};
+
+function ReportPreview({
+  jobId,
+  accent,
+  mute,
+  dark,
+  border,
+}: {
+  jobId?: string;
+  accent: string;
+  mute: string;
+  dark: boolean;
+  border: string;
+}) {
+  const { data } = useCompareSummary(jobId);
+  const panel = {
+    background: dark ? "#15151B" : "#E8E5DE",
+    borderRadius: 12,
+    border: `1px solid ${border}`,
+    padding: 24,
+    display: "flex",
+    flexDirection: "column" as const,
+    alignItems: "center",
+    gap: 16,
+    overflow: "auto",
+  };
+
+  if (!jobId || !data) {
+    return (
+      <div style={{ ...panel, justifyContent: "center", color: mute, fontSize: 12.5 }}>
+        完成一次查重后，此处显示将导出的报告概要。
+      </div>
+    );
+  }
+
+  const s = data.summary;
+  const docs = data.documents ?? [];
+  const peak = data.matrix?.peak ?? 0;
+  const level = (data.job.collusionLevel as string | null) ?? "none";
+  const col = COLLUSION[level] ?? COLLUSION.none;
+  const pairs = docs.length >= 2 ? (docs.length * (docs.length - 1)) / 2 : 0;
+  const counts: Array<[string, number]> = s
+    ? [
+        ["conflict", s.conflictCount],
+        ["same", s.sameCount],
+        ["minor_change", s.minorChangeCount],
+        ["changed", s.changedCount],
+        ["rewrite", s.rewriteCount],
+        ["uncertain", s.uncertainCount],
+        ["added", s.addedCount],
+        ["deleted", s.deletedCount],
+      ]
+    : [];
+
+  return (
+    <div style={panel}>
+      <div style={{ fontSize: 11.5, color: mute }}>报告概要 · 真实数据</div>
+      <div
+        style={{
+          width: 380,
+          padding: "30px 34px 32px",
+          background: "#fff",
+          boxShadow: "0 8px 24px rgba(0,0,0,0.10), 0 1px 0 rgba(0,0,0,0.04)",
+          fontFamily: C.font,
+          color: "#16161B",
+        }}
+      >
+        <div style={{ borderTop: `4px solid ${accent}`, paddingTop: 16 }}>
+          <div style={{ fontSize: 9.5, color: "#6B6B76", letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 700 }}>
+            原本 · 标书查重评审报告
+          </div>
           <div
             style={{
-              background: dark ? "#15151B" : "#E8E5DE",
-              borderRadius: 12,
-              border: `1px solid ${border}`,
-              padding: 24,
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              gap: 16,
-              overflow: "auto",
+              fontSize: 19,
+              fontWeight: 700,
+              color: "#16161B",
+              marginTop: 8,
+              letterSpacing: "-0.014em",
+              lineHeight: 1.25,
+              fontFamily: C.serif,
             }}
           >
-            <div style={{ fontSize: 11.5, color: mute }}>报告预览 · 共 32 页</div>
-            <ReportPageCover accent={accent} />
-            <ReportPageMatrix />
+            {data.job.name || "标书交叉查重"}
+          </div>
+          <div style={{ fontSize: 10, color: "#6B6B76", marginTop: 8, lineHeight: 1.6 }}>
+            {docs.length} 份标书 · {pairs} 组比对
+            {data.job.finishedAt && <> · 生成于 {formatDateTime(data.job.finishedAt)}</>}
           </div>
         </div>
+
+        {/* 关键结论 */}
+        <div
+          style={{
+            marginTop: 16,
+            padding: "12px 14px",
+            borderRadius: 8,
+            background: col.danger ? C.dangerSoft : "#F4F2EB",
+            border: `1px solid ${col.danger ? "#E8C7C7" : "#E3E0D7"}`,
+          }}
+        >
+          <div style={{ fontSize: 9, fontWeight: 700, color: col.danger ? C.danger : "#6B6B76", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            围标判定
+          </div>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: "#16161B", marginTop: 4 }}>{col.label}</div>
+        </div>
+
+        {/* 关键指标 */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginTop: 16 }}>
+          {[
+            { l: "参评标书", v: String(docs.length) },
+            { l: "重复条款", v: String(s?.clusterCount ?? 0) },
+            { l: "高风险", v: String(s?.highRiskCount ?? 0), danger: (s?.highRiskCount ?? 0) > 0 },
+            { l: "峰值相似", v: `${Math.round(peak * 100)}%` },
+          ].map((m, i) => (
+            <div key={i}>
+              <div style={{ fontSize: 8, fontWeight: 700, color: "#6B6B76", letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                {m.l}
+              </div>
+              <div style={{ fontSize: 17, fontWeight: 700, color: m.danger ? C.danger : "#16161B", marginTop: 3, letterSpacing: "-0.014em" }}>
+                {m.v}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 八类分布 */}
+        {counts.some(([, n]) => n > 0) && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 16 }}>
+            {counts
+              .filter(([, n]) => n > 0)
+              .map(([k, n]) => {
+                const t = typeUi(k);
+                return (
+                  <Pill key={k} fg={t.fg} bg={t.bg} size={9.5}>
+                    {t.label} {n}
+                  </Pill>
+                );
+              })}
+          </div>
+        )}
+
+        {/* 文档清单 */}
+        <div style={{ marginTop: 16, borderTop: "1px solid #ECE9E1", paddingTop: 12 }}>
+          <div style={{ fontSize: 9, fontWeight: 700, color: "#6B6B76", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 8 }}>
+            参评标书
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {docs.map((d, i) => (
+              <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span
+                  style={{
+                    width: 16,
+                    height: 16,
+                    borderRadius: 4,
+                    background: docColor(i),
+                    color: "#fff",
+                    fontSize: 9.5,
+                    fontWeight: 700,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    flexShrink: 0,
+                    fontFamily: C.serif,
+                  }}
+                >
+                  {docTag(i)}
+                </span>
+                <span style={{ fontSize: 11, color: "#3A3A44", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {d.fileName}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {s?.semanticDegraded && (
+          <div style={{ fontSize: 9.5, color: "#8a6d3b", marginTop: 12 }}>
+            注：本次语义模型不可用，已降级为词面比对。
+          </div>
+        )}
       </div>
     </div>
   );
@@ -235,34 +411,6 @@ function CardLabel({ children, mute }: { children: ReactNode; mute: string }) {
     >
       {children}
     </div>
-  );
-}
-
-function Check({ checked, label, onClick }: { checked: boolean; label: string; onClick: () => void }) {
-  const { dark, accent } = useTheme();
-  return (
-    <label onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 9, cursor: "pointer" }}>
-      <div
-        style={{
-          width: 14,
-          height: 14,
-          borderRadius: 4,
-          flexShrink: 0,
-          border: `1.5px solid ${checked ? accent : dark ? "rgba(255,255,255,0.2)" : C.ink5}`,
-          background: checked ? accent : "transparent",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        {checked && (
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M2 5l2 2 4-4" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        )}
-      </div>
-      <span style={{ fontSize: 12, color: dark ? "rgba(255,255,255,0.85)" : C.ink2 }}>{label}</span>
-    </label>
   );
 }
 
@@ -297,161 +445,6 @@ function Row({
         {sub && <div style={{ fontSize: 11, color: mute, marginTop: 3 }}>{sub}</div>}
       </div>
       {children}
-    </div>
-  );
-}
-
-function ReportPageCover({ accent }: { accent: string }) {
-  return (
-    <div
-      style={{
-        width: 360,
-        padding: "34px 38px 36px",
-        background: "#fff",
-        boxShadow: "0 8px 24px rgba(0,0,0,0.10), 0 1px 0 rgba(0,0,0,0.04)",
-        fontFamily: C.font,
-        color: "#16161B",
-      }}
-    >
-      <div style={{ borderTop: `4px solid ${accent}`, paddingTop: 18 }}>
-        <div style={{ fontSize: 9.5, color: "#6B6B76", letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 700 }}>
-          原本 · 标书查重评审报告
-        </div>
-        <div
-          style={{
-            fontSize: 22,
-            fontWeight: 700,
-            color: "#16161B",
-            marginTop: 10,
-            letterSpacing: "-0.014em",
-            lineHeight: 1.2,
-            fontFamily: C.serif,
-          }}
-        >
-          市政信息化平台采购
-          <br />5 家供应商围标核查
-        </div>
-        <div style={{ fontSize: 10, color: "#6B6B76", marginTop: 12, lineHeight: 1.6 }}>
-          评审编号 · 047 / 2026
-          <br />
-          生成时间 · 2026-05-26 14:32
-        </div>
-      </div>
-      <div style={{ marginTop: 18, padding: "14px 16px", borderRadius: 8, background: C.dangerSoft, border: "1px solid #E8C7C7" }}>
-        <div style={{ fontSize: 9, fontWeight: 700, color: C.danger, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-          关键结论
-        </div>
-        <div style={{ fontSize: 11.5, fontWeight: 700, color: "#16161B", marginTop: 5, lineHeight: 1.5 }}>
-          甲、乙两份标书存在 12 组高度雷同条款，整体相似度 92%，其中 2 组属于围标嫌疑，建议依据采购法及实施细则进行处理。
-        </div>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginTop: 16 }}>
-        {[
-          { l: "参评标书", v: "4" },
-          { l: "比对数", v: "6" },
-          { l: "雷同条款", v: "12" },
-          { l: "围标嫌疑", v: "2", c: C.danger },
-        ].map((s, i) => (
-          <div key={i}>
-            <div style={{ fontSize: 8, fontWeight: 700, color: "#6B6B76", letterSpacing: "0.06em", textTransform: "uppercase" }}>
-              {s.l}
-            </div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: s.c || "#16161B", marginTop: 3, letterSpacing: "-0.014em", fontFamily: C.font }}>
-              {s.v}
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-const PREVIEW_DOCS = [
-  { tag: "甲" },
-  { tag: "乙" },
-  { tag: "丙" },
-  { tag: "丁" },
-];
-const PREVIEW_MATRIX = [
-  [1, 0.92, 0.34, 0.42],
-  [0.92, 1, 0.31, 0.4],
-  [0.34, 0.31, 1, 0.68],
-  [0.42, 0.4, 0.68, 1],
-];
-
-function ReportPageMatrix() {
-  return (
-    <div
-      style={{
-        width: 360,
-        padding: "28px 32px 30px",
-        background: "#fff",
-        boxShadow: "0 8px 24px rgba(0,0,0,0.10), 0 1px 0 rgba(0,0,0,0.04)",
-        fontFamily: C.font,
-        color: "#16161B",
-      }}
-    >
-      <div style={{ fontSize: 12.5, fontWeight: 700, color: "#16161B", fontFamily: C.serif }}>2. 标书相似度矩阵</div>
-      <div style={{ fontSize: 10, color: "#6B6B76", marginTop: 5, lineHeight: 1.6 }}>
-        基于语义级段落比对，数值表示两份标书之间的整体相似程度。
-      </div>
-      <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "24px repeat(4, 1fr)", gap: 3 }}>
-        <div />
-        {PREVIEW_DOCS.map((d) => (
-          <div key={d.tag} style={{ textAlign: "center", fontSize: 9, fontWeight: 700, color: "#16161B", fontFamily: C.serif }}>
-            {d.tag}
-          </div>
-        ))}
-        {PREVIEW_MATRIX.map((row, r) => (
-          <Fragment key={r}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "flex-end",
-                fontSize: 9,
-                fontWeight: 700,
-                color: "#16161B",
-                fontFamily: C.serif,
-              }}
-            >
-              {PREVIEW_DOCS[r].tag}
-            </div>
-            {row.map((v, c) => {
-              const diag = r === c;
-              return (
-                <div
-                  key={c}
-                  style={{
-                    aspectRatio: "1.3 / 1",
-                    borderRadius: 3,
-                    background: diag ? "#F4F2EB" : severityColor(v, C.okSoft),
-                    color: !diag && v >= 0.7 ? "#fff" : "#16161B",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 9.5,
-                    fontWeight: 700,
-                    fontFamily: C.mono,
-                  }}
-                >
-                  {diag ? "—" : (v * 100).toFixed(0)}
-                </div>
-              );
-            })}
-          </Fragment>
-        ))}
-      </div>
-      <div style={{ marginTop: 16, fontSize: 10, fontWeight: 700, color: "#16161B", fontFamily: C.serif }}>2.1 主要发现</div>
-      <ul style={{ fontSize: 9.5, color: "#3A3A44", paddingLeft: 16, lineHeight: 1.7, marginTop: 4 }}>
-        <li>
-          <b>甲 × 乙: 92%</b> · 5 个核心章节高度同源，且存在共有错别字、关联工商记录，判定为围标嫌疑
-        </li>
-        <li>
-          <b>丙 × 丁: 68%</b> · 在项目管理与售后服务两节出现模板雷同，但其他章节差异充分
-        </li>
-        <li>其余 4 组的相似度均在 30%-42% 区间，主要落在通用条款</li>
-      </ul>
     </div>
   );
 }

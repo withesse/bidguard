@@ -21,8 +21,10 @@ pub fn export_to(
     job_id: &str,
     format: &str,
     path: &str,
+    include_raw_text: Option<bool>,
+    include_config: Option<bool>,
 ) -> AppResult<()> {
-    let data = assemble(conn, jieba, job_id)?;
+    let data = assemble(conn, jieba, job_id, include_raw_text, include_config)?;
     export::write(&data, format, path)
 }
 
@@ -30,6 +32,8 @@ pub fn assemble(
     conn: &rusqlite::Connection,
     jieba: &Jieba,
     job_id: &str,
+    include_raw_text: Option<bool>,
+    include_config: Option<bool>,
 ) -> AppResult<ExportData> {
     let job = job_repo::get(conn, job_id)?;
     if job.status != "completed" {
@@ -194,20 +198,32 @@ pub fn assemble(
         clusters,
         pairs,
     };
-    apply_export_prefs(conn, &mut data)?;
+    apply_export_prefs(conn, &mut data, include_raw_text, include_config)?;
     Ok(data)
 }
 
-/// 导出偏好（内置 < 用户全局 < 工作区）：
+/// 导出偏好（内置 < 用户全局 < 工作区 < 本次导出覆盖）：
 /// includeConfig=false → 报告不附比对配置快照；
 /// includeRawText=false → 条款/逐对明细的正文截断为前 40 字摘要（保留可定位性，不含全文）。
-fn apply_export_prefs(conn: &rusqlite::Connection, data: &mut ExportData) -> AppResult<()> {
+/// override_* 为本次导出的临时覆盖（None 则沿用配置层）。
+fn apply_export_prefs(
+    conn: &rusqlite::Connection,
+    data: &mut ExportData,
+    override_raw_text: Option<bool>,
+    override_config: Option<bool>,
+) -> AppResult<()> {
     let user = crate::db::repo::settings_repo::get(conn, "config")?;
     let ws_patch = crate::db::repo::workspace_repo::get(conn, &data.workspace_id)
         .ok()
         .and_then(|w| w.settings_json)
         .and_then(|s| serde_json::from_str(&s).ok());
-    let prefs = crate::config::resolve(user.as_ref(), ws_patch.as_ref(), None)?.export;
+    let mut prefs = crate::config::resolve(user.as_ref(), ws_patch.as_ref(), None)?.export;
+    if let Some(v) = override_raw_text {
+        prefs.include_raw_text = v;
+    }
+    if let Some(v) = override_config {
+        prefs.include_config = v;
+    }
 
     if !prefs.include_config {
         data.config = serde_json::Value::Object(Default::default());
@@ -329,7 +345,7 @@ mod tests {
         }
 
         let conn = pool.get().unwrap();
-        let data = assemble(&conn, &jieba, &cctx.job_id).unwrap();
+        let data = assemble(&conn, &jieba, &cctx.job_id, None, None).unwrap();
         assert!(data.summary.is_some(), "应有八类统计");
         assert!(
             data.clusters.iter().any(|c| c.conflict.is_some()),

@@ -19,6 +19,9 @@ pub async fn export_report(
     job_id: String,
     format: String,
     path: String,
+    // 本次导出的可选覆盖（None=沿用配置层 export 默认）：是否含正文全文 / 是否附配置快照。
+    include_raw_text: Option<bool>,
+    include_config: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<ExportResultDto> {
     if !FORMATS.contains(&format.as_str()) {
@@ -32,7 +35,9 @@ pub async fn export_report(
     let (job_id2, format2, path2) = (job_id, format.clone(), path.clone());
     tauri::async_runtime::spawn_blocking(move || {
         let conn = db.get().map_err(AppError::from)?;
-        export_service::export_to(&conn, &jieba, &job_id2, &format2, &path2)
+        export_service::export_to(
+            &conn, &jieba, &job_id2, &format2, &path2, include_raw_text, include_config,
+        )
     })
     .await
     .map_err(|e| AppError::new(AppErrorCode::ExportFailed, "导出任务失败").with_detail(e.to_string()))??;
