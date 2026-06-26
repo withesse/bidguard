@@ -2097,7 +2097,7 @@ SQLite 负责本地持久化和缓存
 
 > 本附录记录设计文档落地为 BidGuard（原本·标书查重）后的**实际架构与偏差**。
 > 上文为设计蓝图；产品在保留全部设计能力的同时，针对「标书交叉比对/围标识别」做了领域增强。
-> 更新日期：2026-06-11。
+> 更新日期：2026-06-25（初版 2026-06-11；本附录为累积式里程碑，最新进展见 §28.7）。
 
 ### 28.1 与设计文档的主要偏差
 
@@ -2143,16 +2143,20 @@ src-tauri/src/
   jobs/                        # JobManager 状态机 + ProgressSink 事件
 ```
 
-### 28.4 命令面（28 个 Tauri command）
+### 28.4 命令面（~50 个 Tauri command，2026-06-25）
+
+> 命令在 `lib.rs` 的 `generate_handler!` **手工注册**（无自动注册，长列表新增易漏）。
 
 - workspace：create/list/get/rename/set_settings/delete（6）
-- document：import_documents(任务)/list/get_preview/remove + parse_meta（5）
-- job：get/list/cancel/set_starred/delete（5）
+- document：import_documents(任务)/list/get_preview/remove/read_document_file/get_document_ocr_layout（6）
+- annotation：add/list/update/delete（4，批注独立于条款组存续）
+- job：get/list/cancel/set_starred/delete/cleanup_old_jobs（6）
 - compare：start_compare(任务)/get_summary/list_clusters(分页过滤)/get_cluster_detail/set_review_status/get_pair_detail（6）
-- settings：get/set_app_settings/get_app_info/list/save/delete_source_template（6）
+- settings/模板：get/set_app_settings/get_app_info（下发 MAX_DOCS + embedding/ocr 模型清单）/list/save/set_enabled/batch_save/delete_source_template/read_text_file（9；查重源样板含分类/启停/批量）
+- tools：get_model_status/download_embedding_model/clear_embedding_model/download_ocr_model/clear_ocr_model/get_storage_info/clear_embedding_cache/vacuum_db/run_diagnostics（9，工具箱模型/存储/自检）
 - export：export_report（六格式，从 DB 装配）
 
-事件：`document:import:{progress,completed,failed,cancelled}`、`compare:{progress,completed,failed,cancelled}`（导出为同步命令，不发事件）。
+事件：`document:import:{progress,completed,failed,cancelled}`、`compare:{progress,completed,failed,cancelled}`（导出与工具命令为同步，不发事件）。
 
 ### 28.5 自动更新
 
@@ -2168,3 +2172,48 @@ GitHub Releases + tauri-plugin-updater。`tauri.conf.json` 配 `createUpdaterArt
 - **补 UI**：工作区重命名（首页卡片 ✎）、「保存为本工作区默认」（比对设置 → workspace settings_json）、导出后「打开 / 在文件夹中显示」（tauri-plugin-opener）、设置页「解析与归一」卡、隐私卡「允许联网下载语义模型」、自动清理 30 天（启动时 cleanup_old_jobs，收藏任务保留）、总览「高风险 N」、条款列表行内「章节路径 · 页码」（clusters V4 列）。
 - **日志**：tauri-plugin-log 落盘 app_log_dir（轮转 2MB，仅任务 ID/错误码/摘要）。
 - **测试**：tokenizer 单测、程序化真实 docx 端到端导入、文件库关闭重开持久化、前端 vitest（docTag/clusterUi）入 CI、性能基准 `cargo test --release perf_smoke -- --ignored`（实测 3×100 页 0.3s，§16.1 目标 60s）。
+
+### 28.7 模型可选化、工具箱与查重源重构（2026-06-25）
+
+本轮把「写死摸黑」的模型与样板库变为**可见、可选、可管**，并升级 OCR 引擎。
+
+**语义模型选择器（embedding）**
+- `engine/embed.rs` 建注册表 `MODELS`（`EmbedModelSpec{key,id,label,EmbeddingModel}`）：`e5-small`（默认）/`e5-base`/`bge-zh`。`resolve(key)` 未知回落默认。
+- `AppState.embedder` 改为感知重载：换模型才重载（`ensure(slot,spec,allow_download)`），`Mutex` 兼作推理互斥（fastembed 实例非并发安全）。
+- `embeddings` 缓存主键 `(normalized_hash, model_id)`：换模型自然分桶、不串味；`embedding_model` **不进** `options_hash`（比对期算、按 `spec.id` 独立缓存，改 embedding 不重解析只重算向量）。
+- 配置项 `compare.embeddingModel`，设置页下拉选择；模型完全不打包、首次语义比对按需下载到 `~/.cache/bidguard/fastembed`，受 `security.allowCloudModel` 闸门控制（关闭/无缓存则降级纯词面比对）。
+
+**OCR 引擎升级与可选档位（PP-OCRv6 tiny/small/medium）**
+- 依赖 `oar-ocr 0.6.3 → 0.7.1`（API 兼容，与 fastembed 共用单一 `ort 2.0-rc.12`）；声明 MSRV `rust-version = "1.95"`。
+- `engine/ocr.rs` 建注册表 `OCR_MODELS`（`OcrModelSpec{key,label,det,rec,dict,bundled,size_label,可选下载URL}`）：`v6-tiny`(~6MB 打包，字符集精简 6904 字)/`v6-small`(~30MB 打包，默认，18708 字)/`v6-medium`(~132MB **按需下载**，与 small 共用字典)。`ocr_images(spec)` 按 spec 分发。
+- 模型源：tiny/small 取自 oar-ocr 官方 GitHub Release（PP-OCRv5 同源体系），打包进 `bundle.resources`；medium 取自 PaddlePaddle 官方 BCE（`.tar` 包，工具箱点「下载」时取 + 解压 onnx 到 `~/.cache/bidguard/ocr`，`ureq`+`tar`）。`model_paths_for` **逐文件跨目录解析**（medium 的 det/rec 在缓存、dict 在打包目录）。
+- 配置项 `parser.ocrModel`，设置页下拉选择；**进** `options_hash`（改 OCR 档位使分块缓存失效、重解析）。
+- ⚠️ 已知缺口：选 medium 但未下载会**静默回落** small，`parse_method` 仍记 `'ocr'`，无「实际用哪档」回传。
+- 决策记录：macOS Vision 后端（objc2 FFI）评估后**不做**（单平台、黑盒不可复测、Linux 无对应原生）；server 档不做（需 GPU，违背纯 CPU）。
+
+**工具箱（侧栏「工具箱」屏 + tools 命令组）**
+- 模型管理：OCR 三档与 embedding 三款的状态（已打包/已下载/大小）、下载/删除。
+- 存储：DB 体积 + `VACUUM`、清空语义向量缓存、清理 30 天前旧任务。
+- 环境自检：一键检查 pdfium / OCR / embedding / DB 完整性。
+- 顺带移除设置页中无后端对应的「自动清理」假开关（清理已落工具箱手动入口）。
+
+**查重源（样板库）重构**
+- `source_templates` 增 `category`（迁移 V6）与 `chunks.template_id`（迁移 V7）。
+- 后端：`save` 不再触碰 `enabled`（编辑正文不重置启停）；新增 `set_enabled`、单事务原子 `batch_save`（按正文去重）；`list` 带命中数子查询 `COUNT(DISTINCT document_id)`；`list_enabled` 返回 `(id, text)` 喂 chunker，命中时记录最佳匹配 `template_id`。
+- 前端：sticky 工具条（分类 Pill + 排序 + 「改样板需重新导入才生效」提示）+ 折叠分组（localStorage 记忆）+ 行内编辑/启停 Toggle/删除二次确认 + 搜索高亮 + 每条「命中 N 份」徽标 + 批量导入模态（四格式：空行分段/`分类|名称|正文`/CSV/JSON，预览去重 + 原子提交，含解析器单测）。
+
+### 28.8 当前架构要点补全（与 §9/§10/§12 对应）
+
+- **比对管线 8 阶段**（`compare_service::run_inner`）：load(还原 `CmpChunk`+`fill_tfidf` 按本次语料算 IDF) → 语义(可选,按 `normalized_hash` 去重+缓存命中) → recall(5 通道:exact/normalized hash 桶 ∪ n-gram 倒排 MinHash-TopK ∪ TF-IDF-TopK ∪ embedding-TopK) → score(五维加权,打分即过滤≥阈值) → cluster(并查集+低内聚拆分,跨≥2 文档,每文档 1 primary) → classify+分级 diff(八类,字符≤60/词≤400/句级,表格行列对齐,移动段落标注) → facts(量化字段跨阵营不一致改判 conflict) → aggregate(矩阵/章节热力/共有罕见词/报价梯度/围标/八类计数 → `jobs` 五 JSON 列)。
+- **三层缓存**：① 解析 `(file_hash, parse_options_hash)` → 跨工作区复制分块（连 OCR 版面）；② embeddings `(normalized_hash, model_id)` 全局复用；③ `minhash_blob`（**无版本标记，是未覆盖的失效缺口**）。
+- **写入串行**：仓储不内开事务（service 包整体事务）；`import_service` 内一把 `db_write Mutex` 让解析并行/写串行，叠 `busy_timeout` 兜底 SQLITE_BUSY（有 `concurrent_import_of_large_docs_on_file_pool` 回归测试）。
+- **启动清理**：`lib.rs` setup 把残留 pending/running 任务与卡 'parsing' 的孤儿文档判 failed（否则界面永显「解析中」）。
+
+### 28.9 当前主要技术债
+
+- **`useJobReport` 适配器**（过渡产物）：Matrix/Compare/Export 三屏仍消费旧 `engine.Report`，`buildReport` 串行多命令 await，文档/聚合多时首屏多次 IPC 往返 —— 待原生化删除。
+- **Export 屏**右侧报告预览与「包含内容/安全与签发」复选当前为硬编码 mock，实际导出参数只有 `format+path`；Matrix/Compare 在空数据时回落 MOCK 演示数据。
+- **Embedder 单 `Arc<Mutex>` 槽** → 全应用语义推理串行，多任务并发互阻。
+- **OCR 静默回落 / 硬上限未配置化**（rasterize 20 页、docx 图片 60 张）。
+- **`options_hash` 版本前缀与 `minhash_blob` 失效靠手工维护**，无编译期保障。
+- **CI 用 `@stable` 浮动版本** 与声明的 MSRV 1.95 可能漂移；`parse_meta` 命令仍返 `Result<_,String>` 与 AppError 契约不一致（历史遗留薄壳）。
