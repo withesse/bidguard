@@ -1,4 +1,4 @@
-// 工具箱：模型管理（OCR/语义） + 存储（DB/向量缓存/旧任务） + 环境自检。
+// 工具箱：OCR 模型 + 语义模型（分开两卡） + 存储（DB/向量缓存/旧任务） + 环境自检。
 // 资源管理动作，与「设置」的偏好分开；让 OCR/语义模型从「写死摸黑」变「可见可管」。
 import { useState } from "react";
 import { C } from "../design/tokens";
@@ -77,19 +77,18 @@ export function Tools() {
       <Topbar title="工具箱" sub="模型、存储与环境自检" />
       <div style={{ flex: 1, overflow: "auto", padding: "28px 48px 40px" }}>
         <div style={{ maxWidth: 760, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
-          {/* —— 模型管理 —— */}
-          <Card title="模型管理" cardBg={cardBg} border={border} mute={mute}>
-            {/* 扫描件 OCR 档位（PP-OCRv6 tiny/small/medium）*/}
-            {(appInfo.data?.ocrModels ?? []).map((m) => (
-              <Row key={m.key} ink={ink} mute={mute} border={border}>
+          {/* —— OCR 模型（扫描件识别）—— */}
+          <Card title="OCR 模型 · 扫描件识别（PP-OCRv6）" cardBg={cardBg} border={border} mute={mute}>
+            {(appInfo.data?.ocrModels ?? []).map((m, i, arr) => (
+              <Row key={m.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</div>
                   <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
                     {m.bundled
-                      ? `扫描件 OCR · 随应用打包 · ${m.sizeLabel}`
+                      ? `随应用打包 · ${m.sizeLabel}`
                       : m.present
-                        ? `扫描件 OCR · 已下载 · ${m.sizeLabel}`
-                        : `扫描件 OCR · 未下载 · ${m.sizeLabel}`}
+                        ? `已下载 · ${m.sizeLabel}`
+                        : `未下载 · ${m.sizeLabel}`}
                   </div>
                 </div>
                 {m.bundled ? (
@@ -110,8 +109,10 @@ export function Tools() {
                 )}
               </Row>
             ))}
+          </Card>
 
-            {/* 语义模型们 */}
+          {/* —— 语义模型（向量查重）—— */}
+          <Card title="语义模型 · 向量查重（按需下载）" cardBg={cardBg} border={border} mute={mute}>
             {(ms?.embeddingModels ?? []).map((m, i, arr) => (
               <Row key={m.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
                 <div style={{ flex: 1, minWidth: 0 }}>
