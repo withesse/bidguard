@@ -9,6 +9,7 @@ import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
 import {
   useAppInfo,
+  useAppSettings,
   useCleanupOldJobs,
   useClearEmbeddingCache,
   useClearModel,
@@ -17,6 +18,7 @@ import {
   useDownloadModel,
   useDownloadOcrModel,
   useModelStatus,
+  useSaveAppSettings,
   useStorageInfo,
   useVacuumDb,
 } from "../queries/data";
@@ -28,7 +30,7 @@ function mb(bytes: number): string {
 }
 
 export function Tools() {
-  const { dark } = useTheme();
+  const { dark, accent } = useTheme();
   const toast = useToast();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -38,6 +40,22 @@ export function Tools() {
 
   const models = useModelStatus();
   const appInfo = useAppInfo();
+  // 当前选中的档位（来自设置；工具箱据此标「使用中」）
+  const appCfg = useAppSettings().data as Record<string, Record<string, unknown>> | undefined;
+  const activeOcr = (appCfg?.parser?.ocrModel as string) ?? "v6-small";
+  const activeEmbed = (appCfg?.compare?.embeddingModel as string) ?? "bge-zh";
+  const saveCfg = useSaveAppSettings();
+  // 在工具箱直接切换当前档位（合并写配置，不覆盖其它项）
+  const setActive = (section: "parser" | "compare", field: string, key: string) => {
+    const current = (appCfg ?? {}) as Record<string, Record<string, unknown> | undefined>;
+    saveCfg.mutate(
+      { ...current, [section]: { ...(current[section] ?? {}), [field]: key } },
+      {
+        onSuccess: () => toast.show("已切换当前模型", "success"),
+        onError: (e) => toast.show("切换失败：" + errMsg(e), "error"),
+      },
+    );
+  };
   const storage = useStorageInfo();
   const download = useDownloadModel();
   const clearModel = useClearModel();
@@ -82,7 +100,10 @@ export function Tools() {
             {(appInfo.data?.ocrModels ?? []).map((m, i, arr) => (
               <Row key={m.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</span>
+                    {m.key === activeOcr && <ActivePill accent={accent} />}
+                  </div>
                   <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
                     {m.bundled
                       ? `随应用打包 · ${m.sizeLabel}`
@@ -91,6 +112,11 @@ export function Tools() {
                         : `未下载 · ${m.sizeLabel}`}
                   </div>
                 </div>
+                {m.key !== activeOcr && (
+                  <Button kind="ghost" size="sm" onClick={() => setActive("parser", "ocrModel", m.key)}>
+                    设为当前
+                  </Button>
+                )}
                 {m.bundled ? (
                   <Pill fg="#0F6E56" bg="rgba(15,110,86,0.13)" size={10}>已就位</Pill>
                 ) : m.present ? (
@@ -116,11 +142,19 @@ export function Tools() {
             {(ms?.embeddingModels ?? []).map((m, i, arr) => (
               <Row key={m.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</span>
+                    {m.key === activeEmbed && <ActivePill accent={accent} />}
+                  </div>
                   <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
                     {m.cached ? `已缓存 · ${mb(m.sizeBytes)}` : "未下载（首次语义比对时自动下载）"}
                   </div>
                 </div>
+                {m.key !== activeEmbed && (
+                  <Button kind="ghost" size="sm" onClick={() => setActive("compare", "embeddingModel", m.key)}>
+                    设为当前
+                  </Button>
+                )}
                 {m.cached ? (
                   <Button kind="ghost" size="sm" onClick={() =>
                     clearModel.mutate(m.key, {
@@ -218,6 +252,15 @@ export function Tools() {
         </div>
       </div>
     </div>
+  );
+}
+
+// 「使用中」徽标：标注设置里当前选中的档位。
+function ActivePill({ accent }: { accent: string }) {
+  return (
+    <Pill fg="#fff" bg={accent} size={9.5} weight={700}>
+      使用中
+    </Pill>
   );
 }
 
