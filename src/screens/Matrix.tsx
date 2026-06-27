@@ -42,7 +42,6 @@ interface MatrixView {
   conclusion: { pill: string; statement: string; desc: string };
   pairRows: PairRow[];
   insights: Insight[];
-  isReal: boolean;
 }
 
 
@@ -58,61 +57,6 @@ const LEVEL_META: Record<string, { pill: string; color: string; statement: strin
   medium: { pill: "重点复核 · 中", color: C.hi3, statement: "存在明显雷同与同源迹象，建议重点复核核心章节。" },
   low: { pill: "轻度雷同 · 低", color: C.hi2, statement: "检出一定程度雷同，多为通用模板，建议抽查。" },
   none: { pill: "未见明显围标", color: C.ink, statement: "各份标书差异充分，未见高度雷同或同源迹象。" },
-};
-
-const MOCK_VIEW: MatrixView = {
-  docs: [
-    { tag: "甲", short: "智慧城邦", full: "智慧城邦科技_技术响应文件", color: "#4F58A8" },
-    { tag: "乙", short: "启明信息", full: "启明信息_投标文件_技术标", color: "#0E9A8F" },
-    { tag: "丙", short: "鸿信科技", full: "鸿信科技_市政平台投标书", color: "#C28430" },
-    { tag: "丁", short: "蓝信电子", full: "蓝信电子_技术标响应", color: "#B54545" },
-  ],
-  matrix: [
-    [1.0, 0.92, 0.34, 0.42],
-    [0.92, 1.0, 0.31, 0.4],
-    [0.34, 0.31, 1.0, 0.68],
-    [0.42, 0.4, 0.68, 1.0],
-  ],
-  peakPct: 92,
-  peakColor: C.danger,
-  peakPair: "甲 ←→ 乙",
-  conclusion: {
-    pill: "检出围标嫌疑 · 1 对",
-    statement: "甲、乙两份标书在 5 个章节高度同源，建议人工复核。",
-    desc: "它们的整体相似度达到 92%，远高于其他两两组合（均值 38%），且在不属于通用模板的「技术方案、服务承诺、实施计划」等核心章节出现连续雷同。",
-  },
-  pairRows: [
-    { pair: "甲 × 乙", pct: 92, label: "围标嫌疑", c: C.danger, secs: "§3 技术方案 · §5 服务承诺 · §7 实施计划" },
-    { pair: "丙 × 丁", pct: 68, label: "高相似 · 模板雷同", c: C.hi3, secs: "§4 项目管理 · §6 售后服务" },
-    { pair: "甲 × 丁", pct: 42, label: "中相似", c: C.hi2, secs: "§6 售后服务" },
-    { pair: "甲 × 丙", pct: 34, label: "中相似", c: C.hi2, secs: "§2 公司介绍" },
-    { pair: "乙 × 丁", pct: 40, label: "中相似", c: C.hi2, secs: "§6 售后服务" },
-    { pair: "乙 × 丙", pct: 31, label: "低相似", c: C.hi1, secs: "差异充分" },
-  ],
-  insights: [
-    {
-      tag: "围标",
-      fg: C.danger,
-      bg: C.dangerSoft,
-      title: "甲 × 乙 高度同源",
-      body: "5 个核心章节相似度 ≥ 85%，且双方在「项目难点应对」一节出现完全相同的措辞，该段落不属于行业通用模板。",
-    },
-    {
-      tag: "模板",
-      fg: C.warn,
-      bg: C.warnSoft,
-      title: "丙 × 丁 共用集成模板",
-      body: "在「项目管理」「售后服务」两节相似度 60-75%，推断使用了同一份行业模板，但其他章节差异充分。",
-    },
-    {
-      tag: "差异",
-      fg: C.ok,
-      bg: C.okSoft,
-      title: "乙 × 丙 差异充分",
-      body: "31% 的相似度主要落在通用条款，核心技术方案完全独立编写，可判定为独立投标。",
-    },
-  ],
-  isReal: false,
 };
 
 function fromReport(r: Report): MatrixView {
@@ -195,7 +139,6 @@ function fromReport(r: Report): MatrixView {
     conclusion: { pill: lv.pill, statement, desc },
     pairRows,
     insights,
-    isReal: true,
   };
 }
 
@@ -207,9 +150,26 @@ export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; repo
   const cardBg = dark ? "rgba(255,255,255,0.04)" : C.white;
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
 
-  const v = report && report.docs.length >= 2 ? fromReport(report) : MOCK_VIEW;
-  const n = v.docs.length;
   const toast = useToast();
+  if (!report || report.docs.length < 2) {
+    return (
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: bg,
+          color: mute,
+          fontSize: 13,
+        }}
+      >
+        暂无可展示的检测报告 —— 完成一次查重后在此查看。
+      </div>
+    );
+  }
+  const v = fromReport(report);
+  const n = v.docs.length;
   const share = async () => {
     const text = [
       "标书查重报告",
@@ -230,11 +190,7 @@ export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; repo
     <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
         title="检测报告"
-        sub={
-          v.isReal
-            ? `本地完成 · ${n} 份标书 · ${(n * (n - 1)) / 2} 对比对`
-            : "演示数据 · 4 份标书 · 6 对比对"
-        }
+        sub={`本地完成 · ${n} 份标书 · ${(n * (n - 1)) / 2} 对比对`}
         actions={
           <>
             <Button kind="ghost" size="md" icon="share" onClick={share}>
