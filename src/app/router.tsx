@@ -1,13 +1,11 @@
 // 路由表：Hash 路由（Tauri 生产环境用自定义协议加载，BrowserRouter 刷新会丢路径）。
-// 四个结果屏经 useJobReport 适配器接新数据源，视觉零改动（阶段 6 原生化后撤掉适配层）。
+// 结果屏 Matrix/Compare/Export 原生消费 DTO（useCompareSummary / 按需 getPairDetail），适配层已移除。
 import { createHashRouter, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
 import { Sidebar, type NavKey } from "../components/Sidebar";
 import { Pill } from "../components/primitives";
 import { C } from "../design/tokens";
 import { useTheme } from "../theme";
-import { errMsg } from "../api/client";
 import type { Screen } from "../routes";
-import { useJobReport } from "../queries/useJobReport";
 import { useCompareSummary } from "../queries/data";
 import { typeUi } from "../utils/clusterUi";
 import { WorkspaceList } from "../screens/WorkspaceList";
@@ -64,11 +62,10 @@ function Layout() {
   );
 }
 
-/** 结果屏壳：加载报告（适配器）→ 渲染旧屏组件，onGo 映射为路由跳转。 */
-function JobView({ view }: { view: "matrix" | "compare" | "clusters" | "export" }) {
+/** 结果屏壳：各屏原生消费 DTO（useCompareSummary / 按需 getPairDetail），onGo 映射为路由跳转。 */
+function JobView({ view }: { view: "matrix" | "compare" | "export" }) {
   const { wsId, jobId } = useParams<{ wsId: string; jobId: string }>();
   const nav = useNavigate();
-  const { data: report, isLoading, error } = useJobReport(jobId);
 
   const base = `/workspace/${wsId}/job/${jobId}`;
   const go = (s: Screen) => {
@@ -86,20 +83,16 @@ function JobView({ view }: { view: "matrix" | "compare" | "clusters" | "export" 
     nav(map[s] ?? "/");
   };
 
-  if (isLoading) return <CenterNote text="正在加载报告…" />;
-  if (error) return <CenterNote text={`加载失败：${errMsg(error)}`} />;
-  if (!report) return <CenterNote text="该任务尚未完成或没有结果" />;
-
   switch (view) {
     case "matrix":
       return (
         <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <SummaryBanner jobId={jobId} onClusters={() => go("clusters")} />
-          <MatrixScreen onGo={go} report={report} />
+          <MatrixScreen onGo={go} jobId={jobId} />
         </div>
       );
     case "compare":
-      return <Compare onGo={go} report={report} />;
+      return <Compare onGo={go} jobId={jobId} />;
     case "export":
       return <Export jobId={jobId} />;
   }
@@ -160,24 +153,6 @@ function SummaryBanner({ jobId, onClusters }: { jobId: string | undefined; onClu
           语义模型不可用，已降级词面比对
         </Pill>
       )}
-    </div>
-  );
-}
-
-function CenterNote({ text }: { text: string }) {
-  const { dark } = useTheme();
-  return (
-    <div
-      style={{
-        flex: 1,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        color: dark ? "rgba(255,255,255,0.55)" : C.ink3,
-        fontSize: 13,
-      }}
-    >
-      {text}
     </div>
   );
 }

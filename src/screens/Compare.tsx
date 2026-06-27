@@ -4,9 +4,13 @@ import { C } from "../design/tokens";
 import { Icon } from "../design/Icon";
 import { Topbar } from "../components/Topbar";
 import { Button, Pill } from "../components/primitives";
+import { useQuery } from "@tanstack/react-query";
 import { useTheme, type Highlight } from "../theme";
 import type { Screen } from "../routes";
-import type { Report, DiffOp } from "../engine";
+import type { DiffOp } from "../engine";
+import type { CompareSummaryDto } from "../api/types";
+import * as api from "../api";
+import { useCompareSummary } from "../queries/data";
 import { docColor, docTag } from "../utils/docTag";
 
 type HiScheme = Record<string, string>;
@@ -19,8 +23,10 @@ function hiScheme(name: Highlight): HiScheme {
   return { hi1: C.hi1, hi2: C.hi2, hi3: C.hi3, hi4: C.hi4, hi1soft: C.hi1Soft, hi2soft: C.hi2Soft, hi3soft: C.hi3Soft, hi4soft: C.hi4Soft };
 }
 
-export function Compare({ onGo, report }: { onGo: (s: Screen) => void; report?: Report | null }) {
-  if (report && report.pairs && report.pairs.length) return <RealCompare report={report} onGo={onGo} />;
+export function Compare({ onGo, jobId }: { onGo: (s: Screen) => void; jobId?: string }) {
+  const { data: sm } = useCompareSummary(jobId);
+  if (sm && sm.matrix && sm.matrix.documentIds.length >= 2)
+    return <RealCompare summary={sm} jobId={jobId!} onGo={onGo} />;
   return <EmptyCompare />;
 }
 
@@ -46,7 +52,7 @@ function EmptyCompare() {
 // ─────────────────────────────────────────────────────────────
 // 真实模式
 // ─────────────────────────────────────────────────────────────
-function RealCompare({ report, onGo }: { report: Report; onGo: (s: Screen) => void }) {
+function RealCompare({ summary, jobId, onGo }: { summary: CompareSummaryDto; jobId: string; onGo: (s: Screen) => void }) {
   const { dark, accent, highlight } = useTheme();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -55,16 +61,32 @@ function RealCompare({ report, onGo }: { report: Report; onGo: (s: Screen) => vo
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
   const HI = hiScheme(highlight);
 
-  const pairs = useMemo(() => [...report.pairs].sort((a, b) => b.score - a.score), [report.pairs]);
+  const docIds = summary.matrix!.documentIds;
+  const matrix = summary.matrix!.matrix;
+  const byId = useMemo(() => new Map(summary.documents.map((d) => [d.id, d] as const)), [summary.documents]);
+  const docName = (i: number) => byId.get(docIds[i])?.fileName ?? docTag(i);
+  // 配对列表来自矩阵（不预取明细）；选中哪对才懒加载哪对的匹配段落。
+  const pairs = useMemo(() => {
+    const arr: { a: number; b: number; score: number }[] = [];
+    for (let a = 0; a < docIds.length; a++)
+      for (let b = a + 1; b < docIds.length; b++) arr.push({ a, b, score: matrix[a][b] });
+    return arr.sort((x, y) => y.score - x.score);
+  }, [docIds, matrix]);
   const [sel, setSel] = useState(0);
   const pair = pairs[sel] ?? pairs[0];
-  const docName = (i: number) => report.docs[i]?.name ?? docTag(i);
+  const { data: matchesRaw, isLoading } = useQuery({
+    queryKey: ["pairDetail", jobId, pair?.a, pair?.b],
+    queryFn: () => api.getPairDetail(jobId, docIds[pair.a], docIds[pair.b]),
+    enabled: !!pair,
+    staleTime: Infinity,
+  });
+  const matches = matchesRaw ?? [];
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: bg, minWidth: 0 }}>
       <Topbar
         title="逐对对比"
-        sub={`${docTag(pair.a)} ${docName(pair.a)} × ${docTag(pair.b)} ${docName(pair.b)} · ${pair.matches.length} 处匹配`}
+        sub={`${docTag(pair.a)} ${docName(pair.a)} × ${docTag(pair.b)} ${docName(pair.b)} · ${isLoading ? "加载中…" : `${matches.length} 处匹配`}`}
         actions={
           <Button kind="primary" size="md" icon="check" onClick={() => onGo("matrix")}>
             返回报告
@@ -135,9 +157,9 @@ function RealCompare({ report, onGo }: { report: Report; onGo: (s: Screen) => vo
 
       {/* 匹配段落列表 */}
       <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "18px 24px 40px" }}>
-        {pair.matches.length === 0 ? (
+        {matches.length === 0 ? (
           <div style={{ textAlign: "center", color: mute, fontSize: 13, padding: "60px 0" }}>
-            该组合未发现达到阈值的雷同段落，差异充分。
+            {isLoading ? "正在加载该组合的匹配段落…" : "该组合未发现达到阈值的雷同段落，差异充分。"}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 12, maxWidth: 1200, margin: "0 auto" }}>
@@ -147,7 +169,7 @@ function RealCompare({ report, onGo }: { report: Report; onGo: (s: Screen) => vo
               <div />
               <PaneHeader idx={pair.b} ink={ink} />
             </div>
-            {pair.matches.map((m, i) => {
+            {matches.map((m, i) => {
               const pct = Math.round(m.score * 100);
               const c = pct >= 80 ? C.danger : pct >= 60 ? HI.hi3 : HI.hi2;
               return (

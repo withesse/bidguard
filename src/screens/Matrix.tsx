@@ -1,5 +1,5 @@
 // 屏 4 · 检测报告 · 交叉矩阵 —— 移植自 app-design/project/src/c/bid-b.jsx (BidScrMatrix)
-// 数据驱动：传入真实 Report 渲染真实结果，否则用演示数据。
+// 数据驱动：直接消费 CompareSummaryDto（原生），无真实结果则真空态。
 import { Fragment } from "react";
 import { C, severityColor } from "../design/tokens";
 import { Icon } from "../design/Icon";
@@ -7,9 +7,22 @@ import { Topbar } from "../components/Topbar";
 import { Button, Pill } from "../components/primitives";
 import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
+import { useCompareSummary } from "../queries/data";
 import type { Screen } from "../routes";
-import type { Report, Fingerprint } from "../engine";
+import type { Collusion, Fingerprint } from "../engine";
+import type { CompareSummaryDto } from "../api/types";
 import { docColor, docTag } from "../utils/docTag";
+
+const EMPTY_FP: Fingerprint = {
+  author: null,
+  lastModifiedBy: null,
+  created: null,
+  modified: null,
+  app: null,
+  revision: null,
+  totalEditMinutes: null,
+  riskFlags: [],
+};
 
 interface ViewDoc {
   tag: string;
@@ -59,57 +72,72 @@ const LEVEL_META: Record<string, { pill: string; color: string; statement: strin
   none: { pill: "未见明显围标", color: C.ink, statement: "各份标书差异充分，未见高度雷同或同源迹象。" },
 };
 
-function fromReport(r: Report): MatrixView {
-  const n = r.docs.length;
-  const docs: ViewDoc[] = r.docs.map((d, i) => ({
-    tag: docTag(i),
-    short: d.name.replace(/\.[^.]+$/, "").slice(0, 8),
-    full: d.name,
-    color: docColor(i),
-    note: d.parseError ?? undefined,
-    fp: d.fingerprint,
-  }));
+function fromSummary(sm: CompareSummaryDto): MatrixView {
+  const docIds = sm.matrix?.documentIds ?? [];
+  const matrix = sm.matrix?.matrix ?? [];
+  const byId = new Map(sm.documents.map((d) => [d.id, d]));
+  const fpOf = (id: string): Fingerprint => {
+    try {
+      return { ...EMPTY_FP, ...JSON.parse(byId.get(id)?.fingerprintJson ?? "{}") };
+    } catch {
+      return EMPTY_FP; // 指纹损坏不影响主报告
+    }
+  };
+  const n = docIds.length;
+  const docs: ViewDoc[] = docIds.map((id, i) => {
+    const d = byId.get(id);
+    const name = d?.fileName ?? "未知文档";
+    return {
+      tag: docTag(i),
+      short: name.replace(/\.[^.]+$/, "").slice(0, 8),
+      full: name,
+      color: docColor(i),
+      note: d?.parseError ?? undefined,
+      fp: fpOf(id),
+    };
+  });
 
   let pi = 0;
   let pj = n > 1 ? 1 : 0;
   let pv = -1;
   for (let i = 0; i < n; i++)
     for (let j = i + 1; j < n; j++)
-      if (r.matrix[i][j] > pv) {
-        pv = r.matrix[i][j];
+      if (matrix[i][j] > pv) {
+        pv = matrix[i][j];
         pi = i;
         pj = j;
       }
-  const peakPct = Math.round((r.peak || 0) * 100);
+  const peakPct = Math.round((sm.matrix?.peak || 0) * 100);
 
   const pairRows: PairRow[] = [];
   for (let i = 0; i < n; i++)
     for (let j = i + 1; j < n; j++) {
-      const pct = Math.round(r.matrix[i][j] * 100);
-      const s = sev(pct);
-      pairRows.push({ pair: `${docs[i].tag} × ${docs[j].tag}`, pct, label: s.label, c: s.c, secs: `${docs[i].short} ↔ ${docs[j].short}` });
+      const pct = Math.round(matrix[i][j] * 100);
+      const sv = sev(pct);
+      pairRows.push({ pair: `${docs[i].tag} × ${docs[j].tag}`, pct, label: sv.label, c: sv.c, secs: `${docs[i].short} ↔ ${docs[j].short}` });
     }
   pairRows.sort((a, b) => b.pct - a.pct);
 
   // 围标综合判定驱动结论与洞察
-  const level = r.collusion?.level ?? "none";
+  const collusion = sm.collusion as unknown as Collusion | undefined;
+  const level = collusion?.level ?? "none";
   const lv = LEVEL_META[level] ?? LEVEL_META.none;
-  const signals = r.collusion?.signals ?? [];
+  const signals = collusion?.signals ?? [];
 
-  const insights: Insight[] = signals.map((s) => {
+  const insights: Insight[] = signals.map((sig) => {
     const meta =
-      s.kind === "metadata"
+      sig.kind === "metadata"
         ? { tag: "指纹", fg: C.danger, bg: C.dangerSoft }
-        : s.kind === "cluster"
+        : sig.kind === "cluster"
           ? { tag: "雷同", fg: C.warn, bg: C.warnSoft }
-          : s.kind === "sharedTerms"
+          : sig.kind === "sharedTerms"
             ? { tag: "同源", fg: C.warn, bg: C.warnSoft }
             : { tag: "相似", fg: C.hi3, bg: C.brandSoft };
-    return { ...meta, title: `信号权重 ${(s.weight * 100).toFixed(0)}%`, body: s.detail };
+    return { ...meta, title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`, body: sig.detail };
   });
   const seen = new Set<string>();
-  r.docs.forEach((d, i) =>
-    d.fingerprint.riskFlags.forEach((f) => {
+  docs.forEach((dv, i) =>
+    dv.fp?.riskFlags.forEach((f) => {
       if (!seen.has(f)) {
         seen.add(f);
         insights.push({ tag: "元数据", fg: C.danger, bg: C.dangerSoft, title: `${docs[i].tag} · 指纹`, body: f });
@@ -128,11 +156,11 @@ function fromReport(r: Report): MatrixView {
   const peakColor = lv.color === C.ink && peakPct >= 60 ? C.hi3 : lv.color;
   const statement = level === "high" || level === "medium" ? `${docs[pi].tag}、${docs[pj].tag} 等标书${lv.statement}` : lv.statement;
   const desc =
-    (signals.length ? signals.map((s) => s.detail).join("；") + "。" : "") +
+    (signals.length ? signals.map((sig) => sig.detail).join("；") + "。" : "") +
     `本次共比对 ${n} 份标书、${(n * (n - 1)) / 2} 对组合，峰值相似度 ${peakPct}%，全部在本地完成。`;
   return {
     docs,
-    matrix: r.matrix,
+    matrix,
     peakPct,
     peakColor,
     peakPair: `${docs[pi].tag} ←→ ${docs[pj].tag}`,
@@ -142,7 +170,7 @@ function fromReport(r: Report): MatrixView {
   };
 }
 
-export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; report?: Report | null }) {
+export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId?: string }) {
   const { dark } = useTheme();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -151,7 +179,8 @@ export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; repo
   const border = dark ? "rgba(255,255,255,0.08)" : C.line;
 
   const toast = useToast();
-  if (!report || report.docs.length < 2) {
+  const { data: sm, isLoading } = useCompareSummary(jobId);
+  if (!sm || !sm.matrix || sm.matrix.documentIds.length < 2) {
     return (
       <div
         style={{
@@ -164,11 +193,11 @@ export function MatrixScreen({ onGo, report }: { onGo: (s: Screen) => void; repo
           fontSize: 13,
         }}
       >
-        暂无可展示的检测报告 —— 完成一次查重后在此查看。
+        {isLoading ? "正在加载报告…" : "暂无可展示的检测报告 —— 完成一次查重后在此查看。"}
       </div>
     );
   }
-  const v = fromReport(report);
+  const v = fromSummary(sm);
   const n = v.docs.length;
   const share = async () => {
     const text = [

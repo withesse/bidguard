@@ -1,6 +1,6 @@
 // TanStack Query 封装：查询键约定 ['workspaces'] ['documents', wsId] ['jobs', wsId?]
-// ['job', jobId] ['jobReport', jobId] ['clusters', jobId, filter] ['cluster', cid]。
-// 运行中任务由事件驱动失效 + 轮询兜底。
+// ['job', jobId] ['compareSummary', jobId] ['clusters', jobId, filter] ['cluster', cid]
+// ['pairDetail', jobId, a, b]（逐对懒加载）。运行中任务由事件驱动失效 + 轮询兜底。
 import {
   useInfiniteQuery,
   useMutation,
