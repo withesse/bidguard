@@ -62,17 +62,19 @@ pub fn cache_dir_path() -> Option<std::path::PathBuf> {
 }
 
 /// 递归收集缓存目录下所有文件 (路径, 字节)，最深 5 层。
+/// 用 fs::metadata（跟随符号链接）判定类型/大小：HF-hub 缓存把 snapshots/<hash>/.../model.onnx
+/// 存为指向 blobs/<sha> 的符号链接，entry.file_type() 不跟随会漏掉这些 onnx（导致误判"未下载"）。
 fn walk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(std::path::PathBuf, u64)>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
-        match e.file_type() {
-            Ok(t) if t.is_dir() && depth > 0 => walk_files(&p, depth - 1, out),
-            Ok(t) if t.is_file() => {
-                let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push((p, sz));
+        let Ok(meta) = std::fs::metadata(&p) else { continue };
+        if meta.is_dir() {
+            if depth > 0 {
+                walk_files(&p, depth - 1, out);
             }
-            _ => {}
+        } else if meta.is_file() {
+            out.push((p, meta.len()));
         }
     }
 }
@@ -186,6 +188,28 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 回归：HF-hub 缓存把 snapshots/<hash>/.../model.onnx 存为指向 blobs/<sha> 的符号链接。
+    // walk_files 必须跟随符号链接，否则 model_cached_for 漏判→工具屏永远显示「未下载」。
+    #[cfg(unix)]
+    #[test]
+    fn walk_files_follows_symlinked_onnx() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join("bidguard_walk_symlink_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let blobs = base.join("blobs");
+        let snap = base.join("snapshots/h/onnx");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(blobs.join("deadbeef"), vec![0u8; 1234]).unwrap();
+        symlink("../../../blobs/deadbeef", snap.join("model.onnx")).unwrap();
+        let mut files = Vec::new();
+        walk_files(&base, 5, &mut files);
+        let onnx = files.iter().find(|(p, _)| p.extension().is_some_and(|x| x == "onnx"));
+        assert!(onnx.is_some(), "应通过符号链接发现 model.onnx");
+        assert_eq!(onnx.unwrap().1, 1234, "符号链接 onnx 大小应为真 blob 大小");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     #[ignore] // 需下载模型；用 `cargo test -- --ignored` 手动验证
