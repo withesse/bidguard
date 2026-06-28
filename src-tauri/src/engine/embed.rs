@@ -79,6 +79,19 @@ fn walk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(std::path::PathBu
     }
 }
 
+/// 对文件列表按规范化路径去重后求字节和。
+/// HF-hub 缓存里同一 blob 既以真文件 blobs/<sha> 出现、又被 snapshots/.. 符号链接指向，
+/// walk_files 跟随符号链接会把同一份字节计两遍；canonicalize 后符号链接与目标 blob
+/// 收敛到同一绝对路径，只计一次（detection 用 .any() 不受影响，故仅在求和处去重）。
+fn dedup_bytes<'a>(files: impl IntoIterator<Item = &'a (std::path::PathBuf, u64)>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|(p, _)| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
+        .map(|(_, sz)| *sz)
+        .sum()
+}
+
 /// 模型文件是否已在本地缓存（任一模型，无需联网即可加载）。
 pub fn model_cached() -> bool {
     let Some(d) = cache_dir() else { return false };
@@ -105,11 +118,11 @@ pub fn model_cache_bytes(spec: &EmbedModelSpec) -> u64 {
     let id = spec.id.to_ascii_lowercase();
     let mut files = Vec::new();
     walk_files(&d, 5, &mut files);
-    files
-        .iter()
+    let matched: Vec<_> = files
+        .into_iter()
         .filter(|(p, _)| p.to_string_lossy().to_ascii_lowercase().contains(&id))
-        .map(|(_, sz)| *sz)
-        .sum()
+        .collect();
+    dedup_bytes(&matched)
 }
 
 /// 删除指定模型的本地缓存（含其 fastembed 目录）。返回删除的字节数。
@@ -123,7 +136,7 @@ pub fn clear_model_cache(spec: &EmbedModelSpec) -> u64 {
         if p.is_dir() && p.to_string_lossy().to_ascii_lowercase().contains(&id) {
             let mut files = Vec::new();
             walk_files(&p, 5, &mut files);
-            removed += files.iter().map(|(_, sz)| *sz).sum::<u64>();
+            removed += dedup_bytes(&files);
             let _ = std::fs::remove_dir_all(&p);
         }
     }
@@ -209,6 +222,29 @@ mod tests {
         assert!(onnx.is_some(), "应通过符号链接发现 model.onnx");
         assert_eq!(onnx.unwrap().1, 1234, "符号链接 onnx 大小应为真 blob 大小");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 回归：跟随符号链接后，同一 blob 既以 blobs/<sha> 真文件、又被 snapshots/.. 符号链接命中，
+    // 朴素求和会翻倍（曾导致工具屏显示 ~2x 体积）。dedup_bytes 按规范化路径去重应只计一次。
+    #[cfg(unix)]
+    #[test]
+    fn dedup_bytes_counts_symlinked_blob_once() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join("bidguard_dedup_bytes_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("models--x--bge-small-zh-v1.5");
+        let blobs = base.join("blobs");
+        let snap = base.join("snapshots/h/onnx");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(blobs.join("deadbeef"), vec![0u8; 1000]).unwrap();
+        symlink("../../../blobs/deadbeef", snap.join("model.onnx")).unwrap();
+        let mut files = Vec::new();
+        walk_files(&base, 5, &mut files);
+        let naive: u64 = files.iter().map(|(_, sz)| *sz).sum();
+        assert_eq!(naive, 2000, "前置条件：未去重时 blob + 符号链接翻倍");
+        assert_eq!(dedup_bytes(&files), 1000, "去重后同一 blob 只计一次");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
