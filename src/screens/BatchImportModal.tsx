@@ -1,5 +1,5 @@
 // 查重源批量导入：粘贴或选文件 → 四格式解析 → 预览去重 → 原子提交。
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { C } from "../design/tokens";
 import { Icon } from "../design/Icon";
 import { Button, Pill, SegControl } from "../components/primitives";
@@ -43,6 +43,15 @@ export function BatchImportModal({
 
   const [format, setFormat] = useState(0);
   const [raw, setRaw] = useState("");
+
+  // Esc 关闭模态
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const fmt = FORMATS[format].value;
   const rows = useMemo(

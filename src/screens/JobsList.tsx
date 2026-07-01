@@ -29,7 +29,9 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
       (jobs ?? [])
         .filter((j) => j.jobType === "compare")
         .filter((j) => (mode === "starred" ? j.starred : true))
-        .filter((j) => !q.trim() || (j.name ?? "").includes(q.trim())),
+        .filter(
+          (j) => !q.trim() || (j.name ?? "").toLowerCase().includes(q.trim().toLowerCase()),
+        ),
     [jobs, q, mode],
   );
 
