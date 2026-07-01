@@ -318,7 +318,15 @@ export function DocPreview() {
                     <ChunkBlock c={c} hit={hit} ink={ink} mute={mute} cardBg={cardBg} border={border} showTag sentenceColor={sentenceColor} />
                     <span
                       className="bg-ann-btn"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => setEditingChunk(editingChunk === c.id ? null : c.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setEditingChunk(editingChunk === c.id ? null : c.id);
+                        }
+                      }}
                       style={{
                         position: "absolute",
                         right: 0,
@@ -441,7 +449,19 @@ export function DocPreview() {
         >
           <div style={{ display: "flex", alignItems: "center", padding: "10px 14px", borderBottom: `1px solid ${border}` }}>
             <span style={{ flex: 1, fontSize: 12.5, fontWeight: 700, color: ink }}>本文档批注（{docAnns.length}）</span>
-            <span onClick={() => setNotesOpen(false)} style={{ cursor: "pointer", color: mute, fontSize: 12 }}>✕</span>
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label="关闭批注侧栏"
+              onClick={() => setNotesOpen(false)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setNotesOpen(false);
+                }
+              }}
+              style={{ cursor: "pointer", color: mute, fontSize: 12 }}
+            >✕</span>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
             {docAnns.length === 0 && (
@@ -515,14 +535,38 @@ function AnnBubble({
       ) : (
         <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
           <span style={{ flex: 1, fontSize: 12, lineHeight: 1.6, color: ink }}>{a.note}</span>
-          <span onClick={() => setEditing(true)} style={{ fontSize: 10.5, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}>编辑</span>
           <span
+            role="button"
+            tabIndex={0}
+            onClick={() => setEditing(true)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setEditing(true);
+              }
+            }}
+            style={{ fontSize: 10.5, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}
+          >编辑</span>
+          <span
+            role="button"
+            tabIndex={0}
             onClick={() => {
               if (armDel) {
                 setArmDel(false);
                 onDelete();
               } else {
                 setArmDel(true);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                if (armDel) {
+                  setArmDel(false);
+                  onDelete();
+                } else {
+                  setArmDel(true);
+                }
               }
             }}
             style={{
@@ -561,7 +605,15 @@ function TypeChip({
 }) {
   return (
     <span
+      role="button"
+      tabIndex={0}
       onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
       style={{
         display: "inline-flex",
         alignItems: "center",

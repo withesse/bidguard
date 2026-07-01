@@ -305,6 +305,14 @@ function MemberPane({
         )}
         <span
           onClick={onSource}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onSource();
+            }
+          }}
           title="在原文中查看此段"
           style={{ fontSize: 10.5, color: "var(--accent, #4F58A8)", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
         >
@@ -312,6 +320,14 @@ function MemberPane({
         </span>
         <span
           onClick={() => setNoting((v) => !v)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setNoting((v) => !v);
+            }
+          }}
           title="给这段加批注"
           style={{ fontSize: 10.5, color: anns.length > 0 ? "#C28430" : "var(--accent, #4F58A8)", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
         >
@@ -475,8 +491,34 @@ function MemberNote({
       }}
     >
       <span style={{ flex: 1, fontSize: 11.5, lineHeight: 1.6, color: ink }}>{a.note}</span>
-      <span onClick={() => setEditing(true)} style={{ fontSize: 10, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}>编辑</span>
-      <span onClick={onDelete} style={{ fontSize: 10, color: mute, cursor: "pointer", flexShrink: 0 }}>删除</span>
+      <span
+        onClick={() => setEditing(true)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setEditing(true);
+          }
+        }}
+        style={{ fontSize: 10, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}
+      >
+        编辑
+      </span>
+      <span
+        onClick={onDelete}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onDelete();
+          }
+        }}
+        style={{ fontSize: 10, color: mute, cursor: "pointer", flexShrink: 0 }}
+      >
+        删除
+      </span>
     </div>
   );
 }

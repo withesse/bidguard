@@ -149,7 +149,15 @@ export function Export({ jobId }: { jobId?: string }) {
                   return (
                     <div
                       key={i}
+                      role="button"
+                      tabIndex={0}
                       onClick={() => setFmt(i)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setFmt(i);
+                        }
+                      }}
                       style={{
                         padding: 12,
                         borderRadius: 8,

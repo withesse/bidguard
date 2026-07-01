@@ -63,6 +63,14 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
               <div
                 key={j.id}
                 onClick={() => nav(jobRoute(j))}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    nav(jobRoute(j));
+                  }
+                }}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -81,6 +89,18 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                       { jobId: j.id, starred: !j.starred },
                       { onError: (err) => toast.show("操作失败：" + errMsg(err), "error") },
                     );
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={j.starred ? "取消收藏" : "收藏"}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      star.mutate(
+                        { jobId: j.id, starred: !j.starred },
+                        { onError: (err) => toast.show("操作失败：" + errMsg(err), "error") },
+                      );
+                    }
                   }}
                   title={j.starred ? "取消收藏" : "收藏"}
                   style={{
@@ -139,6 +159,23 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                     } else {
                       setConfirmDel(j.id);
                       setTimeout(() => setConfirmDel((c) => (c === j.id ? null : c)), 2600);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  aria-label="删除任务与其结果"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (confirmDel === j.id) {
+                        del.mutate(j.id, {
+                          onError: (err) => toast.show("删除失败：" + errMsg(err), "error"),
+                        });
+                        setConfirmDel(null);
+                      } else {
+                        setConfirmDel(j.id);
+                        setTimeout(() => setConfirmDel((c) => (c === j.id ? null : c)), 2600);
+                      }
                     }
                   }}
                   title="删除任务与其结果"

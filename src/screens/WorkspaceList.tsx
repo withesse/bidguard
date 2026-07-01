@@ -90,6 +90,14 @@ export function WorkspaceList() {
               <div
                 key={w.id}
                 onClick={() => nav(`/workspace/${w.id}/new`)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    nav(`/workspace/${w.id}/new`);
+                  }
+                }}
                 style={{
                   background: cardBg,
                   border: `1px solid ${border}`,
@@ -150,6 +158,17 @@ export function WorkspaceList() {
                       setDraft(w.name);
                       setRenaming(w.id);
                     }}
+                    role="button"
+                    tabIndex={0}
+                    aria-label="重命名"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDraft(w.name);
+                        setRenaming(w.id);
+                      }
+                    }}
                     style={{ fontSize: 11, color: mute, flexShrink: 0, padding: "2px 2px" }}
                     title="重命名"
                   >
@@ -166,6 +185,24 @@ export function WorkspaceList() {
                       } else {
                         setConfirmDel(w.id);
                         setTimeout(() => setConfirmDel((c) => (c === w.id ? null : c)), 2600);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    aria-label="删除工作区（含文档与结果）"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (confirmDel === w.id) {
+                          del.mutate(w.id, {
+                            onError: (err) => toast.show("删除失败：" + errMsg(err), "error"),
+                          });
+                          setConfirmDel(null);
+                        } else {
+                          setConfirmDel(w.id);
+                          setTimeout(() => setConfirmDel((c) => (c === w.id ? null : c)), 2600);
+                        }
                       }
                     }}
                     style={{
@@ -197,6 +234,14 @@ export function WorkspaceList() {
           {(workspaces ?? []).length === 0 && (
             <div
               onClick={onCreate}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onCreate();
+                }
+              }}
               style={{
                 border: `1.5px dashed ${border}`,
                 borderRadius: 12,
@@ -224,6 +269,14 @@ export function WorkspaceList() {
                 <div
                   key={j.id}
                   onClick={() => nav(jobRoute(j))}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      nav(jobRoute(j));
+                    }
+                  }}
                   style={{
                     display: "flex",
                     alignItems: "center",

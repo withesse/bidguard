@@ -236,6 +236,14 @@ export function Library() {
                     {/* 分组头 */}
                     <div
                       onClick={() => toggleCollapse(cat)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          toggleCollapse(cat);
+                        }
+                      }}
                       style={{ display: "flex", alignItems: "center", gap: 7, cursor: "pointer", padding: "2px 2px" }}
                     >
                       <Icon name={isCollapsed ? "chevR" : "chevD"} size={13} style={{ color: mute }} />
@@ -506,6 +514,14 @@ function FilterPill({
   return (
     <span
       onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
       style={{
         cursor: "pointer",
         fontSize: 11.5,

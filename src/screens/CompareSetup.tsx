@@ -281,6 +281,14 @@ export function CompareSetup() {
           ))}
           <div
             onClick={onPick}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onPick();
+              }
+            }}
             style={{
               border: `1.5px dashed ${border}`,
               borderRadius: 12,
@@ -415,6 +423,14 @@ function DocCard({
   return (
     <div
       onClick={onToggle}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onToggle();
+        }
+      }}
       style={{
         background: cardBg,
         border: `1.5px solid ${border}`,
@@ -470,6 +486,15 @@ function DocCard({
               e.stopPropagation();
               onPreview();
             }}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                onPreview();
+              }
+            }}
             style={{ color: "var(--accent, #4F58A8)", fontSize: 10.5, fontWeight: 600, padding: 2, flexShrink: 0 }}
             title="预览原文"
           >
@@ -480,6 +505,16 @@ function DocCard({
           onClick={(e) => {
             e.stopPropagation();
             onRemove();
+          }}
+          role="button"
+          tabIndex={0}
+          aria-label="移除文档"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              e.stopPropagation();
+              onRemove();
+            }
           }}
           style={{ color: mute, fontSize: 11, padding: 2, flexShrink: 0 }}
           title="移除文档"
@@ -515,6 +550,15 @@ function DocCard({
               onClick={(e) => {
                 e.stopPropagation();
                 onRetry();
+              }}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onRetry();
+                }
               }}
               style={{ color: "var(--accent, #4F58A8)", fontWeight: 600, flexShrink: 0, cursor: "pointer" }}
               title="用同一文件重新解析"

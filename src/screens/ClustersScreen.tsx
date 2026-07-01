@@ -101,7 +101,10 @@ export function ClustersScreen() {
           return (
             <span
               key={f.label}
+              role="button"
+              tabIndex={0}
               onClick={() => setTypeKey(f.key)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setTypeKey(f.key); } }}
               style={{
                 fontSize: 11,
                 padding: "4px 10px",
@@ -119,7 +122,10 @@ export function ClustersScreen() {
         })}
         <span style={{ flex: 1 }} />
         <span
+          role="button"
+          tabIndex={0}
           onClick={() => setOnlyPending((v) => !v)}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOnlyPending((v) => !v); } }}
           style={{
             fontSize: 11,
             padding: "4px 10px",
@@ -207,7 +213,10 @@ function ClusterRow({
   const review = REVIEW_UI[c.reviewStatus] ?? REVIEW_UI.pending;
   return (
     <div
+      role="button"
+      tabIndex={0}
       onClick={onOpen}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}
       style={{
         background: cardBg,
         border: `1px solid ${border}`,
@@ -303,7 +312,10 @@ function ReviewBtn({
   const { dark } = useTheme();
   return (
     <span
+      role="button"
+      tabIndex={0}
       onClick={onClick}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(e as any); } }}
       style={{
         fontSize: 10.5,
         padding: "2px 8px",

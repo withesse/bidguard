@@ -118,6 +118,14 @@ function RealCompare({ summary, jobId, onGo }: { summary: CompareSummaryDto; job
               <div
                 key={`${p.a}-${p.b}`}
                 onClick={() => setSel(i)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setSel(i);
+                  }
+                }}
                 style={{
                   display: "flex",
                   alignItems: "center",

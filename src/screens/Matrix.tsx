@@ -566,6 +566,18 @@ function BigMatrix({
                 key={c}
                 onClick={diag ? undefined : onCell}
                 title={diag ? undefined : "查看逐对对比"}
+                role={diag ? undefined : "button"}
+                tabIndex={diag ? undefined : 0}
+                onKeyDown={
+                  diag
+                    ? undefined
+                    : (e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onCell?.();
+                        }
+                      }
+                }
                 style={{
                   aspectRatio: "1.3 / 1",
                   borderRadius: 8,
