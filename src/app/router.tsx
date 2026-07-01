@@ -1,8 +1,15 @@
 // 路由表：Hash 路由（Tauri 生产环境用自定义协议加载，BrowserRouter 刷新会丢路径）。
 // 结果屏 Matrix/Compare/Export 原生消费 DTO（useCompareSummary / 按需 getPairDetail），适配层已移除。
-import { createHashRouter, Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
+import {
+  createHashRouter,
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRouteError,
+} from "react-router-dom";
 import { Sidebar, type NavKey } from "../components/Sidebar";
-import { Pill } from "../components/primitives";
+import { Button, Pill } from "../components/primitives";
 import { C } from "../design/tokens";
 import { useTheme } from "../theme";
 import type { Screen } from "../routes";
@@ -157,9 +164,54 @@ function SummaryBanner({ jobId, onClusters }: { jobId: string | undefined; onClu
   );
 }
 
+/** 路由级错误兜底：loader/渲染错误显示中文页面而非 React Router 默认英文错误页。 */
+function RouteError() {
+  const { dark } = useTheme();
+  const err = useRouteError();
+  const msg =
+    err instanceof Error ? err.message : typeof err === "string" ? err : "页面加载时发生未知错误";
+  return (
+    <div
+      style={{
+        flex: 1,
+        minWidth: 0,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 14,
+        padding: 24,
+        textAlign: "center",
+        background: dark ? "#15151B" : C.paper,
+      }}
+    >
+      <div style={{ fontSize: 15, fontWeight: 700, color: dark ? "#fff" : C.ink }}>这个页面出错了</div>
+      <div
+        style={{
+          fontSize: 12.5,
+          maxWidth: 480,
+          lineHeight: 1.6,
+          color: dark ? "rgba(255,255,255,0.6)" : C.ink3,
+        }}
+      >
+        {msg}
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <Button kind="secondary" size="md" icon="home" onClick={() => (window.location.hash = "#/")}>
+          返回首页
+        </Button>
+        <Button kind="primary" size="md" onClick={() => window.location.reload()}>
+          重新加载
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export const router = createHashRouter([
   {
     element: <Layout />,
+    errorElement: <RouteError />,
     children: [
       { path: "/", element: <WorkspaceList /> },
       { path: "/starred", element: <JobsList title="我的任务" mode="starred" /> },
