@@ -51,11 +51,7 @@ pub fn score_pair(a: &CmpChunk, b: &CmpChunk, semantic: Option<f32>) -> ScorePar
     let lexical = features::sparse_dot(&a.tfidf, &b.tfidf).clamp(0.0, 1.0);
     let char_ngram = features::jaccard(&a.ngrams, &b.ngrams);
     let entity = features::entity_sim(&a.entities, &b.entities);
-    let structure = if a.section_path.is_empty() || b.section_path.is_empty() {
-        None
-    } else {
-        Some(path_sim(&a.section_path, &b.section_path))
-    };
+    let structure = structure_sim(&a.section_path, &b.section_path);
     let order = 1.0 - (a.rel_pos - b.rel_pos).abs();
 
     let w = if semantic.is_some() { &W_SEMANTIC } else { &W_LEXICAL };
@@ -87,11 +83,25 @@ pub fn score_pair(a: &CmpChunk, b: &CmpChunk, semantic: Option<f32>) -> ScorePar
     }
 }
 
-/// 章节路径相似度：Dice 系数 2·lcp/(|a|+|b|)。
-/// 比 lcp/max 对「同章不同小节深度」（如 2 层 vs 4 层但前 2 层一致）更宽容。
-fn path_sim(a: &[String], b: &[String]) -> f32 {
+/// 结构相似度：比较「去掉文档标题根」后的章节路径，Dice 系数 2·lcp/(|a'|+|b'|)。
+/// section_path 第 0 层是文档 H1 标题（文档身份，非章节结构）。标书标题必然不同，
+/// 若把标题计入公共前缀，会让每条跨文档边的结构维恒为 0，等同对所有雷同内容加一记
+/// 固定罚分（把逐字相同的段落从 100% 压到 ~89%）。故剥掉标题根再比。
+///
+/// 判为「不可测」(None → 踢出分母、不惩罚，交文本/语义维定夺) 的两种情形：任一方无
+/// 章节路径或去根后为空（版本/日期等直挂标题下的行）；去根后无公共章节前缀（内容被
+/// 挪到完全不同章节）。仅当双方共享章节前缀（如同模板围标）时结构维才加分。
+fn structure_sim(a: &[String], b: &[String]) -> Option<f32> {
+    let a = a.get(1..)?;
+    let b = b.get(1..)?;
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
     let lcp = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    2.0 * lcp as f32 / (a.len() + b.len()) as f32
+    if lcp == 0 {
+        return None;
+    }
+    Some(2.0 * lcp as f32 / (a.len() + b.len()) as f32)
 }
 
 #[cfg(test)]
@@ -196,10 +206,18 @@ mod tests {
     }
 
     #[test]
-    fn path_similarity() {
-        assert_eq!(path_sim(&["a".into(), "b".into()], &["a".into(), "b".into()]), 1.0);
-        assert_eq!(path_sim(&["a".into(), "b".into()], &["a".into(), "c".into()]), 0.5);
-        assert_eq!(path_sim(&["a".into()], &["b".into()]), 0.0);
+    fn structure_sim_strips_title_and_reallocates() {
+        let t = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        // 标题不同但子章节一致（同模板围标）→ 剥标题后前缀命中 → 有分
+        assert_eq!(structure_sim(&t(&["标A", "3数据", "3.2表"]), &t(&["标B", "3数据", "3.2表"])), Some(1.0));
+        // 标题不同、子章节也不同 → 剥后无公共前缀 → 不可测
+        assert_eq!(structure_sim(&t(&["标A", "11数据模型"]), &t(&["标B", "5数据架构"])), None);
+        // 只有标题（版本/日期行）→ 剥后为空 → 不可测
+        assert_eq!(structure_sim(&t(&["标A"]), &t(&["标B"])), None);
+        // 空路径 → 不可测
+        assert_eq!(structure_sim(&[], &t(&["标B"])), None);
+        // 部分子章节一致 → Dice 0.5
+        assert_eq!(structure_sim(&t(&["A", "3数据", "3.2表"]), &t(&["B", "3数据", "3.9图"])), Some(0.5));
         let _ = HashSet::<u64>::new(); // 防未用导入告警
     }
 }
