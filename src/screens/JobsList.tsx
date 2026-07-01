@@ -147,8 +147,8 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                 <Pill fg={st.fg} bg={st.bg} size={10}>
                   {st.label}
                 </Pill>
-                <span style={{ fontSize: 11, color: mute, flexShrink: 0 }} title={formatRelative(j.createdAt)}>
-                  {formatDateTime(j.createdAt)}
+                <span style={{ fontSize: 11, color: mute, flexShrink: 0 }} title={formatDateTime(j.createdAt)}>
+                  {formatRelative(j.createdAt)}
                 </span>
                 <span
                   onClick={(e) => {
