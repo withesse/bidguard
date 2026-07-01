@@ -108,8 +108,8 @@ export function ClustersScreen() {
                 borderRadius: 999,
                 cursor: "pointer",
                 background: active ? "rgba(79,88,168,0.15)" : "transparent",
-                color: active ? "#6B73C9" : mute,
-                border: `1px solid ${active ? "#6B73C9" : border}`,
+                color: active ? "var(--accent, #4F58A8)" : mute,
+                border: `1px solid ${active ? "var(--accent, #4F58A8)" : border}`,
                 fontWeight: active ? 700 : 500,
               }}
             >
@@ -125,8 +125,8 @@ export function ClustersScreen() {
             padding: "4px 10px",
             borderRadius: 999,
             cursor: "pointer",
-            color: onlyPending ? "#6B73C9" : mute,
-            border: `1px solid ${onlyPending ? "#6B73C9" : border}`,
+            color: onlyPending ? "var(--accent, #4F58A8)" : mute,
+            border: `1px solid ${onlyPending ? "var(--accent, #4F58A8)" : border}`,
             fontWeight: onlyPending ? 700 : 500,
           }}
         >
@@ -258,7 +258,7 @@ function ClusterRow({
                 height: 17,
                 borderRadius: 5,
                 background: "rgba(79,88,168,0.13)",
-                color: "#6B73C9",
+                color: "var(--accent, #4F58A8)",
                 fontSize: 10,
                 fontWeight: 700,
                 display: "inline-flex",

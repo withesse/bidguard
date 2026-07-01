@@ -275,7 +275,7 @@ function MemberPane({
             height: 20,
             borderRadius: 6,
             background: "rgba(79,88,168,0.13)",
-            color: "#6B73C9",
+            color: "var(--accent, #4F58A8)",
             fontSize: 11,
             fontWeight: 700,
             display: "inline-flex",
@@ -306,14 +306,14 @@ function MemberPane({
         <span
           onClick={onSource}
           title="在原文中查看此段"
-          style={{ fontSize: 10.5, color: "#6B73C9", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
+          style={{ fontSize: 10.5, color: "var(--accent, #4F58A8)", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
         >
           原文
         </span>
         <span
           onClick={() => setNoting((v) => !v)}
           title="给这段加批注"
-          style={{ fontSize: 10.5, color: anns.length > 0 ? "#C28430" : "#6B73C9", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
+          style={{ fontSize: 10.5, color: anns.length > 0 ? "#C28430" : "var(--accent, #4F58A8)", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}
         >
           批注{anns.length > 0 ? ` ${anns.length}` : ""}
         </span>
@@ -475,7 +475,7 @@ function MemberNote({
       }}
     >
       <span style={{ flex: 1, fontSize: 11.5, lineHeight: 1.6, color: ink }}>{a.note}</span>
-      <span onClick={() => setEditing(true)} style={{ fontSize: 10, color: "#6B73C9", cursor: "pointer", flexShrink: 0 }}>编辑</span>
+      <span onClick={() => setEditing(true)} style={{ fontSize: 10, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}>编辑</span>
       <span onClick={onDelete} style={{ fontSize: 10, color: mute, cursor: "pointer", flexShrink: 0 }}>删除</span>
     </div>
   );

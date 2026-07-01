@@ -325,7 +325,7 @@ export function DocPreview() {
                         top: 2,
                         fontSize: 10.5,
                         fontWeight: 600,
-                        color: "#6B73C9",
+                        color: "var(--accent, #4F58A8)",
                         cursor: "pointer",
                         background: cardBg,
                         padding: "1px 6px",
@@ -401,7 +401,7 @@ export function DocPreview() {
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   <div style={{ fontSize: 11, color: mute, maxHeight: 60, overflow: "hidden" }}>
                     “{selDraft.quote.slice(0, 120)}{selDraft.quote.length > 120 ? "…" : ""}”
-                    {selDraft.page != null && <Pill fg="#6B73C9" bg="rgba(79,88,168,0.12)" size={10}> 第 {selDraft.page} 页</Pill>}
+                    {selDraft.page != null && <Pill fg="var(--accent, #4F58A8)" bg="rgba(79,88,168,0.12)" size={10}> 第 {selDraft.page} 页</Pill>}
                   </div>
                   <NoteEditor
                     onCancel={() => {
@@ -493,7 +493,7 @@ function AnnBubble({
         margin: "6px 0 0 44px",
         background: cardBg,
         border: `1px solid ${border}`,
-        borderLeft: "3px solid #6B73C9",
+        borderLeft: "3px solid var(--accent, #4F58A8)",
         borderRadius: 8,
         padding: "8px 10px",
       }}
@@ -515,7 +515,7 @@ function AnnBubble({
       ) : (
         <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
           <span style={{ flex: 1, fontSize: 12, lineHeight: 1.6, color: ink }}>{a.note}</span>
-          <span onClick={() => setEditing(true)} style={{ fontSize: 10.5, color: "#6B73C9", cursor: "pointer", flexShrink: 0 }}>编辑</span>
+          <span onClick={() => setEditing(true)} style={{ fontSize: 10.5, color: "var(--accent, #4F58A8)", cursor: "pointer", flexShrink: 0 }}>编辑</span>
           <span
             onClick={() => {
               if (armDel) {
@@ -627,7 +627,7 @@ function ChunkBlock({
   sentenceColor?: boolean;
 }) {
   const hitStyle = hit
-    ? { background: "rgba(79,88,168,0.10)", border: "1px solid #6B73C9", borderRadius: 8, padding: "8px 10px" }
+    ? { background: "rgba(79,88,168,0.10)", border: "1px solid var(--accent, #4F58A8)", borderRadius: 8, padding: "8px 10px" }
     : {};
   const tag = showTag ? <ChunkTag type={c.chunkType} /> : null;
   // 句子着色：把段落文本切成句子，逐句轮换底色

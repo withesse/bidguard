@@ -470,7 +470,7 @@ function DocCard({
               e.stopPropagation();
               onPreview();
             }}
-            style={{ color: "#6B73C9", fontSize: 10.5, fontWeight: 600, padding: 2, flexShrink: 0 }}
+            style={{ color: "var(--accent, #4F58A8)", fontSize: 10.5, fontWeight: 600, padding: 2, flexShrink: 0 }}
             title="预览原文"
           >
             预览
@@ -516,7 +516,7 @@ function DocCard({
                 e.stopPropagation();
                 onRetry();
               }}
-              style={{ color: "#6B73C9", fontWeight: 600, flexShrink: 0, cursor: "pointer" }}
+              style={{ color: "var(--accent, #4F58A8)", fontWeight: 600, flexShrink: 0, cursor: "pointer" }}
               title="用同一文件重新解析"
             >
               重试

@@ -110,8 +110,8 @@ export function Running() {
                             ? "rgba(255,255,255,0.07)"
                             : C.paper2
                           : "transparent",
-                      color: active ? "#6B73C9" : reached ? ink : mute,
-                      border: `1px solid ${active ? "#6B73C9" : border}`,
+                      color: active ? "var(--accent, #4F58A8)" : reached ? ink : mute,
+                      border: `1px solid ${active ? "var(--accent, #4F58A8)" : border}`,
                       fontWeight: active ? 700 : 500,
                     }}
                   >

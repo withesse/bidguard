@@ -67,7 +67,7 @@ export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: st
         .bg-md-host pre{background:${dark ? "rgba(255,255,255,0.05)" : "#F4F1EA"};padding:10px 12px;border-radius:8px;overflow-x:auto;font-size:12px;}
         .bg-md-host code{font-family:${C.mono};font-size:12px;}
         .bg-md-host blockquote{border-left:3px solid ${border};margin:8px 0;padding:2px 14px;opacity:.85;}
-        .bg-md-host a{color:#6B73C9;}
+        .bg-md-host a{color:var(--accent, #4F58A8);}
       `}</style>
       {/* 已经 DOMPurify 白名单消毒（剥脚本/事件/危险属性） */}
       <div ref={hostRef} className="bg-md-host" dangerouslySetInnerHTML={{ __html: html }} />
