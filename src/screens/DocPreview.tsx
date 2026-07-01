@@ -381,7 +381,7 @@ export function DocPreview() {
           )}
           {fileQ.data && isDocx && <DocxView data={fileQ.data} anchorText={targetObj?.text ?? null} />}
           {fileQ.data && isMd && <MdView data={fileQ.data} anchorText={targetObj?.text ?? null} />}
-          {fileQ.data && isTxt && <TxtView data={fileQ.data} />}
+          {fileQ.data && isTxt && <TxtView data={fileQ.data} anchorText={targetObj?.text ?? null} />}
 
           {/* 选中文本 → 引文批注 */}
           {selDraft && (

@@ -269,7 +269,7 @@ export function CompareSetup() {
               onPreview={() => nav(`/workspace/${wsId}/doc/${d.id}`)}
               onRemove={() =>
                 removeDoc.mutate(d.id, {
-                  onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
+                  onError: (e) => toast.show("移除失败：" + errMsg(e), "error"),
                 })
               }
               onRetry={() =>
@@ -359,7 +359,7 @@ export function CompareSetup() {
             <SettingRow label="事实冲突检测" hint="同一条款金额/工期/日期不一致 → 风险标记">
               <Toggle on={factConflict} onChange={() => setFactConflict((v) => !v)} />
             </SettingRow>
-            <SettingRow label="忽略通用模板" hint="命中查重源样板的段落不参与比对">
+            <SettingRow label="忽略查重源样板" hint="命中查重源样板的段落不参与比对">
               <Toggle on={ignoreTemplates} onChange={() => setIgnoreTemplates((v) => !v)} />
             </SettingRow>
             <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 4 }}>

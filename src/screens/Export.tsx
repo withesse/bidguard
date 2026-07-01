@@ -192,17 +192,30 @@ export function Export({ jobId }: { jobId?: string }) {
             </div>
 
             <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 18 }}>
-              <CardLabel mute={mute}>报告包含（固定章节）</CardLabel>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {SECTIONS.map((label, i) => (
-                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 9 }}>
-                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ flexShrink: 0 }}>
-                      <path d="M3 7.5l2.5 2.5L11 4.5" stroke={accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                    <span style={{ fontSize: 12, color: dark ? "rgba(255,255,255,0.8)" : C.ink2 }}>{label}</span>
+              {FORMATS[fmt].kind === "csv" || FORMATS[fmt].kind === "json" ? (
+                <>
+                  <CardLabel mute={mute}>{FORMATS[fmt].label} 内容</CardLabel>
+                  <div style={{ fontSize: 12, color: dark ? "rgba(255,255,255,0.8)" : C.ink2, lineHeight: 1.7 }}>
+                    {FORMATS[fmt].kind === "csv"
+                      ? "扁平表格：每行一条雷同 / 冲突条款（文档、相似度、类型、章节、正文摘要）。不含封面、矩阵图与热力图。"
+                      : "结构化数据：矩阵、条款、事实冲突、围标信号与配置快照的完整 JSON，供二次处理。不含渲染版式。"}
                   </div>
-                ))}
-              </div>
+                </>
+              ) : (
+                <>
+                  <CardLabel mute={mute}>报告包含（固定章节）</CardLabel>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {SECTIONS.map((label, i) => (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ flexShrink: 0 }}>
+                          <path d="M3 7.5l2.5 2.5L11 4.5" stroke={accent} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                        <span style={{ fontSize: 12, color: dark ? "rgba(255,255,255,0.8)" : C.ink2 }}>{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           </div>
 

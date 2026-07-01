@@ -346,7 +346,7 @@ export function Settings() {
           {/* 隐私 */}
           <Card title="隐私" cardBg={cardBg} border={border} mute={mute}>
             <Row label="本地优先模式" sub="标书不上传至服务器（本应用始终本地处理）" ink={ink} mute={mute}>
-              <Toggle on onChange={() => toast.show("本应用全程本地处理，无需关闭", "info")} />
+              <span style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>始终启用</span>
             </Row>
             <Row
               label="允许联网下载语义模型"
