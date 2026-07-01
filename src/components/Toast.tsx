@@ -1,5 +1,13 @@
 // 轻量 Toast（替代裸 alert，可诊断、自动消失、可点击关闭）
-import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { C } from "../design/tokens";
 
 export type ToastKind = "info" | "success" | "warn" | "error";
@@ -14,6 +22,12 @@ interface ToastCtx {
 
 const Ctx = createContext<ToastCtx>({ show: () => {} });
 export const useToast = () => useContext(Ctx);
+
+// 模块级桥：让 React 树外（如 QueryCache.onError）也能弹 toast。
+let externalShow: ((msg: string, kind?: ToastKind) => void) | null = null;
+export function toast(msg: string, kind: ToastKind = "info") {
+  externalShow?.(msg, kind);
+}
 
 const COLORS: Record<ToastKind, { bg: string; bar: string }> = {
   info: { bg: "#2A2A33", bar: "#6B73C9" },
@@ -30,6 +44,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((t) => [...t, { id, msg, kind }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4500);
   }, []);
+  // 注册到模块级桥，供 React 树外（QueryCache.onError）调用
+  useEffect(() => {
+    externalShow = show;
+    return () => {
+      if (externalShow === show) externalShow = null;
+    };
+  }, [show]);
   return (
     <Ctx.Provider value={{ show }}>
       {children}

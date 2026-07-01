@@ -189,7 +189,11 @@ export function Tools() {
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>数据库</div>
                 <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
-                  {mb(storage.data?.dbBytes ?? 0)} · {storage.data?.documentCount ?? 0} 文档 · {storage.data?.jobCount ?? 0} 任务
+                  {storage.isLoading
+                    ? "读取中…"
+                    : storage.isError
+                      ? "读取失败"
+                      : `${mb(storage.data?.dbBytes ?? 0)} · ${storage.data?.documentCount ?? 0} 文档 · ${storage.data?.jobCount ?? 0} 任务`}
                 </div>
               </div>
               <Button
@@ -210,7 +214,11 @@ export function Tools() {
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>语义向量缓存</div>
                 <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
-                  {storage.data?.embeddingRows ?? 0} 条 · 换模型后旧向量可清理（下次比对按需重算）
+                  {storage.isLoading
+                    ? "读取中…"
+                    : storage.isError
+                      ? "读取失败"
+                      : `${storage.data?.embeddingRows ?? 0} 条 · 换模型后旧向量可清理（下次比对按需重算）`}
                 </div>
               </div>
               <ConfirmButton
@@ -258,21 +266,35 @@ export function Tools() {
                 </div>
                 <Button kind="secondary" size="sm" onClick={() => setDiagOn(true)}>开始检查</Button>
               </Row>
+            ) : diag.isLoading ? (
+              <Row ink={ink} mute={mute} border={border} last>
+                <div style={{ flex: 1, fontSize: 12, color: mute }}>检查中…</div>
+              </Row>
+            ) : diag.isError ? (
+              <Row ink={ink} mute={mute} border={border} last>
+                <div style={{ flex: 1, fontSize: 12, color: C.danger }}>
+                  自检执行失败：{errMsg(diag.error)}
+                </div>
+                <Button kind="secondary" size="sm" onClick={() => void diag.refetch()}>重试</Button>
+              </Row>
             ) : (
-              (diag.data ?? []).map((d, i, arr) => (
-                <Row key={d.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
-                  <span style={{ fontSize: 14, marginRight: 8, color: d.ok ? "#0F6E56" : "#A32D2D" }}>
-                    {d.ok ? "✓" : "✕"}
-                  </span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{d.label}</div>
-                    <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>{d.detail}</div>
-                  </div>
+              <>
+                {(diag.data ?? []).map((d) => (
+                  <Row key={d.key} ink={ink} mute={mute} border={border}>
+                    <span style={{ fontSize: 14, marginRight: 8, color: d.ok ? C.ok : C.danger }}>
+                      {d.ok ? "✓" : "✕"}
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{d.label}</div>
+                      <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>{d.detail}</div>
+                    </div>
+                  </Row>
+                ))}
+                <Row ink={ink} mute={mute} border={border} last>
+                  <div style={{ flex: 1 }} />
+                  <Button kind="ghost" size="sm" onClick={() => void diag.refetch()}>重新检查</Button>
                 </Row>
-              ))
-            )}
-            {diagOn && diag.isLoading && (
-              <div style={{ fontSize: 12, color: mute, padding: "8px 2px" }}>检查中…</div>
+              </>
             )}
           </Card>
         </div>

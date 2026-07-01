@@ -1,21 +1,26 @@
 import React, { useEffect } from "react";
 import ReactDOM from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { router } from "./app/router";
 import { ThemeProvider } from "./theme";
-import { ToastProvider } from "./components/Toast";
+import { ToastProvider, toast as toastBus } from "./components/Toast";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { installRepaintFix } from "./repaint";
 import { initJobEvents } from "./stores/progressStore";
 import { cleanupOldJobs, getAppSettings, setAppSettings } from "./api";
-import { isTauri } from "./api/client";
+import { errMsg, isTauri } from "./api/client";
 import { getSettings } from "./prefs";
 import "./index.css";
 
 installRepaintFix();
 
 const queryClient = new QueryClient({
+  // 全局兜底：查询失败(retry:false 下即时失败)弹 toast，不再静默退化成空态。
+  // 变更类失败走各自 mutation 的 onError，这里只覆盖 query。
+  queryCache: new QueryCache({
+    onError: (err) => toastBus("数据加载失败：" + errMsg(err), "error"),
+  }),
   defaultOptions: {
     // networkMode "always"：invoke 走本地 IPC 不经网络，离线机器（本产品的
     // 目标场景）上绝不能让查询因 navigator.onLine=false 被挂起。
