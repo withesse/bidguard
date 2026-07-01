@@ -88,6 +88,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     if (typeof document !== "undefined")
       document.documentElement.classList.toggle("reduce-motion", t.reduceMotion);
   }, [t.reduceMotion]);
+  // 暗色/主色随全局同步：color-scheme 让原生控件(滚动条/下拉/input)与画布外区域跟随，
+  // --accent 供 CSS(:focus-visible 轮廓)读取，html.dark 供暗色滚动条等 CSS 钩子。
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    root.classList.toggle("dark", t.dark);
+    root.style.colorScheme = t.dark ? "dark" : "light";
+    root.style.setProperty("--accent", t.accent);
+    document.body.style.background = t.dark ? "#15151B" : "#F4F2EB";
+  }, [t.dark, t.accent]);
   const set = (patch: Partial<Theme>) =>
     setT((prev) => {
       const next = { ...prev, ...patch };

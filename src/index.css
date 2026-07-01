@@ -32,6 +32,25 @@ button {
   font-family: inherit;
 }
 
+/* 键盘焦点可见：走主题 accent（由 theme.tsx 注入 --accent），仅键盘聚焦时显示 */
+:where(a, button, input, select, textarea, [role="switch"], [role="radio"], [role="button"], [tabindex]):focus-visible {
+  outline: 2px solid var(--accent, #4f58a8);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 交互反馈：真实 <button>（Button 原子/图标按钮）的 hover/active */
+button:not(:disabled) {
+  transition: filter 0.12s ease, transform 0.06s ease;
+}
+button:not(:disabled):hover {
+  filter: brightness(1.05);
+}
+button:not(:disabled):active {
+  transform: translateY(0.5px);
+  filter: brightness(0.95);
+}
+
 /* 检测中：矩阵单元/步骤点脉冲（Scan 屏用） */
 @keyframes cpulse {
   0%,
@@ -71,4 +90,14 @@ html.reduce-motion *::after {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* 暗色滚动条（html.dark 由 theme.tsx 切换） */
+html.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: padding-box;
+}
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+  background-clip: padding-box;
 }

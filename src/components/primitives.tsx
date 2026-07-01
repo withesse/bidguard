@@ -198,23 +198,41 @@ export function Toggle({
   on,
   accent: accentProp,
   onChange,
+  disabled,
+  label,
 }: {
   on: boolean;
   accent?: string;
   onChange?: () => void;
+  disabled?: boolean;
+  label?: string;
 }) {
   const th = useTheme();
   const accent = accentProp ?? th.accent;
+  const offTrack = th.dark ? "rgba(255,255,255,0.22)" : "#C9C5CF";
   return (
     <div
-      onClick={onChange}
+      role="switch"
+      aria-checked={on}
+      aria-label={label}
+      aria-disabled={disabled || undefined}
+      tabIndex={disabled ? -1 : 0}
+      onClick={disabled ? undefined : onChange}
+      onKeyDown={(e) => {
+        if (disabled) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onChange?.();
+        }
+      }}
       style={{
         width: 28,
         height: 16,
         borderRadius: 999,
-        background: on ? accent : "#C9C5CF",
+        background: on ? accent : offTrack,
         position: "relative",
-        cursor: "pointer",
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.5 : 1,
         transition: "background 0.15s",
         flexShrink: 0,
       }}
@@ -252,6 +270,7 @@ export function SegControl({
   const dark = darkProp ?? th.dark;
   return (
     <div
+      role="radiogroup"
       style={{
         display: "flex",
         padding: 2,
@@ -263,7 +282,22 @@ export function SegControl({
       {options.map((o, i) => (
         <div
           key={i}
+          role="radio"
+          aria-checked={i === value}
+          tabIndex={i === value ? 0 : -1}
           onClick={() => onChange?.(i)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+              e.preventDefault();
+              onChange?.(Math.min(options.length - 1, i + 1));
+            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+              e.preventDefault();
+              onChange?.(Math.max(0, i - 1));
+            } else if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onChange?.(i);
+            }
+          }}
           style={{
             flex: 1,
             textAlign: "center",
