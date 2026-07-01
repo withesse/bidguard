@@ -338,7 +338,7 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                   <span style={{ fontSize: 10.5, color: mute }}>高</span>
                 </div>
               </div>
-              <BigMatrix docs={v.docs} matrix={v.matrix} />
+              <BigMatrix docs={v.docs} matrix={v.matrix} onCell={() => onGo("compare")} />
 
               <div
                 style={{
@@ -492,7 +492,15 @@ function FpChip({ k, v, mute }: { k: string; v: string; mute: string }) {
   );
 }
 
-function BigMatrix({ docs, matrix }: { docs: ViewDoc[]; matrix: number[][] }) {
+function BigMatrix({
+  docs,
+  matrix,
+  onCell,
+}: {
+  docs: ViewDoc[];
+  matrix: number[][];
+  onCell?: () => void;
+}) {
   const { dark } = useTheme();
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
@@ -556,6 +564,8 @@ function BigMatrix({ docs, matrix }: { docs: ViewDoc[]; matrix: number[][] }) {
             return (
               <div
                 key={c}
+                onClick={diag ? undefined : onCell}
+                title={diag ? undefined : "查看逐对对比"}
                 style={{
                   aspectRatio: "1.3 / 1",
                   borderRadius: 8,
