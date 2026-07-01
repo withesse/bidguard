@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { C } from "../design/tokens";
 import { Topbar } from "../components/Topbar";
-import { Button, Pill } from "../components/primitives";
+import { Button, ConfirmButton, Pill } from "../components/primitives";
 import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
@@ -120,14 +120,19 @@ export function Tools() {
                 {m.bundled ? (
                   <Pill fg="#0F6E56" bg="rgba(15,110,86,0.13)" size={10}>已就位</Pill>
                 ) : m.present ? (
-                  <Button kind="ghost" size="sm" onClick={() =>
-                    clearOcr.mutate(m.key, {
-                      onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
-                      onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
-                    })
-                  }>
+                  <ConfirmButton
+                    confirmLabel="确认删除？"
+                    pending={clearOcr.isPending}
+                    pendingLabel="删除中…"
+                    onConfirm={() =>
+                      clearOcr.mutate(m.key, {
+                        onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
+                        onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
+                      })
+                    }
+                  >
                     删除
-                  </Button>
+                  </ConfirmButton>
                 ) : (
                   <Button kind="secondary" size="sm" disabled={downloading != null} onClick={() => onDownloadOcr(m.key, m.label)}>
                     {downloading === m.key ? "下载中…" : "下载"}
@@ -156,14 +161,19 @@ export function Tools() {
                   </Button>
                 )}
                 {m.cached ? (
-                  <Button kind="ghost" size="sm" onClick={() =>
-                    clearModel.mutate(m.key, {
-                      onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
-                      onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
-                    })
-                  }>
+                  <ConfirmButton
+                    confirmLabel="确认删除？"
+                    pending={clearModel.isPending}
+                    pendingLabel="删除中…"
+                    onConfirm={() =>
+                      clearModel.mutate(m.key, {
+                        onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
+                        onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
+                      })
+                    }
+                  >
                     删除缓存
-                  </Button>
+                  </ConfirmButton>
                 ) : (
                   <Button kind="secondary" size="sm" disabled={downloading != null} onClick={() => onDownload(m.key, m.label)}>
                     {downloading === m.key ? "下载中…" : "下载"}
@@ -182,13 +192,18 @@ export function Tools() {
                   {mb(storage.data?.dbBytes ?? 0)} · {storage.data?.documentCount ?? 0} 文档 · {storage.data?.jobCount ?? 0} 任务
                 </div>
               </div>
-              <Button kind="ghost" size="sm" onClick={() =>
-                vacuum.mutate(undefined, {
-                  onSuccess: () => toast.show("数据库已压缩", "success"),
-                  onError: (e) => toast.show("压缩失败：" + errMsg(e), "error"),
-                })
-              }>
-                压缩 VACUUM
+              <Button
+                kind="ghost"
+                size="sm"
+                disabled={vacuum.isPending}
+                onClick={() =>
+                  vacuum.mutate(undefined, {
+                    onSuccess: () => toast.show("数据库已压缩", "success"),
+                    onError: (e) => toast.show("压缩失败：" + errMsg(e), "error"),
+                  })
+                }
+              >
+                {vacuum.isPending ? "压缩中…" : "压缩 VACUUM"}
               </Button>
             </Row>
             <Row ink={ink} mute={mute} border={border}>
@@ -198,28 +213,39 @@ export function Tools() {
                   {storage.data?.embeddingRows ?? 0} 条 · 换模型后旧向量可清理（下次比对按需重算）
                 </div>
               </div>
-              <Button kind="ghost" size="sm" onClick={() =>
-                clearCache.mutate(undefined, {
-                  onSuccess: (n) => toast.show(`已清空 ${n} 条向量缓存`, "success"),
-                  onError: (e) => toast.show("清理失败：" + errMsg(e), "error"),
-                })
-              }>
+              <ConfirmButton
+                confirmLabel="确认清空？"
+                pending={clearCache.isPending}
+                pendingLabel="清空中…"
+                onConfirm={() =>
+                  clearCache.mutate(undefined, {
+                    onSuccess: (n) => toast.show(`已清空 ${n} 条向量缓存`, "success"),
+                    onError: (e) => toast.show("清理失败：" + errMsg(e), "error"),
+                  })
+                }
+              >
                 清空
-              </Button>
+              </ConfirmButton>
             </Row>
             <Row ink={ink} mute={mute} border={border} last>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>清理旧任务</div>
                 <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>删除 30 天前已完结且未收藏的任务</div>
               </div>
-              <Button kind="ghost" size="sm" onClick={() =>
-                cleanup.mutate(30, {
-                  onSuccess: (n) => toast.show(n > 0 ? `已清理 ${n} 个旧任务` : "没有可清理的旧任务", "success"),
-                  onError: (e) => toast.show("清理失败：" + errMsg(e), "error"),
-                })
-              }>
+              <ConfirmButton
+                confirmLabel="确认清理？"
+                pending={cleanup.isPending}
+                pendingLabel="清理中…"
+                onConfirm={() =>
+                  cleanup.mutate(30, {
+                    onSuccess: (n) =>
+                      toast.show(n > 0 ? `已清理 ${n} 个旧任务` : "没有可清理的旧任务", "success"),
+                    onError: (e) => toast.show("清理失败：" + errMsg(e), "error"),
+                  })
+                }
+              >
                 清理
-              </Button>
+              </ConfirmButton>
             </Row>
           </Card>
 

@@ -1,5 +1,5 @@
 // 原子组件 —— 移植自 app-design/project/src/c/shell.jsx
-import type { CSSProperties, ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { C, docChip, shadeC } from "../design/tokens";
 import { Icon } from "../design/Icon";
 import { useTheme } from "../theme";
@@ -251,6 +251,59 @@ export function Toggle({
         }}
       />
     </div>
+  );
+}
+
+// ── ConfirmButton（两击确认销毁性动作）────────────────────
+// 首击进入「确认」态（红字，2.6s 自动回退），二击执行；pending 期间禁用并切文案。
+// 用于删除/清空/清理等不可逆动作，避免误点即执行。
+export function ConfirmButton({
+  onConfirm,
+  children,
+  confirmLabel = "确认？",
+  pending = false,
+  pendingLabel = "处理中…",
+  size = "sm",
+  icon,
+  title,
+  style,
+}: {
+  onConfirm: () => void;
+  children: ReactNode;
+  confirmLabel?: ReactNode;
+  pending?: boolean;
+  pendingLabel?: ReactNode;
+  size?: ButtonSize;
+  icon?: string;
+  title?: string;
+  style?: CSSProperties;
+}) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const id = setTimeout(() => setArmed(false), 2600);
+    return () => clearTimeout(id);
+  }, [armed]);
+  return (
+    <Button
+      kind={armed ? "secondary" : "ghost"}
+      size={size}
+      icon={icon}
+      title={title}
+      disabled={pending}
+      style={armed ? { color: C.danger, borderColor: C.danger, ...style } : style}
+      onClick={() => {
+        if (pending) return;
+        if (armed) {
+          setArmed(false);
+          onConfirm();
+        } else {
+          setArmed(true);
+        }
+      }}
+    >
+      {pending ? pendingLabel : armed ? confirmLabel : children}
+    </Button>
   );
 }
 

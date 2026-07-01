@@ -481,6 +481,12 @@ function AnnBubble({
   onDelete: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [armDel, setArmDel] = useState(false);
+  useEffect(() => {
+    if (!armDel) return;
+    const id = setTimeout(() => setArmDel(false), 2600);
+    return () => clearTimeout(id);
+  }, [armDel]);
   return (
     <div
       style={{
@@ -510,7 +516,25 @@ function AnnBubble({
         <div style={{ display: "flex", gap: 8, alignItems: "baseline" }}>
           <span style={{ flex: 1, fontSize: 12, lineHeight: 1.6, color: ink }}>{a.note}</span>
           <span onClick={() => setEditing(true)} style={{ fontSize: 10.5, color: "#6B73C9", cursor: "pointer", flexShrink: 0 }}>编辑</span>
-          <span onClick={onDelete} style={{ fontSize: 10.5, color: mute, cursor: "pointer", flexShrink: 0 }}>删除</span>
+          <span
+            onClick={() => {
+              if (armDel) {
+                setArmDel(false);
+                onDelete();
+              } else {
+                setArmDel(true);
+              }
+            }}
+            style={{
+              fontSize: 10.5,
+              color: armDel ? C.danger : mute,
+              fontWeight: armDel ? 700 : 400,
+              cursor: "pointer",
+              flexShrink: 0,
+            }}
+          >
+            {armDel ? "确认删除" : "删除"}
+          </span>
         </div>
       )}
     </div>
