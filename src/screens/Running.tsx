@@ -8,9 +8,10 @@ import { C } from "../design/tokens";
 import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
-import { useCancelJob, useJob } from "../queries/data";
+import { useCancelJob, useJob, useStartCompare } from "../queries/data";
 import { useProgressStore } from "../stores/progressStore";
 import { STAGE_LABEL, statusUi } from "../utils/jobStatus";
+import type { CompareRequest } from "../api/types";
 
 const STAGES = ["load", "semantic", "recall", "score", "cluster", "facts", "persist"] as const;
 
@@ -21,7 +22,43 @@ export function Running() {
   const { dark, accent } = useTheme();
   const { data: job } = useJob(jobId);
   const cancel = useCancelJob();
+  const startCompare = useStartCompare(wsId!);
   const prog = useProgressStore((s) => (jobId ? s.progress[jobId] : undefined));
+
+  // 重试：用本任务存的配置(jobs.config_json，含 documentIds + 全部选项)原样重发一次比对。
+  const onRetry = async () => {
+    if (!job || !wsId) return;
+    let cfg: Partial<CompareRequest> & { documentIds?: string[] };
+    try {
+      cfg = JSON.parse(job.configJson);
+    } catch {
+      toast.show("无法读取原任务配置，请返回重新配置", "warn");
+      return;
+    }
+    if (!cfg.documentIds || cfg.documentIds.length < 2) {
+      toast.show("原任务缺少文档信息，请返回重新配置", "warn");
+      return;
+    }
+    try {
+      const newJob = await startCompare.mutateAsync({
+        documentIds: cfg.documentIds,
+        name: job.name ?? undefined,
+        baseDocumentId: cfg.baseDocumentId,
+        chunkLevel: cfg.chunkLevel,
+        similarityThreshold: cfg.similarityThreshold,
+        candidateTopK: cfg.candidateTopK,
+        enableSemantic: cfg.enableSemantic,
+        enableFactConflict: cfg.enableFactConflict,
+        ignoreTemplates: cfg.ignoreTemplates,
+        detectMovedParagraph: cfg.detectMovedParagraph,
+        scope: cfg.scope,
+        embeddingModel: cfg.embeddingModel,
+      });
+      nav(`/workspace/${wsId}/job/${newJob.id}/running`, { replace: true });
+    } catch (e) {
+      toast.show("重试失败：" + errMsg(e), "error");
+    }
+  };
 
   // 完成 → 自动进报告
   useEffect(() => {
@@ -146,6 +183,11 @@ export function Running() {
                 }
               >
                 {cancel.isPending || job?.status === "cancelling" ? "取消中…" : "取消检测"}
+              </Button>
+            )}
+            {(job?.status === "failed" || job?.status === "cancelled") && (
+              <Button kind="primary" disabled={startCompare.isPending} onClick={onRetry}>
+                {startCompare.isPending ? "重试中…" : "重试本次比对"}
               </Button>
             )}
             {!live && (
