@@ -71,6 +71,8 @@ export function Topbar({
         >
           <Icon name="search" size={12} />
           <input
+            type="search"
+            aria-label={search.placeholder ?? "搜索"}
             value={search.value}
             onChange={(e) => search.onChange(e.target.value)}
             placeholder={search.placeholder ?? "搜索"}

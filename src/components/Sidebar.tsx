@@ -19,7 +19,7 @@ export function Sidebar({ active, onNav }: { active: NavKey; onNav: (s: Screen) 
     <NavRow
       key={k}
       active={active === k}
-      label={compact ? "" : label}
+      label={label}
       icon={icon}
       compact={compact}
       onClick={() => onNav(k)}
@@ -115,7 +115,18 @@ function NavRow({
   const activeBg = dark ? "rgba(255,255,255,0.06)" : C.white;
   return (
     <div
+      role="button"
+      tabIndex={0}
+      aria-label={label}
+      aria-current={active ? "page" : undefined}
       onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+      title={compact ? label : undefined}
       style={{
         display: "flex",
         alignItems: "center",
@@ -136,7 +147,9 @@ function NavRow({
         size={14}
         style={{ color: active ? accent : dark ? "rgba(255,255,255,0.55)" : C.ink3 }}
       />
-      {label && <span style={{ flex: 1, fontSize: 12.5, fontWeight: active ? 600 : 500 }}>{label}</span>}
+      {!compact && label && (
+        <span style={{ flex: 1, fontSize: 12.5, fontWeight: active ? 600 : 500 }}>{label}</span>
+      )}
     </div>
   );
 }

@@ -55,6 +55,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={{ show }}>
       {children}
       <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="false"
         style={{
           position: "fixed",
           bottom: 22,
