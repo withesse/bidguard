@@ -18,7 +18,7 @@ export function Running() {
   const { wsId, jobId } = useParams<{ wsId: string; jobId: string }>();
   const nav = useNavigate();
   const toast = useToast();
-  const { dark } = useTheme();
+  const { dark, accent } = useTheme();
   const { data: job } = useJob(jobId);
   const cancel = useCancelJob();
   const prog = useProgressStore((s) => (jobId ? s.progress[jobId] : undefined));
@@ -83,7 +83,7 @@ export function Running() {
               style={{
                 height: "100%",
                 width: `${percent}%`,
-                background: "#4F58A8",
+                background: accent,
                 borderRadius: 3,
                 transition: "width 0.3s ease",
               }}
@@ -137,6 +137,7 @@ export function Running() {
             {live && (
               <Button
                 kind="secondary"
+                disabled={cancel.isPending || job?.status === "cancelling"}
                 onClick={() =>
                   cancel.mutate(jobId!, {
                     onSuccess: () => toast.show("已请求取消，正在收尾…", "info"),
@@ -144,7 +145,7 @@ export function Running() {
                   })
                 }
               >
-                取消检测
+                {cancel.isPending || job?.status === "cancelling" ? "取消中…" : "取消检测"}
               </Button>
             )}
             {!live && (

@@ -68,8 +68,8 @@ export function WorkspaceList() {
         title="首页"
         sub="离线标书交叉比对与围标识别"
         actions={
-          <Button kind="primary" icon="plus" onClick={onCreate}>
-            新建查重任务
+          <Button kind="primary" icon="plus" onClick={onCreate} disabled={create.isPending}>
+            {create.isPending ? "创建中…" : "新建查重任务"}
           </Button>
         }
       />

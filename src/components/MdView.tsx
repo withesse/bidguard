@@ -1,7 +1,7 @@
 // markdown 原文版式视图：marked 渲染 + DOMPurify 消毒。
 // 消毒不可省：标书文件来自外部投标方，恶意 md 里的 <script>/onerror 一旦进 webview
 // 就能摸到 Tauri IPC——只留排版标签，事件与脚本一律剥掉。
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { C } from "../design/tokens";
@@ -10,6 +10,7 @@ import { useTheme } from "../theme";
 export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: string | null }) {
   const { dark } = useTheme();
   const [html, setHtml] = useState<string>("");
+  const hostRef = useRef<HTMLDivElement>(null);
 
   const text = useMemo(() => decodeText(data), [data]);
 
@@ -40,7 +41,8 @@ export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: st
     if (!html || !anchorText) return;
     const probe = anchorText.replace(/\s+/g, "").slice(0, 20);
     if (probe.length < 6) return;
-    const host = document.querySelector(".bg-md-host");
+    // 用本实例 ref 而非全局 querySelector：同屏多个 MdView 时避免定位串到别的实例
+    const host = hostRef.current;
     if (!host) return;
     const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
     let node: Node | null = walker.nextNode();
@@ -68,7 +70,7 @@ export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: st
         .bg-md-host a{color:#6B73C9;}
       `}</style>
       {/* 已经 DOMPurify 白名单消毒（剥脚本/事件/危险属性） */}
-      <div className="bg-md-host" dangerouslySetInnerHTML={{ __html: html }} />
+      <div ref={hostRef} className="bg-md-host" dangerouslySetInnerHTML={{ __html: html }} />
     </div>
   );
 }

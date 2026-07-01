@@ -31,7 +31,7 @@ export function CompareSetup() {
   const { wsId } = useParams<{ wsId: string }>();
   const nav = useNavigate();
   const toast = useToast();
-  const { dark } = useTheme();
+  const { dark, accent } = useTheme();
   const { data: ws } = useWorkspace(wsId);
   const { data: documents } = useDocuments(wsId);
   const { data: jobs } = useJobs(wsId);
@@ -206,8 +206,9 @@ export function CompareSetup() {
             kind="primary"
             icon="diff"
             onClick={onStart}
+            disabled={startCompare.isPending || chosen.size < 2}
           >
-            开始交叉比对（{chosen.size}）
+            {startCompare.isPending ? "发起中…" : `开始交叉比对（${chosen.size}）`}
           </Button>
         }
       />
@@ -241,7 +242,7 @@ export function CompareSetup() {
                 style={{
                   height: "100%",
                   width: `${Math.round((importProg?.percent ?? 0) * 100)}%`,
-                  background: "#4F58A8",
+                  background: accent,
                   borderRadius: 2,
                   transition: "width 0.25s ease",
                 }}
@@ -311,7 +312,7 @@ export function CompareSetup() {
             </SettingRow>
             <SettingRow label="基准文档" hint="设定后可识别「基准缺失/独有」内容；不设则各文档平等比对">
               <select
-                value={baseDocId}
+                value={chosen.has(baseDocId) ? baseDocId : ""}
                 onChange={(e) => setBaseDocId(e.target.value)}
                 style={{
                   background: cardBg,

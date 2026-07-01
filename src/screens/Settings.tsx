@@ -132,9 +132,8 @@ export function Settings() {
     if (ok) {
       toast.show("更新已下载，正在重启应用…", "success");
       setTimeout(() => void relaunchApp(), 800);
-    } else if (upd.kind !== "error") {
-      // 状态在 setUpd 中体现
     }
+    // 未更新时的状态（检查中/已最新/有新版/错误）已由 runUpdate 经 setUpd 反映
   };
   const updLabel = (): string => {
     switch (upd.kind) {
@@ -416,7 +415,9 @@ export function Settings() {
 
           <div style={{ fontSize: 11, color: mute, textAlign: "center", padding: "8px 0 20px" }}>
             <Logo size={20} color={accent} style={{ verticalAlign: "middle", marginRight: 6 }} />
-            <span style={{ verticalAlign: "middle" }}>原本 · Verum · 标书查重 v0.2.0</span>
+            <span style={{ verticalAlign: "middle" }}>
+              原本 · Verum · 标书查重{appInfo?.version ? ` v${appInfo.version}` : ""}
+            </span>
           </div>
         </div>
       </div>

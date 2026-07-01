@@ -7,6 +7,8 @@ export function MiniMatrix({ m, size = 90 }: { m: number[][]; size?: number }) {
   const { dark } = useTheme();
   const n = m.length;
   const fallback = dark ? "rgba(255,255,255,0.08)" : C.paper3;
+  // 空/非方阵守卫：n=0 会产生非法 grid 模板 repeat(0,1fr)
+  if (n === 0 || m.some((row) => row.length !== n)) return null;
   return (
     <div
       style={{
