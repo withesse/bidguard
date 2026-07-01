@@ -6,6 +6,8 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type InfiniteData,
+  type QueryKey,
 } from "@tanstack/react-query";
 import * as api from "../api";
 import type {
@@ -294,19 +296,45 @@ export function useClusterDetail(clusterId: string | undefined) {
   });
 }
 
-/** 人工确认状态（乐观更新：列表与详情立即生效，失败回滚由失效兜底）。 */
+type ReviewClusterItem = { id: string; reviewStatus?: string };
+type ClusterListData = InfiniteData<{ items: ReviewClusterItem[]; offset: number; total: number }>;
+
+/** 人工确认状态：详情 + 列表(所有 filter 变体的无限查询页)同步乐观更新，失败回滚。 */
 export function useSetReviewStatus(jobId: string | undefined) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ clusterId, status }: { clusterId: string; status: string }) =>
       api.setClusterReviewStatus(clusterId, status),
     onMutate: async ({ clusterId, status }) => {
-      // 乐观改详情缓存
+      await qc.cancelQueries({ queryKey: ["cluster", clusterId] });
+      await qc.cancelQueries({ queryKey: ["clusters", jobId] });
+      // 详情缓存
+      const prevDetail = qc.getQueryData(["cluster", clusterId]);
       qc.setQueryData(["cluster", clusterId], (old: unknown) => {
         if (!old || typeof old !== "object") return old;
         const o = old as { cluster?: { reviewStatus?: string } };
         return { ...o, cluster: { ...o.cluster, reviewStatus: status } };
       });
+      // 列表缓存：遍历各 filter 变体的分页，改命中项 reviewStatus，让状态标签立即变
+      const prevLists = qc.getQueriesData<ClusterListData>({ queryKey: ["clusters", jobId] });
+      qc.setQueriesData<ClusterListData>({ queryKey: ["clusters", jobId] }, (old) =>
+        old
+          ? {
+              ...old,
+              pages: old.pages.map((p) => ({
+                ...p,
+                items: p.items.map((it) =>
+                  it.id === clusterId ? { ...it, reviewStatus: status } : it,
+                ),
+              })),
+            }
+          : old,
+      );
+      return { prevDetail, prevLists };
+    },
+    onError: (_e, { clusterId }, ctx) => {
+      if (ctx?.prevDetail !== undefined) qc.setQueryData(["cluster", clusterId], ctx.prevDetail);
+      ctx?.prevLists?.forEach(([key, data]) => qc.setQueryData(key as QueryKey, data));
     },
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["clusters", jobId] });
