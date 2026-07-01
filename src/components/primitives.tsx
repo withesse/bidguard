@@ -131,6 +131,7 @@ export function Button({
   const th = useTheme();
   const accent = accentProp ?? th.accent;
   const dark = darkProp ?? th.dark;
+  const [hover, setHover] = useState(false);
 
   const sizes = {
     sm: { h: 26, px: 10, fs: 11.5, gap: 5 },
@@ -159,6 +160,14 @@ export function Button({
     },
   };
   const k = kinds[kind];
+  // ghost 在透明底上太像纯文字：悬停给淡色底，明确「可点」；primary/secondary 本有底色，
+  // 靠全局 button:hover 的 brightness 反馈即可。
+  const bg =
+    kind === "ghost" && hover && !disabled
+      ? dark
+        ? "rgba(255,255,255,0.08)"
+        : "rgba(20,18,14,0.05)"
+      : k.bg;
 
   return (
     <button
@@ -166,10 +175,12 @@ export function Button({
       onClick={onClick}
       disabled={disabled}
       title={title}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         height: sizes.h,
         padding: `0 ${sizes.px}px`,
-        background: k.bg,
+        background: bg,
         color: k.color,
         border: k.border === "transparent" ? "none" : `1px solid ${k.border}`,
         borderRadius: 7,

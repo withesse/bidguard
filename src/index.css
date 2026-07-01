@@ -41,7 +41,7 @@ button {
 
 /* 交互反馈：真实 <button>（Button 原子/图标按钮）的 hover/active */
 button:not(:disabled) {
-  transition: filter 0.12s ease, transform 0.06s ease;
+  transition: filter 0.12s ease, transform 0.06s ease, background 0.12s ease;
 }
 button:not(:disabled):hover {
   filter: brightness(1.05);
