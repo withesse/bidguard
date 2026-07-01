@@ -10,6 +10,8 @@ import {
   type QueryKey,
 } from "@tanstack/react-query";
 import * as api from "../api";
+import { errMsg } from "../api/client";
+import { toast } from "../components/Toast";
 import type {
   ClusterFilter,
   CompareRequest,
@@ -156,6 +158,7 @@ export function useAddAnnotation(workspaceId: string | undefined) {
   return useMutation({
     mutationFn: api.addAnnotation,
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["annotations", workspaceId] }),
+    onError: (e) => toast("添加批注失败：" + errMsg(e), "error"),
   });
 }
 
@@ -164,6 +167,7 @@ export function useUpdateAnnotation(workspaceId: string | undefined) {
   return useMutation({
     mutationFn: ({ id, note }: { id: string; note: string }) => api.updateAnnotation(id, note),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["annotations", workspaceId] }),
+    onError: (e) => toast("更新批注失败：" + errMsg(e), "error"),
   });
 }
 
@@ -172,6 +176,7 @@ export function useDeleteAnnotation(workspaceId: string | undefined) {
   return useMutation({
     mutationFn: (id: string) => api.deleteAnnotation(id),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["annotations", workspaceId] }),
+    onError: (e) => toast("删除批注失败：" + errMsg(e), "error"),
   });
 }
 
@@ -332,9 +337,10 @@ export function useSetReviewStatus(jobId: string | undefined) {
       );
       return { prevDetail, prevLists };
     },
-    onError: (_e, { clusterId }, ctx) => {
+    onError: (e, { clusterId }, ctx) => {
       if (ctx?.prevDetail !== undefined) qc.setQueryData(["cluster", clusterId], ctx.prevDetail);
       ctx?.prevLists?.forEach(([key, data]) => qc.setQueryData(key as QueryKey, data));
+      toast("人工确认失败：" + errMsg(e), "error");
     },
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["clusters", jobId] });
