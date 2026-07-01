@@ -1,4 +1,14 @@
 // 八类差异分类与风险等级的展示约定（文案/配色）——单一来源。
+import { C } from "../design/tokens";
+
+// 相似度百分比 → 分档（颜色 + 文案）：矩阵/逐对/配置共用，避免 80/60/30 阈值各写一份。
+export function simBand(pct: number): { color: string; label: string } {
+  if (pct >= 80) return { color: C.danger, label: "高度雷同" };
+  if (pct >= 60) return { color: C.hi3, label: "高相似" };
+  if (pct >= 30) return { color: C.hi2, label: "中相似" };
+  return { color: C.hi1, label: "低相似" };
+}
+
 export const TYPE_UI: Record<string, { label: string; fg: string; bg: string }> = {
   same: { label: "相同", fg: "#75646C", bg: "rgba(117,100,108,0.10)" },
   minor_change: { label: "轻微修改", fg: "#8a6d3b", bg: "rgba(194,132,48,0.12)" },

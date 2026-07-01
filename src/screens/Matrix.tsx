@@ -12,6 +12,7 @@ import type { Screen } from "../routes";
 import type { Collusion, Fingerprint } from "../engine";
 import type { CompareSummaryDto } from "../api/types";
 import { docColor, docTag } from "../utils/docTag";
+import { simBand } from "../utils/clusterUi";
 
 const EMPTY_FP: Fingerprint = {
   author: null,
@@ -59,10 +60,8 @@ interface MatrixView {
 
 
 function sev(pct: number): { c: string; label: string } {
-  if (pct >= 80) return { c: C.danger, label: "高度雷同" };
-  if (pct >= 60) return { c: C.hi3, label: "高相似" };
-  if (pct >= 30) return { c: C.hi2, label: "中相似" };
-  return { c: C.hi1, label: "低相似" };
+  const b = simBand(pct);
+  return { c: b.color, label: b.label };
 }
 
 const LEVEL_META: Record<string, { pill: string; color: string; statement: string }> = {

@@ -51,6 +51,7 @@ export function CompareSetup() {
   const [levelIdx, setLevelIdx] = useState(1); // section/paragraph/sentence
   const [threshold, setThreshold] = useState(0.7);
   const [cfgApplied, setCfgApplied] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
 
   // 用户全局默认值（DB）就绪后填充一次；之后用户改动优先
   useEffect(() => {
@@ -90,7 +91,13 @@ export function CompareSetup() {
     import("@tauri-apps/api/webview")
       .then(({ getCurrentWebview }) =>
         getCurrentWebview().onDragDropEvent((event) => {
-          if (event.payload.type === "drop") {
+          const type = event.payload.type;
+          if (type === "enter" || type === "over") {
+            setDragOver(true);
+          } else if (type === "leave") {
+            setDragOver(false);
+          } else if (type === "drop") {
+            setDragOver(false);
             const dropped = event.payload.paths.filter((p) => ACCEPT.test(p));
             if (dropped.length) doImport(dropped);
           }
@@ -290,17 +297,19 @@ export function CompareSetup() {
               }
             }}
             style={{
-              border: `1.5px dashed ${border}`,
+              border: dragOver ? "1.5px dashed var(--accent, #4F58A8)" : `1.5px dashed ${border}`,
+              background: dragOver ? "rgba(79,88,168,0.07)" : "transparent",
               borderRadius: 12,
               minHeight: 92,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              color: mute,
+              color: dragOver ? "var(--accent, #4F58A8)" : mute,
               fontSize: 12.5,
               cursor: "pointer",
               textAlign: "center",
               padding: 12,
+              transition: "border-color 0.12s, background 0.12s, color 0.12s",
             }}
           >
             ＋ 选择标书文件，或直接拖入窗口

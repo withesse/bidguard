@@ -12,6 +12,7 @@ import type { CompareSummaryDto } from "../api/types";
 import * as api from "../api";
 import { useCompareSummary } from "../queries/data";
 import { docColor, docTag } from "../utils/docTag";
+import { simBand } from "../utils/clusterUi";
 
 type HiScheme = Record<string, string>;
 
@@ -148,7 +149,7 @@ function RealCompare({ summary, jobId, onGo }: { summary: CompareSummaryDto; job
                     fontSize: 11.5,
                     fontWeight: 700,
                     fontFamily: C.mono,
-                    color: pct >= 80 ? C.danger : pct >= 60 ? C.hi3 : pct >= 30 ? C.hi2 : C.hi1,
+                    color: simBand(pct).color,
                   }}
                 >
                   {pct}%
