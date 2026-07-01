@@ -9,6 +9,7 @@ import { errMsg } from "../api/client";
 import { readTextFile } from "../api";
 import { useBatchSaveTemplates } from "../queries/data";
 import { parseTemplates, type ParseFormat, type ParsedRow } from "../utils/templateParse";
+import { useFocusTrap } from "../utils/useFocusTrap";
 
 const FORMATS: { label: string; value: ParseFormat }[] = [
   { label: "空行分段", value: "blank" },
@@ -43,6 +44,8 @@ export function BatchImportModal({
 
   const [format, setFormat] = useState(0);
   const [raw, setRaw] = useState("");
+
+  const trapRef = useFocusTrap<HTMLDivElement>();
 
   // Esc 关闭模态
   useEffect(() => {
@@ -137,6 +140,11 @@ export function BatchImportModal({
       }}
     >
       <div
+        ref={trapRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="批量导入查重源"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         style={{
           width: "min(720px, 100%)",

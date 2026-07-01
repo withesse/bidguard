@@ -23,6 +23,15 @@ export function NoteEditor({
         autoFocus
         value={text}
         onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && text.trim()) {
+            e.preventDefault();
+            onSave(text.trim());
+          }
+        }}
         placeholder={placeholder ?? "写下批注…"}
         rows={3}
         style={{
