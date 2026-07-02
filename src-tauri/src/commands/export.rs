@@ -30,6 +30,20 @@ pub async fn export_report(
             format!("不支持的导出格式：{format}"),
         ));
     }
+    // 纵深防御：即便 webview 被攻陷绕过保存对话框传入任意 path，也只允许写报告类扩展名，
+    // 杜绝"导出成 .zshrc/配置文件"式任意写盘（配合 opener scope 收敛 + CSP 断掉放大链）。
+    const ALLOWED_EXT: &[&str] = &["html", "docx", "xlsx", "json", "md", "csv"];
+    let ext_ok = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| ALLOWED_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(AppError::new(
+            AppErrorCode::InvalidConfig,
+            "导出路径扩展名不合法（仅允许 html/docx/xlsx/json/md/csv）",
+        ));
+    }
     let db = state.db.clone();
     let jieba = state.jieba();
     let (job_id2, format2, path2) = (job_id, format.clone(), path.clone());
