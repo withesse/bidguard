@@ -631,8 +631,13 @@ fn apply_fact_conflicts(
     }
 }
 
-/// 报价梯度：每文档取最大金额（投标报价通常是全文最大额），
-/// 两文档共享 ≥3 个雷同条款且金额差 0 < gap < 3% → 信号。
+/// 投标报价锚词：金额须与这些词出现在同一分块，才当作「投标报价」。
+/// 避免注册资本 / 历史业绩合同额劫持全文最大值造成的漏报与误报。
+const PRICE_ANCHORS: &[&str] =
+    &["投标报价", "报价总额", "投标总价", "投标总报价", "总报价", "中标价", "投标价", "报价为"];
+
+/// 报价梯度：每文档取「含报价锚词的分块」内的最大金额作为投标价（找不到锚点则该文档不参与），
+/// 两文档共享 ≥3 个雷同条款且报价差 0 < gap < 3% → 信号。
 fn price_proximity(
     chunks: &[CmpChunk],
     n_docs: usize,
@@ -640,6 +645,10 @@ fn price_proximity(
 ) -> Vec<collusion::PriceProximity> {
     let mut max_amount: Vec<Option<u64>> = vec![None; n_docs];
     for c in chunks {
+        // 只认与报价锚词同块的金额；无锚词的块(注册资本/业绩等)不计入投标价
+        if !PRICE_ANCHORS.iter().any(|a| c.text.contains(a)) {
+            continue;
+        }
         for e in &c.entities {
             if e.kind == "amount" {
                 // 实体来自归一化文本：「3200万元」在导入期已展开为「32000000元」，
@@ -763,19 +772,30 @@ fn section_stats(chunks: &[CmpChunk], best: &HashMap<u32, f32>) -> Vec<SectionSt
     out
 }
 
-/// 共有特征词：≥4 字、被 ≥2 份文档共用的词（疑似同源 / 共用笔误），top 30。
+/// 共有特征词：≥4 字、被 ≥2 份文档共用、且足够罕见的词（疑似同源 / 共用笔误），top 30。
+/// 罕见度过滤：出现在超过 ~20% 分块的词是通用模板词（「技术方案」「项目管理」等），
+/// 必然被多份文档共用却无同源指示意义，剔除以免该信号沦为常开噪声。
 fn shared_terms_of(chunks: &[CmpChunk]) -> Vec<SharedTerm> {
-    let mut map: HashMap<&str, BTreeSet<usize>> = HashMap::new();
+    let total = chunks.len().max(1);
+    let common_ceil = (total / 5).max(3);
+    let mut docs_of: HashMap<&str, BTreeSet<usize>> = HashMap::new();
+    let mut chunk_df: HashMap<&str, usize> = HashMap::new();
     for c in chunks {
+        let mut seen: HashSet<&str> = HashSet::new();
         for t in &c.tokens {
             if t.chars().count() >= 4 {
-                map.entry(t.as_str()).or_default().insert(c.doc);
+                docs_of.entry(t.as_str()).or_default().insert(c.doc);
+                if seen.insert(t.as_str()) {
+                    *chunk_df.entry(t.as_str()).or_insert(0) += 1;
+                }
             }
         }
     }
-    let mut out: Vec<SharedTerm> = map
+    let mut out: Vec<SharedTerm> = docs_of
         .into_iter()
-        .filter(|(_, docs)| docs.len() >= 2)
+        .filter(|(term, docs)| {
+            docs.len() >= 2 && chunk_df.get(*term).copied().unwrap_or(0) <= common_ceil
+        })
         .map(|(term, docs)| SharedTerm {
             term: term.to_string(),
             docs: docs.into_iter().collect(),
