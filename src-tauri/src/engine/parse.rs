@@ -337,12 +337,15 @@ fn parse_pdf_ocr(
     cancel: &AtomicBool,
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
 ) -> Result<ParsedBlocks, String> {
-    let imgs =
+    let (imgs, total_pages) =
         rasterize_pdf(path, cancel).ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
     if imgs.is_empty() {
         return Err("PDF 无可渲染页面".into());
     }
-    let pages = imgs.len() as u32;
+    let rendered = imgs.len();
+    let truncated = total_pages > rendered;
+    // 如实上报总页数（而非被 OCR 上限截断后的数量）
+    let pages = total_pages.max(rendered) as u32;
     let ocr_pages = crate::engine::ocr::ocr_images(imgs, cancel, ocr_model)
         .ok_or_else(|| "OCR 不可用（缺模型或识别失败）".to_string())?;
     if cancel.load(Ordering::SeqCst) {
@@ -358,7 +361,7 @@ fn parse_pdf_ocr(
         ocr_pages.iter().map(|p| p.lines.as_slice()).collect();
     let ocr_layout_json = serde_json::to_string(&layout).ok();
     // enumerate 在 filter 之前：保留的是原始页码
-    let blocks: Vec<Block> = ocr_pages
+    let mut blocks: Vec<Block> = ocr_pages
         .into_iter()
         .enumerate()
         .filter(|(_, p)| !p.text.trim().is_empty())
@@ -370,6 +373,22 @@ fn parse_pdf_ocr(
             is_list_item: false,
         })
         .collect();
+    // 扫描件超出 OCR 上限：首插醒目提示(含本文档页数，各文档数字不同故不会误聚类)，让用户知晓仅比对了前 N 页
+    if truncated {
+        blocks.insert(
+            0,
+            Block {
+                text: format!(
+                    "【查重提示】本文档为扫描件，因性能上限仅识别并比对了前 {rendered} 页（共 {total_pages} 页），其余 {} 页未参与查重，请人工复核。",
+                    total_pages - rendered
+                ),
+                heading_level: None,
+                page: Some(1),
+                is_table_row: false,
+                is_list_item: false,
+            },
+        );
+    }
     Ok(ParsedBlocks {
         blocks,
         pages,
@@ -380,10 +399,15 @@ fn parse_pdf_ocr(
     })
 }
 
+/// 扫描件 OCR 的最大渲染页数（控制耗时）。超出的页不参与查重，会在文本首插入醒目提示。
+const OCR_MAX_PAGES: usize = 20;
+
 /// 用 pdfium 把 PDF 各页渲染为 RgbImage（手动 BGRA→RGB，避开 image 特性耦合）。
-fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<Vec<image::RgbImage>> {
+/// 返回 (渲染出的页图, 文档总页数)——总页数用于识别截断并如实上报页数。
+fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<(Vec<image::RgbImage>, usize)> {
     let pdfium = bind_pdfium()?;
     let doc = pdfium.load_pdf_from_file(path.to_str()?, None).ok()?;
+    let total_pages = doc.pages().len() as usize;
     let cfg = PdfRenderConfig::new()
         .set_target_width(1600)
         .set_maximum_height(2400);
@@ -409,11 +433,11 @@ fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<Vec<image::RgbImage
             *px = image::Rgb([raw[o + 2], raw[o + 1], raw[o]]); // BGRA → RGB
         }
         imgs.push(rgb);
-        if imgs.len() >= 20 {
+        if imgs.len() >= OCR_MAX_PAGES {
             break; // 限制扫描页数，控制耗时
         }
     }
-    Some(imgs)
+    Some((imgs, total_pages))
 }
 
 fn parse_pdf_extract(path: &Path) -> Result<ParsedBlocks, String> {
@@ -1164,7 +1188,7 @@ mod tests {
             return;
         }
         let imgs = match rasterize_pdf(&fixture, &no_cancel()) {
-            Some(v) if !v.is_empty() => v,
+            Some((v, _)) if !v.is_empty() => v,
             _ => return, // pdfium 不可用则跳过
         };
         let mut png = std::io::Cursor::new(Vec::new());
@@ -1294,7 +1318,7 @@ mod tests {
         if !fixture.exists() {
             return;
         }
-        let imgs = rasterize_pdf(&fixture, &no_cancel()).expect("应能栅格化 PDF");
+        let (imgs, _) = rasterize_pdf(&fixture, &no_cancel()).expect("应能栅格化 PDF");
         assert!(!imgs.is_empty(), "应渲染出至少一页");
         let pages = crate::engine::ocr::ocr_images(imgs, &no_cancel(), crate::engine::ocr::resolve("v6-small"))
             .expect("OCR 应可用（模型在 src-tauri/models）");
