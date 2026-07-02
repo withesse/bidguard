@@ -155,7 +155,8 @@ fn canon_amount(s: &str) -> String {
     };
     match num.parse::<f64>() {
         Ok(v) => {
-            let total = v * scale;
+            // 按分取整消除 f64 倍率残差（1.005万 → 10049.9999… 应为 10050），金额精度到分足够
+            let total = (v * scale * 100.0).round() / 100.0;
             if total.fract() == 0.0 && total.abs() < 9e15 {
                 (total as i64).to_string()
             } else {
@@ -269,15 +270,41 @@ mod tests {
 
     #[test]
     fn amount_forms_canonicalize_equal() {
-        // extract_entities 作用于归一化后文本；等额不同写法(纯数值/千分位/¥前缀/圆)应抽出相同规范值。
-        // 大写「壹佰万元」→「1000000元」的转换在 normalize 测试里覆盖。
-        for input in ["合同价1000000元", "合同价1,000,000元", "报价 ¥1,000,000.00", "报价1000000圆"] {
-            let a = extract_entities(input);
+        // 走真实管线(normalize → extract_entities)：等额不同写法(纯数值/千分位/¥前缀/圆/大写/万)应抽出相同规范值。
+        use crate::engine::normalize::{normalize, NormalizeOptions};
+        let opts = NormalizeOptions::default();
+        for input in [
+            "合同价1000000元",
+            "合同价1,000,000元",
+            "报价 ¥1,000,000.00",
+            "报价1000000圆",
+            "人民币壹佰万元整",
+            "合同总价100万元",
+        ] {
+            let norm = normalize(input, &opts);
+            let a = extract_entities(&norm);
             assert!(
                 a.iter().any(|e| e.kind == "amount" && e.value == "1000000"),
-                "{input}: {a:?}"
+                "{input} → {norm} → {a:?}"
             );
         }
+    }
+
+    #[test]
+    fn zzz_adversarial_e2e_check() {
+        use crate::engine::normalize::{normalize, NormalizeOptions};
+        let opts = NormalizeOptions::default();
+        let na = normalize("报价 ¥1,000,000.00", &opts);
+        let nb = normalize("合同价1000000元", &opts);
+        eprintln!("norm A = {na:?}");
+        eprintln!("norm B = {nb:?}");
+        let ea = extract_entities(&na);
+        let eb = extract_entities(&nb);
+        eprintln!("ents A = {ea:?}");
+        eprintln!("ents B = {eb:?}");
+        // 旧正则回归对照：¥ 无元后缀是否根本不产实体
+        let old_re = regex::Regex::new(r"\d+(?:\.\d+)?\s*万?元").unwrap();
+        eprintln!("old regex on 报价¥100000000: {:?}", old_re.find_iter("报价¥100000000").map(|m| m.as_str().to_string()).collect::<Vec<_>>());
     }
 
     #[test]

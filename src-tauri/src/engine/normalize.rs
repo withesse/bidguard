@@ -25,8 +25,9 @@ impl Default for NormalizeOptions {
 pub fn normalize(text: &str, opts: &NormalizeOptions) -> String {
     let s: String = text.nfkc().collect();
     let s = normalize_cn_numbers(&s);
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         if c.is_whitespace() {
             if !opts.ignore_whitespace {
                 out.push(' ');
@@ -34,6 +35,15 @@ pub fn normalize(text: &str, opts: &NormalizeOptions) -> String {
             continue;
         }
         if is_punct(c) {
+            // 数字内的小数点与千分位逗号保留：否则「1,000,000.00」被删成「100000000」腐化金额
+            let digit_inner = (c == '.' || c == ',')
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit);
+            if digit_inner {
+                out.push(c);
+                continue;
+            }
             if !opts.ignore_punctuation {
                 out.push(half_punct(c));
             }
@@ -98,19 +108,22 @@ const UNITS: &[&str] = &[
     "个", "周", "次", "期", "项", "条", "款", "名", "家", "%", "％",
 ];
 
-/// 逐位写法的数字字符（年份「二〇二六」按位拼接，不走 cn_to_num 进位逻辑）。
+/// 大写数字字符集（法定金额大写）；用于把大写数字转换限制在金额语境，避免误伤「陆家嘴」等专名。
+const UPPER_CN: &str = "壹贰貳叁肆伍陆柒捌玖拾佰仟";
+
+/// 逐位写法的数字字符（年份「二〇二六」/「贰零贰陆」按位拼接，不走 cn_to_num 进位逻辑）。
 fn plain_digit(c: char) -> Option<char> {
     Some(match c {
         '零' | '〇' => '0',
-        '一' => '1',
-        '二' => '2',
-        '三' => '3',
-        '四' => '4',
-        '五' => '5',
-        '六' => '6',
-        '七' => '7',
-        '八' => '8',
-        '九' => '9',
+        '一' | '壹' => '1',
+        '二' | '贰' | '貳' => '2',
+        '三' | '叁' => '3',
+        '四' | '肆' => '4',
+        '五' | '伍' => '5',
+        '六' | '陆' => '6',
+        '七' | '柒' => '7',
+        '八' | '捌' => '8',
+        '九' | '玖' => '9',
         _ => return None,
     })
 }
@@ -169,7 +182,15 @@ fn normalize_cn_numbers(text: &str) -> String {
                     && chars
                         .get(j + unit_len)
                         .is_some_and(|c| *c == '万' || *c == '亿');
-                if !unit_is_ge_scale {
+                // 大写数字仅在金额/百分比语境转换（后随 万/亿/元/圆/%）：否则「陆家嘴」「玖月」
+                // 会被当数字腐化成「6家嘴」「9月」。小写数字不受此限（行为不变）。
+                let run_has_upper = chars[i..j].iter().any(|c| UPPER_CN.contains(*c));
+                let unit = &chars[j..j + unit_len];
+                let money_ctx = unit
+                    .iter()
+                    .any(|c| matches!(c, '元' | '圆' | '万' | '亿' | '%' | '％'));
+                let upper_ok = !run_has_upper || money_ctx;
+                if !unit_is_ge_scale && upper_ok {
                     if let Some(n) = cn_to_num(&chars[i..j]) {
                         out.push_str(&n.to_string());
                         out.extend(&chars[j..j + unit_len]);
@@ -369,6 +390,23 @@ mod tests {
         assert_eq!(normalize_cn_numbers("金额壹仟贰佰捌拾万元"), "金额12800000元");
         assert_eq!(cn_to_num(&"壹佰万".chars().collect::<Vec<_>>()), Some(1_000_000));
         assert_eq!(cn_to_num(&"伍万".chars().collect::<Vec<_>>()), Some(50_000));
+        // 金额语境仍转
+        assert_eq!(normalize_cn_numbers("陆万元"), "60000元");
+        // 非金额语境不转：大写数字碰短单位不腐化专名（陆家嘴/玖月/伍家渠）
+        assert_eq!(normalize_cn_numbers("陆家嘴金融中心"), "陆家嘴金融中心");
+        assert_eq!(normalize_cn_numbers("玖月奇迹项目"), "玖月奇迹项目");
+        assert_eq!(normalize_cn_numbers("伍家渠市"), "伍家渠市");
+        // 大写逐位年份走 plain_digit 拦截，不被进位算错
+        assert_eq!(normalize_cn_numbers("贰零贰陆年"), "2026年");
+    }
+
+    #[test]
+    fn digit_punctuation_preserved() {
+        // 数字内的千分位与小数点保留，金额不被删标点腐化
+        assert_eq!(normalize("¥1,000,000.00", &NormalizeOptions::default()), "¥1,000,000.00");
+        assert_eq!(normalize("合同价1,000,000元", &NormalizeOptions::default()), "合同价1,000,000元");
+        // 句末中文句号仍按标点处理（不保留）
+        assert_eq!(normalize("完成。", &NormalizeOptions::default()), "完成");
     }
 
     #[test]
