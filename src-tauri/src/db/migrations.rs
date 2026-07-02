@@ -296,12 +296,11 @@ const EMBEDDINGS_RESET_V8: &str = "
 DELETE FROM embeddings;
 ";
 
-// V9：删除 candidate_edges 上无查询消费者的 3 个索引。该表仅按 job_id 做 DELETE 与 COUNT
-// （由 idx_edges_job_id 覆盖），source/target/(job_id,final_score) 三索引从无 SELECT 使用，
-// 却是比对事务最大写入项的额外写放大。删之减少写入成本，不影响任何查询。
+// V9：删除 candidate_edges 上确无消费者的复合索引 idx_edges_score(job_id, final_score)——
+// 无任何 SELECT 按 final_score 过滤/排序。
+// 注意：idx_edges_source / idx_edges_target 不能删——source_chunk_id/target_chunk_id 是
+// ON DELETE CASCADE 外键，删文档/工作区时 SQLite 靠这两个索引做级联查找，删了会退化为全表扫描。
 const DROP_UNUSED_EDGE_INDEXES_V9: &str = "
-DROP INDEX IF EXISTS idx_edges_source;
-DROP INDEX IF EXISTS idx_edges_target;
 DROP INDEX IF EXISTS idx_edges_score;
 ";
 
