@@ -177,6 +177,55 @@ pub struct FactConflict {
     pub fields: Vec<FieldConflict>,
 }
 
+/// 解析日期为 (年, 月, 日)，缺省分量为 None。
+/// 支持 2026年6月10日 / 2026年6月 / 2026年 / 2026-6-10 / 2026/6/10 / 6月10日。
+fn parse_ymd(s: &str) -> Option<(Option<u32>, Option<u32>, Option<u32>)> {
+    let s = s.trim();
+    if s.contains('年') || s.contains('月') {
+        let (mut y, mut m, mut d) = (None, None, None);
+        let rest = if let Some(i) = s.find('年') {
+            y = s[..i].trim().parse().ok();
+            &s[i + '年'.len_utf8()..]
+        } else {
+            s
+        };
+        if let Some(j) = rest.find('月') {
+            m = rest[..j].trim().parse().ok();
+            let r3 = &rest[j + '月'.len_utf8()..];
+            if let Some(k) = r3.find('日') {
+                d = r3[..k].trim().parse().ok();
+            }
+        }
+        return (y.is_some() || m.is_some()).then_some((y, m, d));
+    }
+    let parts: Vec<&str> = s.split(['-', '/']).collect();
+    if parts.len() >= 2 {
+        if let Ok(y) = parts[0].parse::<u32>() {
+            return Some((
+                Some(y),
+                parts.get(1).and_then(|p| p.parse().ok()),
+                parts.get(2).and_then(|p| p.parse().ok()),
+            ));
+        }
+    }
+    None
+}
+
+/// 两日期是否兼容(不构成矛盾)：都能解析时，双方都指定的分量必须相等(粗粒度是细粒度前缀即兼容)；
+/// 无法解析则退回字符串相等。
+fn dates_compatible(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (parse_ymd(a), parse_ymd(b)) {
+        (Some((ya, ma, da)), Some((yb, mb, db))) => {
+            let agree = |x: Option<u32>, y: Option<u32>| x.is_none() || y.is_none() || x == y;
+            agree(ya, yb) && agree(ma, mb) && agree(da, db)
+        }
+        _ => false,
+    }
+}
+
 /// 跨文档比较同一条款的事实（按字段的完整值集合）。
 /// 冲突 = 存在两文档的集合互不包含（各自都有对方没有的值）；
 /// 子集关系视为信息缺失而非矛盾（A 列了三笔款、B 只提了首笔 ≠ 冲突）。
@@ -198,10 +247,19 @@ pub fn conflicts_between(facts: &[(usize, &Fact)]) -> Option<FactConflict> {
             .map(|(doc, f)| (*doc, get(f).iter().map(String::as_str).collect::<BTreeSet<_>>()))
             .filter(|(_, s)| !s.is_empty())
             .collect();
+        let is_date = name == "date";
         let mut conflicted = false;
         for (x, (_, sa)) in per_doc.iter().enumerate() {
             for (_, sb) in per_doc.iter().skip(x + 1).map(|(d, s)| (d, s)) {
-                if !sa.is_subset(sb) && !sb.is_subset(sa) {
+                // 日期用「粒度兼容子集」：2026年6月 与 2026年6月10日 是粗细粒度而非矛盾，不判冲突；
+                // 只有共有分量真正不同(6月 vs 7月)才算冲突。其它字段仍用严格集合子集。
+                let compat = if is_date {
+                    sa.iter().all(|x| sb.iter().any(|y| dates_compatible(x, y)))
+                        || sb.iter().all(|x| sa.iter().any(|y| dates_compatible(x, y)))
+                } else {
+                    sa.is_subset(sb) || sb.is_subset(sa)
+                };
+                if !compat {
                     conflicted = true;
                 }
             }
@@ -280,9 +338,9 @@ mod tests {
     fn extracts_quantitative_fields() {
         // 金额 ×3
         for (t, want) in [
-            ("投标报价为人民币12800000元整", "12800000元"),
-            ("履约保证金为500000元", "500000元"),
-            ("合同总价3200万元", "3200万元"),
+            ("投标报价为人民币12800000元整", "12800000"),
+            ("履约保证金为500000元", "500000"),
+            ("合同总价3200万元", "32000000"),
         ] {
             assert_eq!(fact_of(t).amount.as_deref(), Some(want), "{t}");
         }
@@ -310,6 +368,24 @@ mod tests {
         ] {
             assert_eq!(fact_of(t).percentage.as_deref(), Some(want), "{t}");
         }
+    }
+
+    #[test]
+    fn date_granularity_not_conflict() {
+        // 粗细粒度兼容：2026年6月 与 2026年6月10日 是精度差异而非矛盾
+        let a = fact_of("投标人计划2026年6月开工");
+        let b = fact_of("投标人计划2026年6月10日开工");
+        assert!(
+            conflicts_between(&[(0, &a), (1, &b)]).is_none(),
+            "粗细粒度日期不应判冲突"
+        );
+        // 共有分量真不同(6月 vs 7月) → 冲突
+        let c = fact_of("投标人计划2026年7月10日开工");
+        assert_eq!(
+            conflicts_between(&[(0, &b), (1, &c)]).map(|x| x.risk),
+            Some("high".to_string()),
+            "6月 vs 7月应判冲突"
+        );
     }
 
     #[test]
@@ -351,7 +427,7 @@ mod tests {
         let m2 = fact_of("投标人预付款5000000元，进度款8000000元，尾款6000000元");
         let c = conflicts_between(&[(0, &m1), (1, &m2)]).expect("尾款不同应判冲突");
         assert_eq!(c.risk, "high");
-        assert!(c.fields[0].values[0].value.contains("7000000元"));
+        assert!(c.fields[0].values[0].value.contains("7000000"));
         let subset = fact_of("投标人预付款5000000元，进度款8000000元");
         assert!(
             conflicts_between(&[(0, &m1), (1, &subset)]).is_none(),

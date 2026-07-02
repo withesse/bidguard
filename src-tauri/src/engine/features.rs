@@ -107,7 +107,8 @@ fn entity_regexes() -> &'static [(&'static str, Regex)] {
             // 顺序即优先级：先长后短，避免「3年」被「3」截走
             // 「2026年」纯年份（招标里常见的交付里程碑）也算日期
             ("date", Regex::new(r"\d{4}年(?:\d{1,2}月(?:\d{1,2}日)?)?|\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?|\d{1,2}月\d{1,2}日").unwrap()),
-            ("amount", Regex::new(r"\d+(?:\.\d+)?\s*万?元").unwrap()),
+            // 金额：¥/￥ 前缀（元可省）或 元/圆 后缀；容忍千分位逗号与残留的 万/亿。
+            ("amount", Regex::new(r"[¥￥]\s*\d[\d,]*(?:\.\d+)?\s*[万亿]?\s*[元圆]?|\d[\d,]*(?:\.\d+)?\s*[万亿]?\s*[元圆]").unwrap()),
             ("percentage", Regex::new(r"\d+(?:\.\d+)?\s*[%％]").unwrap()),
             ("duration", Regex::new(r"\d+\s*个?(?:日历日|工作日|小时|日|天|月|年|周)").unwrap()),
         ]
@@ -125,13 +126,44 @@ pub fn extract_entities(normalized: &str) -> Vec<Entity> {
                 continue; // 与更高优先级的命中重叠
             }
             taken.push(span);
-            out.push(Entity {
-                kind: kind.to_string(),
-                value: m.as_str().replace([' ', '　'], ""),
-            });
+            // 金额规范化为纯数值串：让「¥1,000,000.00」「1,000,000元」「壹佰万元(归一后 1000000元)」
+            // 等额不同写法比较相等，既消除误报也让真冲突可比。
+            let value = if *kind == "amount" {
+                canon_amount(m.as_str())
+            } else {
+                m.as_str().replace([' ', '　'], "")
+            };
+            out.push(Entity { kind: kind.to_string(), value });
         }
     }
     out
+}
+
+/// 金额串 → 规范数值串：去货币符/千分位/单位/整/空白，折算残留的 万/亿，输出无冗余小数的数值。
+/// 解析失败时回退清理后的原串（不丢信息）。
+fn canon_amount(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !matches!(c, '¥' | '￥' | ',' | '，' | '元' | '圆' | '整' | ' ' | '　'))
+        .collect();
+    let (num, scale) = if let Some(p) = cleaned.strip_suffix('万') {
+        (p, 10_000f64)
+    } else if let Some(p) = cleaned.strip_suffix('亿') {
+        (p, 100_000_000f64)
+    } else {
+        (cleaned.as_str(), 1f64)
+    };
+    match num.parse::<f64>() {
+        Ok(v) => {
+            let total = v * scale;
+            if total.fract() == 0.0 && total.abs() < 9e15 {
+                (total as i64).to_string()
+            } else {
+                total.to_string()
+            }
+        }
+        Err(_) => cleaned,
+    }
 }
 
 /// 实体集合重合度（Jaccard）。返回 None 表示双方都没有实体（该维不可测）。
@@ -231,8 +263,21 @@ mod tests {
         assert!(kinds.contains(&"duration"));
         assert!(kinds.contains(&"percentage"));
         assert!(kinds.contains(&"date"));
-        assert!(ents.iter().any(|e| e.value == "12800000元"));
+        assert!(ents.iter().any(|e| e.value == "12800000"));
         assert!(ents.iter().any(|e| e.value == "180个日历日"));
+    }
+
+    #[test]
+    fn amount_forms_canonicalize_equal() {
+        // extract_entities 作用于归一化后文本；等额不同写法(纯数值/千分位/¥前缀/圆)应抽出相同规范值。
+        // 大写「壹佰万元」→「1000000元」的转换在 normalize 测试里覆盖。
+        for input in ["合同价1000000元", "合同价1,000,000元", "报价 ¥1,000,000.00", "报价1000000圆"] {
+            let a = extract_entities(input);
+            assert!(
+                a.iter().any(|e| e.kind == "amount" && e.value == "1000000"),
+                "{input}: {a:?}"
+            );
+        }
     }
 
     #[test]

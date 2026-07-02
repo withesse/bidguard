@@ -88,7 +88,8 @@ fn half_punct(c: char) -> char {
     }
 }
 
-const CN_DIGITS: &str = "零一二三四五六七八九十百千万亿两";
+// 含法定大写（壹贰叁肆伍陆柒捌玖拾佰仟）——投标报价条款最常用大写，须走同一归一路径。
+const CN_DIGITS: &str = "零一二三四五六七八九十百千万亿两壹贰貳叁肆伍陆柒捌玖拾佰仟";
 
 /// 单位词表：只有「中文数字串 + 单位」才转换，避免误伤「一致」「统一」这类普通词。
 /// 按长度降序做最长匹配。
@@ -227,15 +228,15 @@ fn cn_to_num(chars: &[char]) -> Option<u64> {
     let digit = |c: char| -> Option<u64> {
         Some(match c {
             '零' => 0,
-            '一' => 1,
-            '二' | '两' => 2,
-            '三' => 3,
-            '四' => 4,
-            '五' => 5,
-            '六' => 6,
-            '七' => 7,
-            '八' => 8,
-            '九' => 9,
+            '一' | '壹' => 1,
+            '二' | '两' | '贰' | '貳' => 2,
+            '三' | '叁' => 3,
+            '四' | '肆' => 4,
+            '五' | '伍' => 5,
+            '六' | '陆' => 6,
+            '七' | '柒' => 7,
+            '八' | '捌' => 8,
+            '九' | '玖' => 9,
             _ => return None,
         })
     };
@@ -256,19 +257,19 @@ fn cn_to_num(chars: &[char]) -> Option<u64> {
             continue;
         }
         match c {
-            '十' => {
+            '十' | '拾' => {
                 // 「十」开头表示 1 十
                 section += if cur == 0 { 10 } else { cur * 10 };
                 cur = 0;
                 shorthand = 0;
                 any = true;
             }
-            '百' => {
+            '百' | '佰' => {
                 section += cur.checked_mul(100)?;
                 cur = 0;
                 shorthand = 10;
             }
-            '千' => {
+            '千' | '仟' => {
                 section += cur.checked_mul(1000)?;
                 cur = 0;
                 shorthand = 100;
@@ -358,6 +359,16 @@ mod tests {
         // 普通词不受影响：数字后无单位不转换
         assert_eq!(normalize_cn_numbers("方案保持一致"), "方案保持一致");
         assert_eq!(normalize_cn_numbers("统一接口网关"), "统一接口网关");
+    }
+
+    #[test]
+    fn uppercase_cn_amounts_normalize() {
+        // 法定大写（投标报价条款最常用）走同一路径归一为阿拉伯金额
+        assert_eq!(normalize_cn_numbers("投资伍万元"), "投资50000元");
+        assert_eq!(normalize_cn_numbers("合同价壹佰万元整"), "合同价1000000元整");
+        assert_eq!(normalize_cn_numbers("金额壹仟贰佰捌拾万元"), "金额12800000元");
+        assert_eq!(cn_to_num(&"壹佰万".chars().collect::<Vec<_>>()), Some(1_000_000));
+        assert_eq!(cn_to_num(&"伍万".chars().collect::<Vec<_>>()), Some(50_000));
     }
 
     #[test]
