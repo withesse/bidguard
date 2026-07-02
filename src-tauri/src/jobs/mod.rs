@@ -181,14 +181,20 @@ impl JobManager {
         F: FnOnce(&JobCtx) -> AppResult<()> + Send + 'static,
     {
         let job = {
-            let conn = self.db_get(db)?;
-            if job_repo::has_active(&conn, workspace_id, job_type)? {
+            // IMMEDIATE 事务：并发 spawn 时序列化「查活跃 + 建任务」，杜绝双击建出两个并行任务。
+            let mut conn = self.db_get(db)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(AppError::from)?;
+            if job_repo::has_active(&tx, workspace_id, job_type)? {
                 return Err(AppError::new(
                     AppErrorCode::JobConflict,
                     "该工作区已有同类任务在运行，请等待完成或先取消",
                 ));
             }
-            job_repo::create(&conn, workspace_id, job_type, name, config_json)?
+            let job = job_repo::create(&tx, workspace_id, job_type, name, config_json)?;
+            tx.commit().map_err(AppError::from)?;
+            job
         };
 
         let cancel = Arc::new(AtomicBool::new(false));

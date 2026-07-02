@@ -123,7 +123,8 @@ pub fn set_progress(conn: &rusqlite::Connection, id: &str, progress: f64, messag
     Ok(())
 }
 
-/// 终态落库。status: completed | failed | cancelled
+/// 终态落库。status: completed | failed | cancelled。
+/// 带状态守卫：只从非终态跃迁，防 cancel 与 execute 竞态把已 completed 的任务覆写成 cancelled。
 pub fn finish(
     conn: &rusqlite::Connection,
     id: &str,
@@ -134,7 +135,7 @@ pub fn finish(
     conn.execute(
         "UPDATE jobs SET status = ?2, error_code = ?3, error_message = ?4, finished_at = ?5,
          progress = CASE WHEN ?2 = 'completed' THEN 1.0 ELSE progress END
-         WHERE id = ?1",
+         WHERE id = ?1 AND status NOT IN ('completed', 'failed', 'cancelled')",
         params![id, status, error_code, error_message, now_iso()],
     )?;
     Ok(())

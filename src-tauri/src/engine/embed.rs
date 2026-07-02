@@ -165,7 +165,9 @@ pub fn ensure<'a>(
         *slot = None; // 换了模型，释放旧实例
     }
     if slot.is_none() {
-        if !allow_download && !model_cached() {
+        // 用「当前所选模型」是否已缓存做闸门，而非「任一模型」——否则缓存了 A、禁联网时
+        // 选未缓存的 B 会误放行触发联网下载，违背离线承诺。
+        if !allow_download && !model_cached_for(spec) {
             return None;
         }
         if let Some(m) = init_model(spec.model.clone()) {
