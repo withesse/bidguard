@@ -631,12 +631,15 @@ fn apply_fact_conflicts(
     }
 }
 
-/// 投标报价锚词：金额须与这些词出现在同一分块，才当作「投标报价」。
-/// 避免注册资本 / 历史业绩合同额劫持全文最大值造成的漏报与误报。
-const PRICE_ANCHORS: &[&str] =
-    &["投标报价", "报价总额", "投标总价", "投标总报价", "总报价", "中标价", "投标价", "报价为"];
+/// 非报价金额语境：这些词所在分块的金额不计入「投标价」（常见劫持全文最大值的大额）。
+/// 用负向排除而非正向锚词同块：投标总价常在报价表数据行(与"总价"表头/标题分处不同 chunk)，
+/// 正向同块会整份漏掉表格式报价；排除法既保住表格报价，又滤掉注册资本/业绩/保证金。
+const PRICE_EXCLUDE: &[&str] = &[
+    "注册资本", "注册资金", "实收资本", "净资产", "总资产", "资产总额",
+    "营业收入", "营业额", "年产值", "合同额", "业绩", "纳税", "保证金",
+];
 
-/// 报价梯度：每文档取「含报价锚词的分块」内的最大金额作为投标价（找不到锚点则该文档不参与），
+/// 报价梯度：每文档取「排除非报价语境后」的最大金额作为投标价，
 /// 两文档共享 ≥3 个雷同条款且报价差 0 < gap < 3% → 信号。
 fn price_proximity(
     chunks: &[CmpChunk],
@@ -645,8 +648,8 @@ fn price_proximity(
 ) -> Vec<collusion::PriceProximity> {
     let mut max_amount: Vec<Option<u64>> = vec![None; n_docs];
     for c in chunks {
-        // 只认与报价锚词同块的金额；无锚词的块(注册资本/业绩等)不计入投标价
-        if !PRICE_ANCHORS.iter().any(|a| c.text.contains(a)) {
+        // 排除注册资本/业绩/保证金等非报价大额所在的块，避免劫持全文最大值
+        if PRICE_EXCLUDE.iter().any(|w| c.text.contains(w)) {
             continue;
         }
         for e in &c.entities {
