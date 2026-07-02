@@ -1,6 +1,6 @@
 // 重复条款（原生版）：分页 + 虚拟列表（万级聚合不卡）+ 类型/风险/确认状态过滤 +
 // 行内人工确认。点击行进入 ClusterDetail。
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Topbar } from "../components/Topbar";
@@ -62,12 +62,14 @@ export function ClustersScreen() {
     overscan: 8,
   });
 
-  // 滚到底部附近自动加载下一页
+  // 滚到底部附近自动加载下一页（放 effect 里，不在 render 体内触发副作用）
   const vitems = virtualizer.getVirtualItems();
-  const last = vitems.length > 0 ? vitems[vitems.length - 1] : undefined;
-  if (last && last.index >= items.length - 5 && q.hasNextPage && !q.isFetchingNextPage) {
-    void q.fetchNextPage();
-  }
+  const lastIndex = vitems.length > 0 ? vitems[vitems.length - 1].index : -1;
+  useEffect(() => {
+    if (lastIndex >= items.length - 5 && q.hasNextPage && !q.isFetchingNextPage) {
+      void q.fetchNextPage();
+    }
+  }, [lastIndex, items.length, q]);
 
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;

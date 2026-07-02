@@ -45,9 +45,19 @@ export async function initJobEvents(queryClient: QueryClient): Promise<() => voi
   for (const name of TERMINAL_EVENTS) {
     offs.push(
       await listen<TerminalEvent>(name, (e) => {
-        useProgressStore.getState().onTerminal(e.payload);
-        // 本地 SQLite 查询很便宜：终态后整体失效，保证各屏一致
-        void queryClient.invalidateQueries();
+        const t = e.payload;
+        useProgressStore.getState().onTerminal(t);
+        // 只失效受影响的查询族——无键全量失效会连 staleTime:Infinity 的文档字节(ArrayBuffer)一起重取。
+        void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+        void queryClient.invalidateQueries({ queryKey: ["storageInfo"] });
+        if (t.jobType === "import") {
+          void queryClient.invalidateQueries({ queryKey: ["documents"] });
+        } else {
+          void queryClient.invalidateQueries({ queryKey: ["job", t.jobId] });
+          void queryClient.invalidateQueries({ queryKey: ["compareSummary", t.jobId] });
+          void queryClient.invalidateQueries({ queryKey: ["clusters", t.jobId] });
+          void queryClient.invalidateQueries({ queryKey: ["cluster"] });
+        }
       }),
     );
   }
