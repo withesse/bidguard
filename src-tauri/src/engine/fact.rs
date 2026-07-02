@@ -211,19 +211,35 @@ fn parse_ymd(s: &str) -> Option<(Option<u32>, Option<u32>, Option<u32>)> {
     None
 }
 
-/// 两日期是否兼容(不构成矛盾)：都能解析时，双方都指定的分量必须相等(粗粒度是细粒度前缀即兼容)；
-/// 无法解析则退回字符串相等。
+/// 两日期是否兼容(不构成矛盾)：仅当一方是另一方的「粗粒度前缀」才兼容
+/// （高位分量一致、低位缺省，如 2026年6月 ⊑ 2026年6月10日）。
+/// 关键收紧：年份「一方有一方无」判不兼容——缺年份的「6月10日」不无条件兼容任意年份的同月日，
+/// 避免把不同年的同月日漏判为兼容(false negative)。无法解析退回字符串相等。
 fn dates_compatible(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    match (parse_ymd(a), parse_ymd(b)) {
-        (Some((ya, ma, da)), Some((yb, mb, db))) => {
-            let agree = |x: Option<u32>, y: Option<u32>| x.is_none() || y.is_none() || x == y;
-            agree(ya, yb) && agree(ma, mb) && agree(da, db)
-        }
-        _ => false,
+    let (Some((ya, ma, da)), Some((yb, mb, db))) = (parse_ymd(a), parse_ymd(b)) else {
+        return false;
+    };
+    // 年份：都有且不等 → 冲突；一方有一方无 → 无法对齐锚点，保守判不兼容
+    match (ya, yb) {
+        (Some(x), Some(y)) if x != y => return false,
+        (Some(_), None) | (None, Some(_)) => return false,
+        _ => {}
     }
+    // 月/日：都指定且不等 → 冲突；一方缺省 → 视为粒度更粗，兼容
+    if let (Some(x), Some(y)) = (ma, mb) {
+        if x != y {
+            return false;
+        }
+    }
+    if let (Some(x), Some(y)) = (da, db) {
+        if x != y {
+            return false;
+        }
+    }
+    true
 }
 
 /// 跨文档比较同一条款的事实（按字段的完整值集合）。
@@ -269,9 +285,13 @@ pub fn conflicts_between(facts: &[(usize, &Fact)]) -> Option<FactConflict> {
                 field: name.to_string(),
                 values: per_doc
                     .iter()
-                    .map(|(doc, s)| DocValue {
-                        doc: *doc,
-                        value: s.iter().copied().collect::<Vec<_>>().join("、"),
+                    .map(|(doc, s)| {
+                        let mut vals: Vec<&str> = s.iter().copied().collect();
+                        // 金额值已是纯数值串：按数值而非字典序排列，展示大小额有序
+                        if name == "amount" {
+                            vals.sort_by_key(|v| v.parse::<i128>().unwrap_or(i128::MAX));
+                        }
+                        DocValue { doc: *doc, value: vals.join("、") }
                     })
                     .collect(),
             });
@@ -385,6 +405,13 @@ mod tests {
             conflicts_between(&[(0, &b), (1, &c)]).map(|x| x.risk),
             Some("high".to_string()),
             "6月 vs 7月应判冲突"
+        );
+        // 缺年份的「6月10日」不无条件兼容具体年份 → 保守判冲突(修复漏报)
+        let e = fact_of("投标人计划6月10日开工");
+        assert_eq!(
+            conflicts_between(&[(0, &e), (1, &c)]).map(|x| x.risk),
+            Some("high".to_string()),
+            "缺年份不应兼容 2026年7月10日"
         );
     }
 
