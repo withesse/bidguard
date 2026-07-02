@@ -11,6 +11,26 @@ pub struct PriceProximity {
     pub gap_pct: f32,
 }
 
+// —— 围标判定权重与分级线（集中于此，便于校准） ——
+// ⚠️ 未经实证校准：以下均为基于评标经验的初始默认值，尚无带标注的真实案例语料回测。
+// 校准方法见 docs/architecture-analysis-v0.4.md(S1-1)：收集有标注(真围标/非围标)的历史比对
+// 语料，用正负向样本回测这些权重与三条分级线后再固化。改这里即可整体调参。
+const SIM_FLOOR: f32 = 0.6; // 相似度峰值起算线
+const SIM_WEIGHT: f32 = 0.4; // 相似度信号满权重
+const CLUSTER_MULTI_DOCS: usize = 3; // ≥N 份共现算强雷同
+const CLUSTER_BASE: f32 = 0.1; // 有雷同条款的基础权重
+const CLUSTER_SCALE: f32 = 0.3; // 强雷同随数量增长的权重
+const CLUSTER_SCALE_CAP: f32 = 5.0; // multi/CAP 封顶到 1
+const META_MIN_DOCS: usize = 2; // ≥N 份元数据同源才计
+const META_WEIGHT: f32 = 0.25;
+const SHARED_TERMS_MIN: usize = 5; // ≥N 个共有特征词才计
+const SHARED_TERMS_WEIGHT: f32 = 0.1;
+const PRICE_WEIGHT: f32 = 0.15;
+const PRICE_SHOW_MAX: usize = 3; // 报价梯度对最多列出几对
+const LEVEL_HIGH: f32 = 0.6;
+const LEVEL_MEDIUM: f32 = 0.35;
+const LEVEL_LOW: f32 = 0.1; // score > LEVEL_LOW → low
+
 pub fn assess_with(
     peak: f32,
     clusters: &[Cluster],
@@ -21,9 +41,9 @@ pub fn assess_with(
     let mut signals = Vec::new();
     let mut score = 0.0f32;
 
-    // 1) 文本相似度峰值（0.6→0，1.0→满分 0.4）
-    if peak >= 0.6 {
-        let w = 0.4 * ((peak - 0.6) / 0.4).clamp(0.0, 1.0);
+    // 1) 文本相似度峰值（SIM_FLOOR→0，1.0→满分 SIM_WEIGHT）
+    if peak >= SIM_FLOOR {
+        let w = SIM_WEIGHT * ((peak - SIM_FLOOR) / (1.0 - SIM_FLOOR)).clamp(0.0, 1.0);
         score += w;
         signals.push(CollusionSignal {
             kind: "similarity".into(),
@@ -33,21 +53,21 @@ pub fn assess_with(
     }
 
     // 2) 跨文档雷同条款（3 份及以上的聚类是强信号）
-    let multi = clusters.iter().filter(|c| c.docs.len() >= 3).count();
+    let multi = clusters.iter().filter(|c| c.docs.len() >= CLUSTER_MULTI_DOCS).count();
     if multi > 0 {
-        let w = 0.1 + 0.3 * (multi as f32 / 5.0).clamp(0.0, 1.0);
+        let w = CLUSTER_BASE + CLUSTER_SCALE * (multi as f32 / CLUSTER_SCALE_CAP).clamp(0.0, 1.0);
         score += w;
         signals.push(CollusionSignal {
             kind: "cluster".into(),
-            detail: format!("{multi} 处条款在 3 份及以上标书间高度雷同"),
+            detail: format!("{multi} 处条款在 {CLUSTER_MULTI_DOCS} 份及以上标书间高度雷同"),
             weight: w,
         });
     } else if !clusters.is_empty() {
-        score += 0.1;
+        score += CLUSTER_BASE;
         signals.push(CollusionSignal {
             kind: "cluster".into(),
             detail: format!("{} 处跨标书雷同条款", clusters.len()),
-            weight: 0.1,
+            weight: CLUSTER_BASE,
         });
     }
 
@@ -56,22 +76,22 @@ pub fn assess_with(
         .iter()
         .filter(|d| !d.fingerprint.risk_flags.is_empty())
         .count();
-    if meta >= 2 {
-        score += 0.25;
+    if meta >= META_MIN_DOCS {
+        score += META_WEIGHT;
         signals.push(CollusionSignal {
             kind: "metadata".into(),
             detail: "多份文档元数据同源（作者 / 修改人 / 制作软件一致）".into(),
-            weight: 0.25,
+            weight: META_WEIGHT,
         });
     }
 
     // 4) 共有特征词 / 疑似共用笔误
-    if shared_terms.len() >= 5 {
-        score += 0.1;
+    if shared_terms.len() >= SHARED_TERMS_MIN {
+        score += SHARED_TERMS_WEIGHT;
         signals.push(CollusionSignal {
             kind: "sharedTerms".into(),
             detail: format!("{} 个罕见特征词被多份标书共用", shared_terms.len()),
-            weight: 0.1,
+            weight: SHARED_TERMS_WEIGHT,
         });
     }
 
@@ -82,7 +102,7 @@ pub fn assess_with(
         let tag = |i: usize| STEMS.get(i).copied().unwrap_or("?");
         let shown: Vec<String> = price_pairs
             .iter()
-            .take(3)
+            .take(PRICE_SHOW_MAX)
             .map(|p| {
                 format!(
                     "「{}」「{}」差 {:.1}%（{} vs {} 元）",
@@ -94,7 +114,7 @@ pub fn assess_with(
                 )
             })
             .collect();
-        let w = 0.15;
+        let w = PRICE_WEIGHT;
         score += w;
         signals.push(CollusionSignal {
             kind: "facts".into(),
@@ -104,11 +124,11 @@ pub fn assess_with(
     }
 
     let score = score.clamp(0.0, 1.0);
-    let level = if score >= 0.6 {
+    let level = if score >= LEVEL_HIGH {
         "high"
-    } else if score >= 0.35 {
+    } else if score >= LEVEL_MEDIUM {
         "medium"
-    } else if score > 0.1 {
+    } else if score > LEVEL_LOW {
         "low"
     } else {
         "none"
