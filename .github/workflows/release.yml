@@ -16,8 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS 原生 aarch64(Apple 芯片)。universal(含 Intel) 走不通：ort/ONNX Runtime
+          # 无 x86_64-apple-darwin 预编译库，Intel 需从源码编译 ONNX Runtime(大工程，见 BUILD.md)。
           - platform: macos-latest
-            args: "--target universal-apple-darwin"
+            args: ""
           - platform: ubuntu-24.04
             args: ""
           - platform: windows-latest
@@ -31,10 +33,6 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: macOS universal 目标（含 Intel）
-        if: matrix.platform == 'macos-latest'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Install Linux 依赖
         if: matrix.platform == 'ubuntu-24.04'

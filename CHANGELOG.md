@@ -30,7 +30,7 @@
 > ⚠️ 本版含较多检测行为变更（金额 / 日期 / 报价 / 围标），建议用真实标书端到端验证后再正式发布该草稿。
 
 ### 下载
-- macOS（universal，含 Intel + Apple 芯片）：`BidGuard_0.5.0_universal.dmg`
+- macOS（Apple 芯片 / arm64）：`BidGuard_0.5.0_aarch64.dmg`（Intel Mac 暂不支持，见 BUILD.md）
 - Windows：`BidGuard_0.5.0_x64-setup.exe` 或 `BidGuard_0.5.0_x64_en-US.msi`
 - Linux：`.AppImage`、`.deb`、`.rpm`
 

@@ -31,7 +31,9 @@ npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.d
 - `src-tauri/binaries/`：`libpdfium.dylib`(macOS) / `pdfium.dll`(Windows x64) —— 鲁棒 PDF 解析。
   ⚠️ **Linux 尚缺 `libpdfium.so`**：未随包时 Linux 上 PDF 会静默回落到较弱的 pdf-extract，
   数字型 PDF 尚可、扫描件 OCR 不可用。补 Linux 支持需下载对应 `libpdfium.so` 放入本目录
-  （来源：pdfium-binaries 发布页，选 linux-x64）。macOS universal 会同时含 arm64 + x86_64(Intel)。
+  （来源：pdfium-binaries 发布页，选 linux-x64）。
+  ⚠️ **macOS 仅 arm64(Apple 芯片)**：universal(含 Intel) 走不通——ort/ONNX Runtime 无
+  x86_64-apple-darwin 预编译库，Intel 支持需从源码编译 ONNX Runtime，暂不提供。
 - `src-tauri/models/`：PaddleOCR ONNX（检测 + 识别）+ 中文字典 —— 扫描件 OCR
 
 二者通过 `tauri.conf.json` 的 `bundle.resources` 打进安装包；运行时按候选目录解析
