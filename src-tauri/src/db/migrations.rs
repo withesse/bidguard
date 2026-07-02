@@ -12,6 +12,7 @@ const MIGRATIONS: &[&str] = &[
     CATEGORY_V6,
     CHUNK_TEMPLATE_V7,
     EMBEDDINGS_RESET_V8,
+    DROP_UNUSED_EDGE_INDEXES_V9,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -293,6 +294,15 @@ CREATE INDEX idx_chunks_template_id ON chunks(template_id);
 // 一次性清空让下次比对按新策略重算。embeddings 仅为缓存、可再生，清空无损正确性。
 const EMBEDDINGS_RESET_V8: &str = "
 DELETE FROM embeddings;
+";
+
+// V9：删除 candidate_edges 上无查询消费者的 3 个索引。该表仅按 job_id 做 DELETE 与 COUNT
+// （由 idx_edges_job_id 覆盖），source/target/(job_id,final_score) 三索引从无 SELECT 使用，
+// 却是比对事务最大写入项的额外写放大。删之减少写入成本，不影响任何查询。
+const DROP_UNUSED_EDGE_INDEXES_V9: &str = "
+DROP INDEX IF EXISTS idx_edges_source;
+DROP INDEX IF EXISTS idx_edges_target;
+DROP INDEX IF EXISTS idx_edges_score;
 ";
 
 #[cfg(test)]
