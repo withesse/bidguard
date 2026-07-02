@@ -50,6 +50,9 @@ export async function initJobEvents(queryClient: QueryClient): Promise<() => voi
         // 只失效受影响的查询族——无键全量失效会连 staleTime:Infinity 的文档字节(ArrayBuffer)一起重取。
         void queryClient.invalidateQueries({ queryKey: ["jobs"] });
         void queryClient.invalidateQueries({ queryKey: ["storageInfo"] });
+        // 工作区列表的文档数/最近任务状态徽标随终态刷新
+        void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+        void queryClient.invalidateQueries({ queryKey: ["workspace"] });
         if (t.jobType === "import") {
           void queryClient.invalidateQueries({ queryKey: ["documents"] });
         } else {
