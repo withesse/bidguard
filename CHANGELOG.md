@@ -22,7 +22,7 @@
 
 ### 优化 · 性能 / 工程
 - 查询精确失效（不再全量重取文档字节）、无限滚动移入 effect。
-- 删除无消费者索引减写放大；CI 增 Windows/Linux 编译检查；macOS 构建改 universal（含 Intel）。
+- 删除无消费者索引减写放大；CI 增 Windows/Linux 编译检查；macOS 保持 arm64（Apple 芯片）单架构（Intel 因 ort 无预编译库不支持）。
 
 ### 文档
 - 新增 `docs/architecture-analysis-v0.4.md`（深度业务与架构分析）。
