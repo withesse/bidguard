@@ -29,11 +29,12 @@ npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.d
 ## 随包原生资源（已入库，开箱即用）
 
 - `src-tauri/binaries/`：`libpdfium.dylib`(macOS) / `pdfium.dll`(Windows x64) —— 鲁棒 PDF 解析。
-  ⚠️ **Linux 尚缺 `libpdfium.so`**：未随包时 Linux 上 PDF 会静默回落到较弱的 pdf-extract，
-  数字型 PDF 尚可、扫描件 OCR 不可用。补 Linux 支持需下载对应 `libpdfium.so` 放入本目录
-  （来源：pdfium-binaries 发布页，选 linux-x64）。
-  ⚠️ **macOS 仅 arm64(Apple 芯片)**：universal(含 Intel) 走不通——ort/ONNX Runtime 无
-  x86_64-apple-darwin 预编译库，Intel 支持需从源码编译 ONNX Runtime，暂不提供。
+  ⚠️ **macOS 仅 arm64(Apple 芯片)**：Intel/x86 不支持——ort/ONNX Runtime 无 x86_64-apple-darwin
+  预编译库，Intel 支持需从源码编译 ONNX Runtime，不提供。
+  ⚠️ **Windows arm64 待验证**：随包 `pdfium.dll` 为 x64，arm64 上加载不了 → PDF 退到 pdf-extract
+  (扫描件 OCR 不可用)；且 ort 须有 aarch64-pc-windows-msvc 预编译库否则该 target 构建会失败。
+  补 arm64 Windows 完整支持需 arm64 版 pdfium.dll(来源：pdfium-binaries，选 win-arm64)。
+  ⚠️ **Linux 暂不构建**（用户决定）；若恢复需补 `libpdfium.so`(pdfium-binaries，选 linux-x64)。
 - `src-tauri/models/`：PaddleOCR ONNX（检测 + 识别）+ 中文字典 —— 扫描件 OCR
 
 二者通过 `tauri.conf.json` 的 `bundle.resources` 打进安装包；运行时按候选目录解析
@@ -44,11 +45,11 @@ npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.d
 ## CI / 发布
 
 - `.github/workflows/ci.yml`：push / PR 时跑前端构建 + 引擎测试（macOS runner）。
-- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(universal) / Windows / Linux
-  三平台构建并发布为 GitHub Release 草稿。
+- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(arm64) / Windows(x64, arm64)
+  构建并发布为 GitHub Release 草稿。
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0    # 触发三平台发布
+git tag v0.1.0 && git push origin v0.1.0    # 触发构建发布
 ```
 
 ### macOS 代码签名 / 公证（可选，配置后自动启用）

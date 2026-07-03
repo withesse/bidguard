@@ -1,6 +1,7 @@
 name: release
 
-# 打 tag（v*）或手动触发 → 三平台构建并发布到 GitHub Release（草稿）。
+# 打 tag（v*）或手动触发 → 构建并发布到 GitHub Release（草稿）。
+# 目标：macOS(arm64) + Windows(x64, arm64)。暂不构建 Linux。
 on:
   push:
     tags: ["v*"]
@@ -16,14 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS 原生 aarch64(Apple 芯片)。universal(含 Intel) 走不通：ort/ONNX Runtime
-          # 无 x86_64-apple-darwin 预编译库，Intel 需从源码编译 ONNX Runtime(大工程，见 BUILD.md)。
+          # macOS 原生 aarch64(Apple 芯片)。Intel/x86 不支持：ort 无 x86_64-apple-darwin 预编译库。
           - platform: macos-latest
             args: ""
-          - platform: ubuntu-24.04
-            args: ""
+          # Windows x64
           - platform: windows-latest
             args: ""
+          # Windows arm64(交叉编译)。⚠️ 待实测：ort 需有 aarch64-pc-windows-msvc 预编译库，
+          # 且随包 pdfium.dll 为 x64 → arm64 上 PDF 会退到 pdf-extract(扫描件 OCR 不可用)，见 BUILD.md。
+          - platform: windows-latest
+            args: "--target aarch64-pc-windows-msvc"
+            rust-target: aarch64-pc-windows-msvc
+          # 暂不构建 Linux(用户决定)
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -34,11 +39,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Linux 依赖
-        if: matrix.platform == 'ubuntu-24.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: 交叉编译目标(如 Windows arm64)
+        if: matrix.rust-target
+        run: rustup target add ${{ matrix.rust-target }}
 
       - name: 安装前端依赖
         run: npm install
