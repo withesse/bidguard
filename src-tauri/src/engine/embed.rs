@@ -1,5 +1,13 @@
-// 语义查重：embedding + 余弦。首次使用某模型会下载（受 security.allowCloudModel 控制）。
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+// 语义查重：embedding + 余弦。模型三种来源，按优先级：
+//  1) 本地内置（随安装包，src-tauri/models/embeddings/<id>/ 五个文件）——离线开箱可用；
+//  2) 本地已下载（工具屏按需下载到 ~/.cache/bidguard/embeddings/<id>/）；
+//  3) HF 联网下载（fastembed，受 security.allowCloudModel 控制）——1/2 都没有时的回落。
+// 1/2 走 try_new_from_user_defined 直接喂字节，pooling 与内置模型对齐后向量与 HF 版逐位等价。
+use fastembed::{
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
+    UserDefinedEmbeddingModel,
+};
+use std::path::{Path, PathBuf};
 
 /// 一个可选语义模型的规格。id 进 embeddings 表主键，换模型不脏读且各自缓存。
 #[derive(Debug, Clone)]
@@ -8,6 +16,12 @@ pub struct EmbedModelSpec {
     pub id: &'static str,    // 缓存 model_id（稳定，勿改，否则旧缓存失配）
     pub label: &'static str, // UI 展示
     pub model: EmbeddingModel,
+    /// 池化策略：本地(user-defined)加载时必须与内置模型一致，否则向量漂移、与 HF 缓存不可比。
+    /// BGE 系 = Cls；E5 系 = Mean（取自 fastembed get_default_pooling_method）。
+    pub pooling: Pooling,
+    /// 自托管按需下载源（5 文件打成的 .tar：model.onnx + 4 个 tokenizer 文件）。
+    /// None = 不提供自托管下载（仍可走 HF 或内置）。离线内网可把归档放此 URL 或直接内置。
+    pub download_url: Option<&'static str>,
 }
 
 /// 可选模型注册表。默认项（e5-small）的 id 沿用历史值，保证旧缓存继续命中。
@@ -17,30 +31,41 @@ pub const MODELS: &[EmbedModelSpec] = &[
         id: "bge-small-zh-v1.5",
         label: "BGE 中文 · 小（默认，快，~95MB）",
         model: EmbeddingModel::BGESmallZHV15,
+        pooling: Pooling::Cls,
+        // 默认档，建议随安装包内置（见 src-tauri/models/embeddings/README.md）；无内置文件时回落 HF
+        download_url: None,
     },
     EmbedModelSpec {
         key: "bge-large-zh",
         id: "bge-large-zh-v1.5",
         label: "BGE 中文 · 大（中文最准，~1.2GB）",
         model: EmbeddingModel::BGELargeZHV15,
+        pooling: Pooling::Cls,
+        download_url: None, // 太大不内置；可填自托管 .tar 供内网/离线下载，或回落 HF
     },
     EmbedModelSpec {
         key: "e5-large",
         id: "multilingual-e5-large",
         label: "E5 多语种 · 大（中英混排最准，~2.1GB）",
         model: EmbeddingModel::MultilingualE5Large,
+        pooling: Pooling::Mean,
+        download_url: None,
     },
     EmbedModelSpec {
         key: "e5-small",
         id: "multilingual-e5-small",
         label: "E5 多语种 · 小（轻量，~450MB）",
         model: EmbeddingModel::MultilingualE5Small,
+        pooling: Pooling::Mean,
+        download_url: None,
     },
     EmbedModelSpec {
         key: "e5-base",
         id: "multilingual-e5-base",
         label: "E5 多语种 · 中（~1GB）",
         model: EmbeddingModel::MultilingualE5Base,
+        pooling: Pooling::Mean,
+        download_url: None,
     },
 ];
 
@@ -59,6 +84,67 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 /// 语义模型缓存目录（工具屏展示用）。
 pub fn cache_dir_path() -> Option<std::path::PathBuf> {
     cache_dir()
+}
+
+/// user-defined 加载所需的 4 个 tokenizer 文件名（HF 仓库内一致命名）。
+const TOKENIZER_FILES: [&str; 4] = [
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+const ONNX_FILE: &str = "model.onnx";
+
+/// 自托管按需下载的落地目录（区别于 HF 缓存）：~/.cache/bidguard/embeddings/<id>/。
+fn download_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/bidguard/embeddings"))
+}
+
+/// 本地模型（内置随包 + 已下载）的候选基目录，按优先级；每个模型在 <base>/<id>/ 下放 5 个文件。
+fn local_model_base_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(p) = std::env::var("BIDGUARD_EMBED_DIR") {
+        dirs.push(PathBuf::from(p)); // 测试/内网覆盖
+    }
+    if let Some(d) = download_dir() {
+        dirs.push(d); // 已下载档
+    }
+    // 随包内置：dev 用 manifest 目录；打包后按平台定位 Resources
+    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("models/embeddings"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("models/embeddings"));
+            dirs.push(d.join("../Resources/models/embeddings")); // macOS .app
+            dirs.push(d.join("../lib/models/embeddings")); // Linux
+        }
+    }
+    dirs
+}
+
+/// 在给定基目录集合里找某 id 的完整本地文件目录（纯函数，便于单测）。
+fn resolve_local(id: &str, bases: &[PathBuf]) -> Option<PathBuf> {
+    bases.iter().map(|b| b.join(id)).find(|dir| {
+        dir.join(ONNX_FILE).is_file() && TOKENIZER_FILES.iter().all(|f| dir.join(f).is_file())
+    })
+}
+
+/// 某模型是否有完整的本地文件（内置或已下载）；返回其目录。
+fn local_model_dir(spec: &EmbedModelSpec) -> Option<PathBuf> {
+    resolve_local(spec.id, &local_model_base_dirs())
+}
+
+/// 从本地目录用 user-defined 方式加载（绕过 HF）。pooling 取自 spec 与内置模型对齐，
+/// quantization 默认 None、max_length 默认值——与 fastembed 内置 try_new 一致，向量等价。
+fn init_local(dir: &Path, spec: &EmbedModelSpec) -> Option<TextEmbedding> {
+    let onnx = std::fs::read(dir.join(ONNX_FILE)).ok()?;
+    let tk = TokenizerFiles {
+        tokenizer_file: std::fs::read(dir.join(TOKENIZER_FILES[0])).ok()?,
+        config_file: std::fs::read(dir.join(TOKENIZER_FILES[1])).ok()?,
+        special_tokens_map_file: std::fs::read(dir.join(TOKENIZER_FILES[2])).ok()?,
+        tokenizer_config_file: std::fs::read(dir.join(TOKENIZER_FILES[3])).ok()?,
+    };
+    let ud = UserDefinedEmbeddingModel::new(onnx, tk).with_pooling(spec.pooling.clone());
+    TextEmbedding::try_new_from_user_defined(ud, InitOptionsUserDefined::new()).ok()
 }
 
 /// 递归收集缓存目录下所有文件 (路径, 字节)，最深 5 层。
@@ -92,16 +178,8 @@ fn dedup_bytes<'a>(files: impl IntoIterator<Item = &'a (std::path::PathBuf, u64)
         .sum()
 }
 
-/// 模型文件是否已在本地缓存（任一模型，无需联网即可加载）。
-pub fn model_cached() -> bool {
-    let Some(d) = cache_dir() else { return false };
-    let mut files = Vec::new();
-    walk_files(&d, 5, &mut files);
-    files.iter().any(|(p, _)| p.extension().is_some_and(|x| x == "onnx"))
-}
-
-/// 指定模型是否已缓存（fastembed 缓存目录名含模型 id，据此匹配）。
-pub fn model_cached_for(spec: &EmbedModelSpec) -> bool {
+/// 某模型是否在 HF 缓存里（仅联网下载路径；内置/自托管下载走 local_model_dir）。
+fn hf_cached_for(spec: &EmbedModelSpec) -> bool {
     let Some(d) = cache_dir() else { return false };
     let id = spec.id.to_ascii_lowercase();
     let mut files = Vec::new();
@@ -112,8 +190,30 @@ pub fn model_cached_for(spec: &EmbedModelSpec) -> bool {
     })
 }
 
-/// 指定模型缓存占用字节数（0 = 未缓存）。
+/// 模型文件是否已在本地就绪（任一模型：内置/已下载/HF 缓存，无需联网即可加载）。
+pub fn model_cached() -> bool {
+    if MODELS.iter().any(|s| local_model_dir(s).is_some()) {
+        return true;
+    }
+    let Some(d) = cache_dir() else { return false };
+    let mut files = Vec::new();
+    walk_files(&d, 5, &mut files);
+    files.iter().any(|(p, _)| p.extension().is_some_and(|x| x == "onnx"))
+}
+
+/// 指定模型是否已就绪：内置/自托管下载（local_model_dir）或 HF 缓存任一即可。
+/// 这决定离线闸门（allow_download=false 时能否加载）与工具屏「已缓存」展示。
+pub fn model_cached_for(spec: &EmbedModelSpec) -> bool {
+    local_model_dir(spec).is_some() || hf_cached_for(spec)
+}
+
+/// 指定模型占用字节数（0 = 未就绪）。优先算本地目录（内置/已下载），否则算 HF 缓存。
 pub fn model_cache_bytes(spec: &EmbedModelSpec) -> u64 {
+    if let Some(dir) = local_model_dir(spec) {
+        let mut files = Vec::new();
+        walk_files(&dir, 5, &mut files);
+        return dedup_bytes(&files);
+    }
     let Some(d) = cache_dir() else { return 0 };
     let id = spec.id.to_ascii_lowercase();
     let mut files = Vec::new();
@@ -125,19 +225,32 @@ pub fn model_cache_bytes(spec: &EmbedModelSpec) -> u64 {
     dedup_bytes(&matched)
 }
 
-/// 删除指定模型的本地缓存（含其 fastembed 目录）。返回删除的字节数。
+/// 删除指定模型的本地缓存：HF 缓存目录 + 自托管下载目录。返回删除的字节数。
+/// 【不删】随包内置档（在只读 Resources 里，是安装包的一部分）。
 pub fn clear_model_cache(spec: &EmbedModelSpec) -> u64 {
-    let Some(d) = cache_dir() else { return 0 };
     let id = spec.id.to_ascii_lowercase();
     let mut removed = 0u64;
-    let Ok(entries) = std::fs::read_dir(&d) else { return 0 };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() && p.to_string_lossy().to_ascii_lowercase().contains(&id) {
+    // 自托管下载目录 <download>/<id>/
+    if let Some(dl) = download_dir().map(|d| d.join(spec.id)) {
+        if dl.is_dir() {
             let mut files = Vec::new();
-            walk_files(&p, 5, &mut files);
+            walk_files(&dl, 5, &mut files);
             removed += dedup_bytes(&files);
-            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_dir_all(&dl);
+        }
+    }
+    // HF 缓存里名字含 id 的目录
+    if let Some(d) = cache_dir() {
+        if let Ok(entries) = std::fs::read_dir(&d) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() && p.to_string_lossy().to_ascii_lowercase().contains(&id) {
+                    let mut files = Vec::new();
+                    walk_files(&p, 5, &mut files);
+                    removed += dedup_bytes(&files);
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
         }
     }
     removed
@@ -150,6 +263,48 @@ fn init_model(model: EmbeddingModel) -> Option<TextEmbedding> {
         opts = opts.with_cache_dir(dir);
     }
     TextEmbedding::try_new(opts).ok()
+}
+
+/// 自托管按需下载：拉 spec.download_url 的 .tar（含 model.onnx + 4 个 tokenizer 文件），解到
+/// ~/.cache/bidguard/embeddings/<id>/。已就绪（内置/已下载）返回 Ok(0)，否则返回新写入字节数。
+/// 无 download_url 的模型返回 Err（可改走 HF 联网，或把文件内置到安装包）。工具屏显式发起 = 授权联网。
+pub fn download_model(spec: &EmbedModelSpec) -> Result<u64, String> {
+    if local_model_dir(spec).is_some() {
+        return Ok(0); // 内置或已下载
+    }
+    let url = spec
+        .download_url
+        .ok_or_else(|| "该模型未提供自托管下载源；请启用联网由 HF 拉取，或将其文件内置到安装包".to_string())?;
+    let base = download_dir().ok_or_else(|| "无法定位下载目录".to_string())?;
+    let dest = base.join(spec.id);
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    let resp = ureq::get(url).call().map_err(|e| format!("下载失败：{e}"))?;
+    let reader = resp.into_body().into_reader();
+    let mut archive = tar::Archive::new(reader);
+    let wanted: std::collections::HashSet<&str> =
+        [ONNX_FILE].into_iter().chain(TOKENIZER_FILES).collect();
+    let mut written = 0u64;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut e = entry.map_err(|e| e.to_string())?;
+        let name = e
+            .path()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
+        let Some(name) = name else { continue };
+        if !wanted.contains(name.as_str()) {
+            continue;
+        }
+        // 先写 .part 再 rename，避免半截文件被后续 local_model_dir 当成就位
+        let part = dest.join(format!("{name}.part"));
+        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+        written += std::io::copy(&mut e, &mut out).map_err(|e| e.to_string())?;
+        std::fs::rename(&part, dest.join(&name)).map_err(|e| e.to_string())?;
+    }
+    if local_model_dir(spec).is_none() {
+        let _ = std::fs::remove_dir_all(&dest); // 半套文件不留，避免被当就位
+        return Err("下载归档缺少必需文件（需 model.onnx + 4 个 tokenizer 文件）".to_string());
+    }
+    Ok(written)
 }
 
 /// 确保槽位里有「指定模型」的常驻实例：已加载同一模型则复用；不同则丢弃重载。
@@ -165,12 +320,18 @@ pub fn ensure<'a>(
         *slot = None; // 换了模型，释放旧实例
     }
     if slot.is_none() {
-        // 用「当前所选模型」是否已缓存做闸门，而非「任一模型」——否则缓存了 A、禁联网时
-        // 选未缓存的 B 会误放行触发联网下载，违背离线承诺。
-        if !allow_download && !model_cached_for(spec) {
+        // 优先本地（内置随包 / 已自托管下载）：离线可用，且 pooling 对齐后向量与 HF 版等价。
+        let local = local_model_dir(spec);
+        // 离线闸门：本地无文件且 HF 也没缓存时，禁联网就降级（不触发下载），守住离线承诺。
+        // 用「当前所选模型」判定而非「任一模型」——否则缓存了 A、禁联网选未缓存的 B 会误放行。
+        if local.is_none() && !allow_download && !hf_cached_for(spec) {
             return None;
         }
-        if let Some(m) = init_model(spec.model.clone()) {
+        let loaded = match &local {
+            Some(dir) => init_local(dir, spec),
+            None => init_model(spec.model.clone()), // HF 缓存命中则加载、否则（allow_download）下载
+        };
+        if let Some(m) = loaded {
             *slot = Some((spec.id.to_string(), m));
         }
     }
@@ -267,6 +428,35 @@ mod tests {
         let para = cosine(&embs[0], &embs[1]);
         let diff = cosine(&embs[0], &embs[2]);
         assert!(para > diff, "改写句应比无关句更相似：para={para} diff={diff}");
+    }
+
+    #[test]
+    fn resolve_local_needs_all_five_files() {
+        let root = std::env::temp_dir().join(format!("bg_embed_local_{}", uuid::Uuid::new_v4()));
+        let dir = root.join("bge-small-zh-v1.5");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bases = vec![root.clone()];
+        // 缺文件 → 不认
+        std::fs::write(dir.join("model.onnx"), b"x").unwrap();
+        assert!(resolve_local("bge-small-zh-v1.5", &bases).is_none(), "缺 tokenizer 不应就位");
+        // 补齐 5 个 → 认
+        for f in TOKENIZER_FILES {
+            std::fs::write(dir.join(f), b"{}").unwrap();
+        }
+        assert_eq!(resolve_local("bge-small-zh-v1.5", &bases), Some(dir));
+        // 别的 id 仍不认
+        assert!(resolve_local("multilingual-e5-large", &bases).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pooling_matches_model_family() {
+        // 本地(user-defined)加载必须与 fastembed 内置 pooling 一致，否则向量与 HF 版不可比
+        assert_eq!(resolve("bge-zh").pooling, Pooling::Cls);
+        assert_eq!(resolve("bge-large-zh").pooling, Pooling::Cls);
+        assert_eq!(resolve("e5-large").pooling, Pooling::Mean);
+        assert_eq!(resolve("e5-small").pooling, Pooling::Mean);
+        assert_eq!(resolve("e5-base").pooling, Pooling::Mean);
     }
 
     #[test]
