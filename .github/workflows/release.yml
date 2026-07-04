@@ -42,7 +42,7 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 自动更新签名：私钥与密码存在 GitHub Secrets。
