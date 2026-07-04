@@ -3,7 +3,16 @@ use super::data::ExportData;
 use super::shared::{review_cn, section_cn, severity_cn, type_cn};
 
 fn esc(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+    // CWE-1236 CSV 公式注入防护：标书正文来自投标人（对抗方），若单元格以 = + - @ 或
+    // TAB/CR 开头，Excel/WPS 打开时会当公式执行（可外带同表数据或诱导命令）。前置单引号中和，
+    // 再做引号转义。必须先中和后转义，保证外层引号包裹逻辑不变。
+    let neutralized = match s.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') | Some('\t') | Some('\r') => {
+            format!("'{s}")
+        }
+        _ => s.to_string(),
+    };
+    format!("\"{}\"", neutralized.replace('"', "\"\""))
 }
 
 pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
@@ -39,4 +48,28 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
     std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::esc;
+
+    #[test]
+    fn esc_neutralizes_formula_injection() {
+        for payload in ["=1+1", "+cmd", "-2", "@SUM(A1)", "\tx", "\rx"] {
+            let out = esc(payload);
+            assert!(out.starts_with("\"'"), "危险前导字符应被前置单引号中和：{payload:?} → {out}");
+        }
+        // 典型攻击载荷：不以裸 = 开头
+        assert!(!esc("=HYPERLINK(\"http://x\",\"y\")").starts_with("\"="));
+    }
+
+    #[test]
+    fn esc_preserves_normal_text_and_quote_escaping() {
+        assert_eq!(esc("甲方应在十日内支付"), "\"甲方应在十日内支付\"");
+        // 正常正文不加前缀；内部双引号仍转义
+        assert_eq!(esc("a\"b"), "\"a\"\"b\"");
+        // 中间出现的 = 不受影响（只看首字符）
+        assert_eq!(esc("x=y"), "\"x=y\"");
+    }
 }

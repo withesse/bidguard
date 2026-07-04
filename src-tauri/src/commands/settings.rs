@@ -140,15 +140,37 @@ pub async fn delete_source_template(id: String, state: State<'_, AppState>) -> A
     template_repo::delete(&*conn(&state)?, &id)
 }
 
-/// 读取文本文件内容（批量导入选 .txt/.csv/.json 时用）。UTF-8 优先，GB18030 兜底。
-/// 与放开 fs 全盘 scope 相比更收敛：仅此一处按用户经对话框选定的路径读取。
+/// 读取文本文件内容（批量导入选 .txt/.csv/.json/.md 时用）。UTF-8 优先，GB18030 兜底。
+/// 纵深防御：限定扩展名与大小上限，收敛「任意路径读原语」——即便 webview 被攻陷，也不能借此
+/// 读取 ~/.ssh/id_rsa、浏览器 cookie 等任意文件（与 export_report 的扩展名白名单同一威胁模型）。
 #[tauri::command]
 pub async fn read_text_file(path: String) -> AppResult<String> {
-    tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
-        .await
-        .map_err(|e| AppError::new(AppErrorCode::Unknown, "读取文件失败").with_detail(e.to_string()))?
-        .map(|bytes| crate::engine::parse::decode_text(&bytes))
-        .map_err(|e| {
+    const MAX_BYTES: u64 = 64 * 1024 * 1024; // 64MB：文本导入足够，挡住把任意大文件当文本读
+    const ALLOWED: [&str; 6] = ["txt", "text", "csv", "json", "md", "markdown"];
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<String> {
+        let p = std::path::Path::new(&path);
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !ALLOWED.contains(&ext.as_str()) {
+            return Err(AppError::new(
+                AppErrorCode::InvalidConfig,
+                "仅支持读取 .txt/.csv/.json/.md 文本文件",
+            ));
+        }
+        let meta = std::fs::metadata(p).map_err(|e| {
             AppError::new(AppErrorCode::FileNotFound, "文件不存在或不可读").with_detail(e.to_string())
-        })
+        })?;
+        if meta.len() > MAX_BYTES {
+            return Err(AppError::new(AppErrorCode::InvalidConfig, "文件过大（文本导入上限 64MB）"));
+        }
+        let bytes = std::fs::read(p).map_err(|e| {
+            AppError::new(AppErrorCode::FileNotFound, "文件不存在或不可读").with_detail(e.to_string())
+        })?;
+        Ok(crate::engine::parse::decode_text(&bytes))
+    })
+    .await
+    .map_err(|e| AppError::new(AppErrorCode::Unknown, "读取文件失败").with_detail(e.to_string()))?
 }

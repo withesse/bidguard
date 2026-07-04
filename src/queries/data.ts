@@ -320,11 +320,18 @@ export function useSetReviewStatus(jobId: string | undefined) {
         const o = old as { cluster?: { reviewStatus?: string } };
         return { ...o, cluster: { ...o.cluster, reviewStatus: status } };
       });
-      // 列表缓存：遍历各 filter 变体的分页，改命中项 reviewStatus，让状态标签立即变
+      // 列表缓存：逐个 filter 变体乐观更新。按 reviewStatus 过滤的视图（如「只看待确认」）里，
+      // 若新状态不再匹配该过滤，则把命中项【移出列表并减 total】——否则会留下「已确认却仍在待确认
+      // 列表」的自相矛盾条目；其余视图只就地改 reviewStatus。这样 onSettled 用 refetchType:"none"
+      // 不重取也不产生不一致（既避免深滚动重取风暴，又不漏更新过滤态）。
       const prevLists = qc.getQueriesData<ClusterListData>({ queryKey: ["clusters", jobId] });
-      qc.setQueriesData<ClusterListData>({ queryKey: ["clusters", jobId] }, (old) =>
-        old
-          ? {
+      for (const [key] of prevLists) {
+        const filter = (key as unknown[])[2] as { reviewStatus?: string } | undefined;
+        const drop = !!filter?.reviewStatus && filter.reviewStatus !== status;
+        qc.setQueryData<ClusterListData>(key as QueryKey, (old) => {
+          if (!old) return old;
+          if (!drop) {
+            return {
               ...old,
               pages: old.pages.map((p) => ({
                 ...p,
@@ -332,9 +339,19 @@ export function useSetReviewStatus(jobId: string | undefined) {
                   it.id === clusterId ? { ...it, reviewStatus: status } : it,
                 ),
               })),
-            }
-          : old,
-      );
+            };
+          }
+          const present = old.pages.some((p) => p.items.some((it) => it.id === clusterId));
+          return {
+            ...old,
+            pages: old.pages.map((p) => ({
+              ...p,
+              items: p.items.filter((it) => it.id !== clusterId),
+              total: present ? Math.max(0, p.total - 1) : p.total,
+            })),
+          };
+        });
+      }
       return { prevDetail, prevLists };
     },
     onError: (e, { clusterId }, ctx) => {
@@ -343,8 +360,10 @@ export function useSetReviewStatus(jobId: string | undefined) {
       toast("人工确认失败：" + errMsg(e), "error");
     },
     onSettled: () => {
-      void qc.invalidateQueries({ queryKey: ["clusters", jobId] });
-      void qc.invalidateQueries({ queryKey: ["cluster"] });
+      // 乐观更新已改好列表/详情；这里只标脏不重取（refetchType:"none"）——否则活跃 infiniteQuery
+      // 会逐页串行重取，深滚动大列表下每次行内确认都触发几十次 IPC。下次挂载/聚焦自然收敛。
+      void qc.invalidateQueries({ queryKey: ["clusters", jobId], refetchType: "none" });
+      void qc.invalidateQueries({ queryKey: ["cluster"], refetchType: "none" });
     },
   });
 }

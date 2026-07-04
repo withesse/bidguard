@@ -235,6 +235,20 @@ export function DocPreview() {
           </>
         }
       />
+      {doc?.truncationNotice && (
+        <div
+          role="note"
+          style={{
+            padding: "8px 32px",
+            fontSize: 12.5,
+            color: "#8a5a00",
+            background: "rgba(240,170,20,0.14)",
+            borderBottom: `1px solid ${border}`,
+          }}
+        >
+          ⚠️ 内容不完整：{doc.truncationNotice}
+        </div>
+      )}
       {error != null && (
         <div style={{ padding: 24, fontSize: 12.5, color: mute }}>原文加载失败，请确认文档仍在工作区中。</div>
       )}

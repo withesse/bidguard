@@ -1,6 +1,6 @@
 // 屏 7 · 导出报告 —— 从 DB 装配（含八类统计/事实冲突/配置快照）。
 // 预览为真实任务概要；导出选项（正文全文 / 配置快照）按 per-export 覆盖传给后端。
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { C } from "../design/tokens";
 import { Topbar } from "../components/Topbar";
@@ -57,6 +57,19 @@ export function Export({ jobId }: { jobId?: string }) {
     (exportCfg.includeConfig as boolean) ?? true,
   );
   const [lastExport, setLastExport] = useState<{ path: string; label: string } | null>(null);
+
+  // 深链直达导出页时 ['appSettings'] 可能尚未在缓存，useState 惰性初始化只跑一次会错过用户默认；
+  // data 到达后回填一次（applied-once，仿 CompareSetup 的模式），避免 includeRawText 等误用默认值。
+  const applied = useRef(false);
+  useEffect(() => {
+    if (applied.current || appCfg === undefined) return;
+    applied.current = true;
+    const ec = ((appCfg as Record<string, Record<string, unknown>>)?.export) ?? {};
+    const k = ec.defaultFormat as string | undefined;
+    if (k) setFmt(Math.max(0, FORMATS.findIndex((f) => f.kind === k)));
+    if (typeof ec.includeRawText === "boolean") setIncludeRawText(ec.includeRawText);
+    if (typeof ec.includeConfig === "boolean") setIncludeConfig(ec.includeConfig);
+  }, [appCfg]);
 
   const onExport = async () => {
     if (!isTauri()) {

@@ -32,7 +32,8 @@ export function CompareSetup() {
   const nav = useNavigate();
   const toast = useToast();
   const { dark, accent } = useTheme();
-  const { data: ws } = useWorkspace(wsId);
+  const wsQuery = useWorkspace(wsId);
+  const ws = wsQuery.data;
   const { data: documents } = useDocuments(wsId);
   const { data: jobs } = useJobs(wsId);
   const importDocs = useImportDocuments(wsId!);
@@ -53,25 +54,36 @@ export function CompareSetup() {
   const [cfgApplied, setCfgApplied] = useState(false);
   const [dragOver, setDragOver] = useState(false);
 
-  // 用户全局默认值（DB）就绪后填充一次；之后用户改动优先
+  // 生效默认 = 用户全局默认 < 本工作区默认（工作区层覆盖全局层），二者就绪后填充一次；此后用户改动优先。
+  // 修复前只读全局，导致「保存为本工作区默认」写入 settingsJson 却从不被回填 → 保存零生效。
   useEffect(() => {
-    if (cfgApplied || cfgRaw === undefined) return;
-    const cmp =
-      cfgRaw && typeof cfgRaw === "object"
-        ? ((cfgRaw as Record<string, unknown>).compare as Record<string, unknown> | undefined)
+    // 等 workspace 查询【落定】（成功→用 settingsJson 叠加工作区层；失败→仅用全局层），而非硬等
+    // ws!==undefined——否则 workspace 查询失败时预填永不执行、用户全局默认被静默忽略退回硬编码默认。
+    if (cfgApplied || cfgRaw === undefined || wsQuery.isLoading) return;
+    const compareOf = (v: unknown): Record<string, unknown> | undefined =>
+      v && typeof v === "object"
+        ? ((v as Record<string, unknown>).compare as Record<string, unknown> | undefined)
         : undefined;
-    if (cmp) {
-      if (typeof cmp.enableSemantic === "boolean") setSemantic(cmp.enableSemantic);
-      if (typeof cmp.enableFactConflict === "boolean") setFactConflict(cmp.enableFactConflict);
-      if (typeof cmp.ignoreTemplates === "boolean") setIgnoreTemplates(cmp.ignoreTemplates);
-      if (typeof cmp.similarityThreshold === "number") setThreshold(cmp.similarityThreshold);
-      const si = ["full", "tech", "business"].indexOf(String(cmp.scope ?? ""));
-      if (si >= 0) setScopeIdx(si);
-      const li = ["section", "paragraph", "sentence"].indexOf(String(cmp.defaultChunkLevel ?? ""));
-      if (li >= 0) setLevelIdx(li);
+    const globalCmp = compareOf(cfgRaw);
+    let wsCmp: Record<string, unknown> | undefined;
+    if (ws?.settingsJson) {
+      try {
+        wsCmp = compareOf(JSON.parse(ws.settingsJson));
+      } catch {
+        // 坏 JSON 忽略，回落全局默认
+      }
     }
+    const cmp = { ...(globalCmp ?? {}), ...(wsCmp ?? {}) };
+    if (typeof cmp.enableSemantic === "boolean") setSemantic(cmp.enableSemantic);
+    if (typeof cmp.enableFactConflict === "boolean") setFactConflict(cmp.enableFactConflict);
+    if (typeof cmp.ignoreTemplates === "boolean") setIgnoreTemplates(cmp.ignoreTemplates);
+    if (typeof cmp.similarityThreshold === "number") setThreshold(cmp.similarityThreshold);
+    const si = ["full", "tech", "business"].indexOf(String(cmp.scope ?? ""));
+    if (si >= 0) setScopeIdx(si);
+    const li = ["section", "paragraph", "sentence"].indexOf(String(cmp.defaultChunkLevel ?? ""));
+    if (li >= 0) setLevelIdx(li);
     setCfgApplied(true);
-  }, [cfgRaw, cfgApplied]);
+  }, [cfgRaw, ws, wsQuery.isLoading, cfgApplied]);
 
   const parsed = useMemo(() => (documents ?? []).filter((d) => d.status === "parsed"), [documents]);
 

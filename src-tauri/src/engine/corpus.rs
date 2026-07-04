@@ -47,6 +47,9 @@ pub fn from_row(row: CompareChunkRow, doc: usize, doc_chunk_total: usize) -> Cmp
         Some(b) if !b.is_empty() => features::blob_to_minhash(b),
         _ => features::minhash(&ngrams),
     };
+    // 契约：order_index 必须是本文档本粒度内的稠密行序（0..total-1）。chunker 的 order_index
+    // 含 heading 编号有空洞，调用方（compare_service）在 load_for_compare 后按加载顺序重编，
+    // 否则 rel_pos 会 >1.0，污染 order 维与「位置移动」判定。
     let rel_pos = if doc_chunk_total > 1 {
         row.order_index as f32 / (doc_chunk_total - 1) as f32
     } else {

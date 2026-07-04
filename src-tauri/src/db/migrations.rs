@@ -13,6 +13,8 @@ const MIGRATIONS: &[&str] = &[
     CHUNK_TEMPLATE_V7,
     EMBEDDINGS_RESET_V8,
     DROP_UNUSED_EDGE_INDEXES_V9,
+    CLUSTER_MEMBERS_INDEX_V10,
+    DOC_TRUNCATION_NOTICE_V11,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -302,6 +304,22 @@ DELETE FROM embeddings;
 // ON DELETE CASCADE 外键，删文档/工作区时 SQLite 靠这两个索引做级联查找，删了会退化为全表扫描。
 const DROP_UNUSED_EDGE_INDEXES_V9: &str = "
 DROP INDEX IF EXISTS idx_edges_score;
+";
+
+// V10：cluster_members 的 chunk_id / document_id 建索引。二者均为 ON DELETE CASCADE 外键，
+// 但复合主键 (cluster_id, document_id, chunk_id) 的最左前缀是 cluster_id，删文档/工作区时
+// 按 chunk_id/document_id 的级联查找无索引可用 → 每个被删 chunk 触发一次 cluster_members
+// 全表扫描，大库删除退化到分钟级。与 V9 保留 idx_edges_source/target 同理（级联外键须有索引）。
+const CLUSTER_MEMBERS_INDEX_V10: &str = "
+CREATE INDEX IF NOT EXISTS idx_cluster_members_chunk ON cluster_members(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_members_doc ON cluster_members(document_id);
+";
+
+// V11：documents 增 truncation_notice（解析期「内容不完整」告知语：扫描件超 OCR 上限、
+// 或 docx 正文 XML 中途出错截断）。前端以警示条展示，不进比对语料——提示文本本身若作为
+// 正文参与比对，多份截断件的相同提示会被聚成假 same 雷同条款并触发假围标信号。旧行为 NULL。
+const DOC_TRUNCATION_NOTICE_V11: &str = "
+ALTER TABLE documents ADD COLUMN truncation_notice TEXT;
 ";
 
 #[cfg(test)]

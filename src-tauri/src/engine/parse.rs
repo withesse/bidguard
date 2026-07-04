@@ -33,6 +33,10 @@ pub struct ParsedBlocks {
     /// 扫描件 OCR 行级版面（每页一组归一化坐标行），JSON 序列化后随文档入库，
     /// 供原文版式预览在页图上叠加隐形可选中文本层；非 OCR 路径为 None。
     pub ocr_layout_json: Option<String>,
+    /// 截断提示：扫描件超 OCR 上限时「仅比对前 N 页」的告知语。随文档入库、前端以
+    /// 警示条展示，但【不进 blocks/分块】——若作为正文参与比对，多份总页数相同的
+    /// 截断扫描件其提示文本逐字节相同，会被聚成假 same 雷同条款并触发假围标信号。
+    pub truncation_notice: Option<String>,
 }
 
 /// 新 API：结构化段块 + 取消旗标（OCR/栅格化等长阶段逐页检查）。
@@ -122,6 +126,7 @@ fn parse_spreadsheet(path: &Path) -> Result<ParsedBlocks, String> {
         method: "xlsx",
         legacy_text: legacy,
         ocr_layout_json: None,
+        truncation_notice: None,
     })
 }
 
@@ -162,6 +167,7 @@ fn parse_txt(path: &Path) -> Result<ParsedBlocks, String> {
         method: "text",
         legacy_text: text,
         ocr_layout_json: None,
+        truncation_notice: None,
     })
 }
 
@@ -299,8 +305,18 @@ fn is_page_number_line(line: &str) -> bool {
     has_digit
 }
 
-/// 解码文本：优先 UTF-8（含 BOM），无效时回落 GB18030（覆盖 GBK/GB2312）。
+/// 解码文本：UTF-16 BOM → UTF-8（含 BOM）→ GB18030（覆盖 GBK/GB2312）回落。
+/// UTF-16 必须先判：带 BOM 的 UTF-16（Windows 记事本「Unicode」存档）若落到 GB18030
+/// 会被硬解成乱码静默入库（GB18030 几乎不解码失败），永远比对不上 → 无声漏报。
 pub fn decode_text(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
     let body = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         &bytes[3..]
     } else {
@@ -361,7 +377,7 @@ fn parse_pdf_ocr(
         ocr_pages.iter().map(|p| p.lines.as_slice()).collect();
     let ocr_layout_json = serde_json::to_string(&layout).ok();
     // enumerate 在 filter 之前：保留的是原始页码
-    let mut blocks: Vec<Block> = ocr_pages
+    let blocks: Vec<Block> = ocr_pages
         .into_iter()
         .enumerate()
         .filter(|(_, p)| !p.text.trim().is_empty())
@@ -373,22 +389,14 @@ fn parse_pdf_ocr(
             is_list_item: false,
         })
         .collect();
-    // 扫描件超出 OCR 上限：首插醒目提示(含本文档页数，各文档数字不同故不会误聚类)，让用户知晓仅比对了前 N 页
-    if truncated {
-        blocks.insert(
-            0,
-            Block {
-                text: format!(
-                    "【查重提示】本文档为扫描件，因性能上限仅识别并比对了前 {rendered} 页（共 {total_pages} 页），其余 {} 页未参与查重，请人工复核。",
-                    total_pages - rendered
-                ),
-                heading_level: None,
-                page: Some(1),
-                is_table_row: false,
-                is_list_item: false,
-            },
-        );
-    }
+    // 扫描件超出 OCR 上限：不进正文（避免多份截断件的相同提示语被聚成假雷同/假围标），
+    // 改随文档入库并由前端以警示条展示，让用户知晓仅比对了前 N 页。
+    let truncation_notice = truncated.then(|| {
+        format!(
+            "本文档为扫描件，因性能上限仅识别并比对了前 {rendered} 页（共 {total_pages} 页），其余 {} 页未参与查重，请人工复核。",
+            total_pages - rendered
+        )
+    });
     Ok(ParsedBlocks {
         blocks,
         pages,
@@ -396,6 +404,7 @@ fn parse_pdf_ocr(
         method: "ocr",
         legacy_text,
         ocr_layout_json,
+        truncation_notice,
     })
 }
 
@@ -460,6 +469,7 @@ fn parse_pdf_extract(path: &Path) -> Result<ParsedBlocks, String> {
         method: "pdf-extract",
         legacy_text: text,
         ocr_layout_json: None,
+        truncation_notice: None,
     })
 }
 
@@ -501,6 +511,7 @@ fn parse_pdf_pdfium(path: &Path, cancel: &AtomicBool) -> Option<ParsedBlocks> {
         method: "pdfium",
         legacy_text,
         ocr_layout_json: None,
+        truncation_notice: None,
     })
 }
 
@@ -597,7 +608,7 @@ fn parse_docx(
 
     let doc_xml = read_zip(&mut zip, "word/document.xml")
         .ok_or_else(|| "docx 缺少 word/document.xml".to_string())?;
-    let (mut blocks, mut legacy_text) = docx_blocks(&doc_xml);
+    let (mut blocks, mut legacy_text, xml_truncated) = docx_blocks(&doc_xml);
 
     // 内嵌图片 OCR：截图式报价表/资质/公章里的文字，否则纯文本管线完全看不到
     if ocr_images {
@@ -621,6 +632,9 @@ fn parse_docx(
         pages = ((legacy_text.chars().count() / 1500) as u32).max(1);
     }
 
+    let truncation_notice = xml_truncated.then(|| {
+        "文档正文 XML 解析中途出错，仅提取到部分内容，其余段落可能缺失，请人工复核。".to_string()
+    });
     Ok(ParsedBlocks {
         blocks,
         pages,
@@ -628,6 +642,7 @@ fn parse_docx(
         method: "docx",
         legacy_text,
         ocr_layout_json: None,
+        truncation_notice,
     })
 }
 
@@ -735,11 +750,14 @@ fn heading_level_of_style(val: &str) -> Option<u8> {
 /// 表格 <w:tbl> 按行产出（单元格以「 | 」连接），嵌套表格的文本并入外层单元格不丢字。
 /// outlineLvl（大纲级别 0-8）优先于 pStyle 样式名推断，两者都有时取 outlineLvl。
 /// 同步构建 legacy 全文：每个 </w:p> 追加「未裁剪段文+\n」（含空段落），与旧 docx_text 等价。
-fn docx_blocks(xml: &[u8]) -> (Vec<Block>, String) {
+/// 返回 (段块, 全文, xml_truncated)。xml_truncated=true 表示正文 XML 解析中途出错
+/// 提前中止——其后段落全部丢失，调用方须显式告知用户「内容可能不完整」而非静默当完整。
+fn docx_blocks(xml: &[u8]) -> (Vec<Block>, String, bool) {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut blocks: Vec<Block> = Vec::new();
     let mut legacy = String::new();
+    let mut xml_truncated = false;
     let mut in_t = false;
     let mut para = String::new();
     let mut style_level: Option<u8> = None;
@@ -838,12 +856,15 @@ fn docx_blocks(xml: &[u8]) -> (Vec<Block>, String) {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(_) => {
+                xml_truncated = true;
+                break;
+            }
             _ => {}
         }
         buf.clear();
     }
-    (blocks, legacy)
+    (blocks, legacy, xml_truncated)
 }
 
 /// 解析 docProps/core.xml：作者、最后保存者、创建/修改时间、修订号。
@@ -958,6 +979,33 @@ mod tests {
     }
 
     #[test]
+    fn decodes_utf16_bom_text() {
+        // Windows 记事本「Unicode」存档：UTF-16LE/BE 带 BOM。旧实现落 GB18030 → 乱码静默入库。
+        let text = "投标报价壹佰贰拾捌万元";
+        let mut le = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            le.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(decode_text(&le), text, "UTF-16LE 解码失败");
+        let mut be = vec![0xFE, 0xFF];
+        for u in text.encode_utf16() {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(decode_text(&be), text, "UTF-16BE 解码失败");
+    }
+
+    #[test]
+    fn docx_blocks_flags_truncation_on_malformed_xml() {
+        // 第二段用不匹配的结束标签(</w:BADEND> vs <w:p>) → quick-xml 报错，旧实现静默 break
+        // 丢弃其后全部段落且不告知；修复后 truncated=true 供上层显式警示，同时保留已解析段落。
+        let xml = "<?xml version=\"1.0\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>\n<w:p><w:r><w:t>已解析的第一段</w:t></w:r></w:p>\n<w:p><w:r><w:t>丢失的第二段</w:t></w:r></w:BADEND></w:body></w:document>";
+        let (blocks, _legacy, truncated) = docx_blocks(xml.as_bytes());
+        assert!(truncated, "非法 XML 应标记 truncated");
+        assert!(blocks.iter().any(|b| b.text.contains("已解析的第一段")), "错误点前的段落应保留");
+        assert!(!blocks.iter().any(|b| b.text.contains("丢失的第二段")), "错误点后的段落确会丢失");
+    }
+
+    #[test]
     fn docx_blocks_extract_heading_levels() {
         // 英文样式 id / 中文数字样式 id / outlineLvl 三种来源
         let xml = r#"<?xml version="1.0"?>
@@ -967,7 +1015,8 @@ mod tests {
 <w:p><w:pPr><w:outlineLvl w:val="2"/></w:pPr><w:r><w:t>1.1.1 总体要求</w:t></w:r></w:p>
 <w:p><w:r><w:t>本项目采用微服务架构。</w:t></w:r></w:p>
 </w:body></w:document>"#;
-        let (blocks, legacy) = docx_blocks(xml.as_bytes());
+        let (blocks, legacy, truncated) = docx_blocks(xml.as_bytes());
+        assert!(!truncated, "合法 XML 不应标记截断");
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].heading_level, Some(1));
         assert_eq!(blocks[1].heading_level, Some(2));
@@ -1244,7 +1293,7 @@ mod tests {
 <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>提供七乘二十四小时响应</w:t></w:r></w:p>
 <w:p><w:r><w:t>以上承诺自合同签订之日起生效。</w:t></w:r></w:p>
 </w:body></w:document>"#;
-        let (blocks, _) = docx_blocks(xml.as_bytes());
+        let (blocks, _, _) = docx_blocks(xml.as_bytes());
         assert_eq!(blocks.len(), 3);
         assert!(blocks[0].is_list_item && blocks[1].is_list_item, "numPr 段应标记列表项");
         assert!(!blocks[2].is_list_item, "普通段不标记");
@@ -1262,7 +1311,7 @@ mod tests {
 </w:tbl>
 <w:p><w:r><w:t>以上报价含税。</w:t></w:r></w:p>
 </w:body></w:document>"#;
-        let (blocks, legacy) = docx_blocks(xml.as_bytes());
+        let (blocks, legacy, _) = docx_blocks(xml.as_bytes());
         let rows: Vec<_> = blocks.iter().filter(|b| b.is_table_row).collect();
         assert_eq!(rows.len(), 3, "三行表格 → 三个行块（嵌套表并入外层单元格）");
         assert_eq!(rows[0].text, "序号 | 设备名称 | 单价");
@@ -1286,7 +1335,7 @@ mod tests {
 <w:p></w:p>
 <w:p><w:r><w:t>第三段</w:t></w:r></w:p>
 </w:body></w:document>"#;
-        let (blocks, legacy) = docx_blocks(xml.as_bytes());
+        let (blocks, legacy, _) = docx_blocks(xml.as_bytes());
         assert_eq!(blocks.len(), 2, "空段落不产出块");
         assert_eq!(legacy, "第一段\n\n第三段\n", "legacy 保留空段落换行");
     }

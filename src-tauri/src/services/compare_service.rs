@@ -95,8 +95,14 @@ pub fn run_compare(
 ) -> AppResult<()> {
     let r = run_inner(ctx, &jieba, &embedder, workspace_id, cfg);
     if r.is_err() {
-        if let Ok(conn) = ctx.db.get() {
-            let _ = compare_repo::delete_job_results(&conn, &ctx.job_id);
+        // 失败/取消后清理半成品；清理本身失败不能静默（会留下残留结果），记日志（仅 job_id + 码）
+        match ctx.db.get() {
+            Ok(conn) => {
+                if let Err(e) = compare_repo::delete_job_results(&conn, &ctx.job_id) {
+                    log::error!("清理比对半成品失败 job_id={} code={:?}", ctx.job_id, e.code);
+                }
+            }
+            Err(e) => log::error!("清理比对半成品取连接失败 job_id={}: {e}", ctx.job_id),
         }
     }
     r
@@ -137,7 +143,11 @@ fn run_inner(
         for (di, d) in docs.iter().enumerate() {
             let rows = chunk_repo::load_for_compare(&conn, &d.id, &cfg.chunk_level)?;
             let total = rows.len();
-            for row in rows {
+            for (rank, mut row) in rows.into_iter().enumerate() {
+                // rel_pos 用稠密行序：order_index 由 chunker 连同 heading 块一起编号，而
+                // load_for_compare 已排除 heading（order_index 有空洞），直接用会使 rel_pos>1.0。
+                // rows 已按 order_index 排序，按加载顺序重编稠密序即可。
+                row.order_index = rank as i64;
                 let c = corpus::from_row(row, di, total);
                 // 比对范围：tech 排除商务段，business 排除技术段
                 let keep_scope = match cfg.scope.as_str() {
@@ -257,6 +267,8 @@ fn run_inner(
     // 7) 单事务落库（边在打分阶段已按阈值过滤）
     ctx.progress("persist", 0, 1, "保存比对结果");
     {
+        // 持进程级写锁：与导入 persist 共用一把，避免跨任务/跨工作区并发写撞 SQLITE_BUSY。
+        let _w = ctx.write_lock();
         let mut conn = ctx.db.get()?;
         let tx = conn.transaction()?;
         let kept_edges: Vec<NewEdge> = edges
@@ -399,9 +411,17 @@ fn embed_chunks(
     ctx.progress("semantic", 0, total, format!("语义向量（缓存命中 {}）", cache.len()));
 
     if !missing.is_empty() {
-        let mut guard = embedder.lock().unwrap();
-        let Some(model) = embed::ensure(&mut guard, spec, allow_download) else {
-            ctx.progress("semantic", total, total, "语义模型不可用，降级为词面比对");
+        // 比对路径【禁止隐式下载】：下载可达数分钟且此处持 embedder 锁不可取消，会让「取消比对」
+        // 卡在 cancelling。故 ensure 传 allow_download=false——已加载/已缓存的模型正常使用，未缓存
+        // 则降级并提示去工具屏预下载。unwrap_or_else 做毒化恢复，避免一次 panic 后语义功能永久失效。
+        let mut guard = embedder.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(model) = embed::ensure(&mut guard, spec, false) else {
+            let msg = if allow_download {
+                "语义模型未缓存，已降级为词面比对；请在工具屏预下载该模型后重试"
+            } else {
+                "语义模型不可用（离线且无缓存），降级为词面比对"
+            };
+            ctx.progress("semantic", total, total, msg);
             return Ok((None, true));
         };
         for (bi, batch) in missing.chunks(EMBED_BATCH).enumerate() {
@@ -417,6 +437,9 @@ fn embed_chunks(
                 .map(|((h, _), v)| (h.clone(), v))
                 .collect();
             {
+                // embedding 缓存回写也走进程级写锁，与导入/比对 persist 共用一把，避免跨工作区
+                // 并发比对时此写与他任务的 persist 事务争 SQLite 单写者撞 SQLITE_BUSY。
+                let _w = ctx.write_lock();
                 let conn = ctx.db.get()?;
                 embedding_repo::insert_many(&conn, &items, spec.id)?;
             }
@@ -425,7 +448,7 @@ fn embed_chunks(
             }
             ctx.progress(
                 "semantic",
-                (bi + 1) * EMBED_BATCH.min(total),
+                ((bi + 1) * EMBED_BATCH).min(total),
                 total,
                 format!("语义向量 {} / {}", ((bi + 1) * EMBED_BATCH).min(total), total),
             );
@@ -612,20 +635,29 @@ fn apply_fact_conflicts(
         if let Some(conflict) = fact::conflicts_between(&refs) {
             nc.cluster_type = "conflict".into();
             nc.severity = conflict.risk.clone();
-            nc.summary = Some(format!(
-                "同一条款关键数字不一致（{}）",
-                conflict
-                    .fields
-                    .iter()
-                    .map(|f| match f.field.as_str() {
-                        "amount" => "金额",
-                        "duration" => "工期",
-                        "date" => "日期",
-                        _ => "比例",
-                    })
-                    .collect::<Vec<_>>()
-                    .join("、")
-            ));
+            let labels: Vec<&str> = conflict
+                .fields
+                .iter()
+                .map(|f| match f.field.as_str() {
+                    "amount" => "金额",
+                    "duration" => "工期",
+                    "date" => "日期",
+                    "percentage" => "比例",
+                    "subject" => "责任主体",
+                    _ => "其他",
+                })
+                .collect();
+            // 纯主体冲突（甲方↔乙方互换）不是数字，措辞不能写「关键数字不一致」，否则举证描述失真
+            let has_numeric = conflict
+                .fields
+                .iter()
+                .any(|f| matches!(f.field.as_str(), "amount" | "duration" | "date" | "percentage"));
+            let head = if has_numeric {
+                "同一条款关键数字不一致"
+            } else {
+                "同一条款责任主体不一致"
+            };
+            nc.summary = Some(format!("{head}（{}）", labels.join("、")));
             nc.conflict_json = serde_json::to_string(&conflict).ok();
         }
     }

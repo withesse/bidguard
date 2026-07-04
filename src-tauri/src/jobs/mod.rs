@@ -19,6 +19,9 @@ const THROTTLE_PCT: f32 = 0.01;
 #[derive(Clone, Default)]
 pub struct JobManager {
     running: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// 进程级 DB 写串行锁：所有写事务（导入 persist / 比对 persist）共用一把，
+    /// 避免跨任务/跨工作区并发写在 SQLite 单写者下互撞 SQLITE_BUSY 造成任务假失败。
+    db_write: Arc<Mutex<()>>,
 }
 
 /// 交给任务体的执行上下文：取消检查 + 进度上报（含落库与事件）。
@@ -29,6 +32,7 @@ pub struct JobCtx {
     cancel: Arc<AtomicBool>,
     sink: Arc<dyn ProgressSink>,
     last_emit: Mutex<(Instant, f32, String)>, // (时间, 百分比, stage)
+    db_write: Arc<Mutex<()>>,                 // 进程级 DB 写串行锁（见 JobManager::db_write）
 }
 
 impl JobCtx {
@@ -39,6 +43,12 @@ impl JobCtx {
     /// 旗标引用：交给需要在内部循环里自查取消的引擎代码（如 OCR 逐页）。
     pub fn cancel_flag(&self) -> &AtomicBool {
         &self.cancel
+    }
+
+    /// 进程级 DB 写串行锁：所有写事务（导入 persist / 比对 persist）持此锁串行，
+    /// 避免 SQLite 单写者下并发写互撞 SQLITE_BUSY。毒化后恢复，避免一次 panic 后永久卡死。
+    pub fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.db_write.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 测试用构造：绕过 JobManager 直接组装上下文。
@@ -57,6 +67,7 @@ impl JobCtx {
             cancel,
             sink,
             last_emit: Mutex::new((Instant::now(), -1.0, String::new())),
+            db_write: Arc::new(Mutex::new(())),
         }
     }
 
@@ -109,13 +120,21 @@ pub fn execute<F>(
     sink: Arc<dyn ProgressSink>,
     cancel: Arc<AtomicBool>,
     job: &JobRow,
+    db_write: Arc<Mutex<()>>,
     worker: F,
 ) where
     F: FnOnce(&JobCtx) -> AppResult<()>,
 {
     let mark = |status: &str, code: Option<&str>, msg: Option<&str>| {
-        if let Ok(conn) = db.get() {
-            let _ = job_repo::finish(&conn, &job.id, status, code, msg);
+        // 终态落库失败不能静默：DB 与已广播的终态事件会永久不一致（前端显示完成但表停在
+        // running，重启后被误判为「中断」）。至少记日志（仅 job_id + 错误码，不含正文）。
+        match db.get() {
+            Ok(conn) => {
+                if let Err(e) = job_repo::finish(&conn, &job.id, status, code, msg) {
+                    log::error!("任务终态落库失败 job_id={} status={status} code={:?}", job.id, e.code);
+                }
+            }
+            Err(e) => log::error!("任务终态落库取连接失败 job_id={} status={status}: {e}", job.id),
         }
         sink.emit_terminal(&JobTerminal {
             job_id: job.id.clone(),
@@ -126,8 +145,23 @@ pub fn execute<F>(
         });
     };
 
-    if let Ok(conn) = db.get() {
-        if job_repo::set_running(&conn, &job.id).is_err() {
+    // 取连接失败必须显式处理：否则会跳过 set_running 让任务带 pending 状态照常运行。
+    match db.get() {
+        Ok(conn) => match job_repo::set_running(&conn, &job.id) {
+            Ok(true) => {} // 正常进入 running
+            // pending→running 未命中：竞态窗口内任务已被取消/终态，直接收尾为 cancelled 不再执行
+            Ok(false) => {
+                mark("cancelled", None, None);
+                return;
+            }
+            Err(e) => {
+                log::error!("set_running 失败 job_id={} code={:?}", job.id, e.code);
+                mark("failed", Some("databaseError"), Some("任务启动失败"));
+                return;
+            }
+        },
+        Err(e) => {
+            log::error!("任务启动取连接失败 job_id={}: {e}", job.id);
             mark("failed", Some("databaseError"), Some("任务启动失败"));
             return;
         }
@@ -140,6 +174,7 @@ pub fn execute<F>(
         cancel: cancel.clone(),
         sink: sink.clone(),
         last_emit: Mutex::new((Instant::now(), -1.0, String::new())),
+        db_write,
     };
 
     // worker panic 不能拖垮线程池，也不能让任务永远停在 running
@@ -205,6 +240,7 @@ impl JobManager {
 
         let running = self.running.clone();
         let db = db.clone();
+        let db_write = self.db_write.clone();
         let job_for_worker = job.clone();
         tauri::async_runtime::spawn_blocking(move || {
             // RAII 守卫：即使 execute 内部 panic，运行表也不残留 zombie 条目
@@ -221,7 +257,7 @@ impl JobManager {
                 map: running,
                 id: job_for_worker.id.clone(),
             };
-            execute(db, sink, cancel, &job_for_worker, worker);
+            execute(db, sink, cancel, &job_for_worker, db_write, worker);
         });
         Ok(job)
     }
@@ -279,7 +315,7 @@ mod tests {
         };
         let sink = Arc::new(CollectSink::default());
         let cancel = Arc::new(AtomicBool::new(false));
-        execute(pool.clone(), sink.clone(), cancel, &job, |ctx| {
+        execute(pool.clone(), sink.clone(), cancel, &job, Arc::new(Mutex::new(())), |ctx| {
             ctx.progress("parse", 0, 3, "开始");
             ctx.progress("parse", 3, 3, "完成");
             Ok(())
@@ -305,7 +341,7 @@ mod tests {
             job_repo::create(&conn, &ws, "import", None, "{}").unwrap()
         };
         let cancel = Arc::new(AtomicBool::new(true));
-        execute(pool.clone(), sink.clone(), cancel, &job, |ctx| {
+        execute(pool.clone(), sink.clone(), cancel, &job, Arc::new(Mutex::new(())), |ctx| {
             ctx.check()?;
             unreachable!("已取消不应继续执行");
         });
@@ -320,6 +356,7 @@ mod tests {
             sink.clone(),
             Arc::new(AtomicBool::new(false)),
             &job2,
+            Arc::new(Mutex::new(())),
             |_| Err(AppError::new(AppErrorCode::ParseFailed, "解析失败")),
         );
         let conn = pool.get().unwrap();

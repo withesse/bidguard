@@ -22,13 +22,15 @@ pub struct DocumentRow {
     pub chunk_count: i64,
     pub created_at: String,
     pub updated_at: String,
+    /// 解析期「内容不完整」告知语（扫描件超页 / docx XML 截断）；前端以警示条展示。
+    pub truncation_notice: Option<String>,
 }
 
 const SELECT: &str = "SELECT d.id, d.workspace_id, d.file_name, d.file_path, d.file_hash,
   d.file_type, d.status, d.parse_error, d.parse_method, d.page_count, d.char_count,
   d.fingerprint_json,
   (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id AND c.chunk_level = 'paragraph'),
-  d.created_at, d.updated_at FROM documents d";
+  d.created_at, d.updated_at, d.truncation_notice FROM documents d";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<DocumentRow> {
     Ok(DocumentRow {
@@ -47,6 +49,7 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<DocumentRow> {
         chunk_count: r.get(12)?,
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
+        truncation_notice: r.get(15)?,
     })
 }
 
@@ -144,6 +147,7 @@ pub fn find_parsed_by_hash(
         .optional()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn mark_parsed(
     conn: &rusqlite::Connection,
     id: &str,
@@ -152,11 +156,12 @@ pub fn mark_parsed(
     char_count: usize,
     fingerprint_json: &str,
     ocr_layout_json: Option<&str>,
+    truncation_notice: Option<&str>,
 ) -> AppResult<()> {
     conn.execute(
         "UPDATE documents SET status = 'parsed', parse_method = ?2, page_count = ?3,
-         char_count = ?4, fingerprint_json = ?5, ocr_layout_json = ?6, parse_error = NULL,
-         updated_at = ?7 WHERE id = ?1",
+         char_count = ?4, fingerprint_json = ?5, ocr_layout_json = ?6, truncation_notice = ?8,
+         parse_error = NULL, updated_at = ?7 WHERE id = ?1",
         params![
             id,
             parse_method,
@@ -164,7 +169,8 @@ pub fn mark_parsed(
             char_count as i64,
             fingerprint_json,
             ocr_layout_json,
-            now_iso()
+            now_iso(),
+            truncation_notice
         ],
     )?;
     Ok(())
@@ -186,6 +192,17 @@ pub fn mark_failed(conn: &rusqlite::Connection, id: &str, error: &str) -> AppRes
         params![id, error, now_iso()],
     )?;
     Ok(())
+}
+
+/// 该文档是否被现存比对结果（cluster_members）引用——删除会使那些条款组变空壳、
+/// diffs/matrix_json 悬挂，是对「可举证报告」的静默污染，删前应拒绝或先失效相关任务。
+pub fn is_in_compare_results(conn: &rusqlite::Connection, id: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cluster_members WHERE document_id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// 删除文档（chunks/特征/facts 级联清理）。

@@ -481,8 +481,9 @@ function MemberNote({
   return (
     <div
       style={{
-        borderLeft: "3px solid #C28430",
+        // border 简写必须在 borderLeft 之前，否则会重置左侧强调条（琥珀色批注条不渲染）
         border: `1px solid ${border}`,
+        borderLeft: "3px solid #C28430",
         borderRadius: 7,
         padding: "6px 8px",
         display: "flex",

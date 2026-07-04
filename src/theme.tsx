@@ -98,6 +98,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     root.style.setProperty("--accent", t.accent);
     document.body.style.background = t.dark ? "#15151B" : "#F4F2EB";
   }, [t.dark, t.accent]);
+  // 「跟随系统」时监听系统深浅色切换（macOS 日落自动切暗色等），运行中即时跟随而非仅启动时解析一次
+  useEffect(() => {
+    if (t.mode !== "system" || typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () =>
+      setT((prev) => (prev.mode === "system" ? { ...prev, dark: mq.matches } : prev));
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [t.mode]);
   const set = (patch: Partial<Theme>) =>
     setT((prev) => {
       const next = { ...prev, ...patch };

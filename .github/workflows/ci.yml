@@ -14,13 +14,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # 缓存重型依赖树（ort/fastembed/pdfium/tauri），避免每次冷编译
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
       - name: 安装前端依赖
-        run: npm install
+        run: npm ci
       - name: 前端类型检查 + 构建（含 tsc）
         run: npm run build
+      - name: 前端 Lint（ESLint + react-hooks）
+        run: npm run lint
       - name: 前端单元测试
         run: npm test
       - name: Clippy（警告即失败）
@@ -28,7 +36,7 @@ jobs:
       - name: 引擎单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-  # 跨平台编译检查：Windows/Linux 上 cargo check，避免跨平台编译错误拖到打 tag 时才暴露。
+  # 跨平台：Linux 编译检查；Windows 跑完整引擎测试（随包 pdfium.dll 为 x64，可真跑）。
   cross-check:
     strategy:
       fail-fast: false
@@ -38,6 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
       - name: Install Linux 依赖
         if: matrix.os == 'ubuntu-24.04'
         run: |
@@ -46,5 +57,20 @@ jobs:
       - name: 占位 frontendDist（tauri-build 需其存在）
         shell: bash
         run: mkdir -p dist && echo '<!doctype html><title>ci</title>' > dist/index.html
-      - name: 跨平台编译检查
+      # Windows：跑引擎测试验证平台分叉逻辑（路径分隔 / GBK 文件名 / pdfium.dll 加载）
+      - name: Windows 引擎测试
+        if: matrix.os == 'windows-latest'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      # Linux：仅编译检查（无 libpdfium.so，不跑需 pdfium 的测试）
+      - name: Linux 编译检查
+        if: matrix.os == 'ubuntu-24.04'
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+
+  # 依赖供应链审计（非阻塞信息位；出 CVE 时 CI 变红提醒）
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

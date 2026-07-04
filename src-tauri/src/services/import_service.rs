@@ -58,9 +58,12 @@ impl ImportOptions {
     }
 
     /// 配置指纹：跨工作区分块缓存复用的匹配键（配置不同 → 分块不可互换）。
-    pub fn options_hash(&self) -> String {
+    /// templates_digest 是启用中查重源模板集的摘要——模板集是分块的真实输入（决定 is_template
+    /// 标记），必须并入指纹：否则工作区 A 导入后增删模板、工作区 B 导入同一文件命中旧缓存，
+    /// 会复用过期的 is_template 标记 → 新增模板不生效(误报)、停用模板仍剔除(漏报)。
+    pub fn options_hash(&self, templates_digest: &str) -> String {
         let s = format!(
-            "v4|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|lang={}",
+            "v5|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|lang={}|tpl={}",
             self.min_paragraph_chars,
             self.normalize.ignore_case,
             self.normalize.ignore_punctuation,
@@ -71,6 +74,7 @@ impl ImportOptions {
             self.ocr_docx_images,
             self.ocr_model,
             self.language,
+            templates_digest,
         );
         crate::engine::normalize::sha256_hex(s.as_bytes())
     }
@@ -93,25 +97,37 @@ pub fn run_import(
     if paths.is_empty() {
         return Err(AppError::new(AppErrorCode::InvalidConfig, "未选择任何文件"));
     }
-    let options_hash = opts.options_hash();
-
-    // 启用中的查重源模板 → 分词，供分块阶段标记样板段落
-    let chunker_opts = {
+    // 启用中的查重源模板：既用于分块标记样板段，也并入 options_hash——模板集是分块的真实
+    // 输入，缓存复用必须同集才安全。摘要按 id 排序后 hash（与集合内容一一对应、与加载顺序无关）。
+    let (chunker_opts, templates_digest) = {
         let conn = ctx.db.get()?;
-        let templates: Vec<(String, Vec<String>)> = template_repo::list_enabled(&conn)?
+        let raw = template_repo::list_enabled(&conn)?; // Vec<(id, text)>
+        let mut keyed: Vec<(&str, &str)> = raw.iter().map(|(id, t)| (id.as_str(), t.as_str())).collect();
+        keyed.sort_unstable();
+        let mut digest_src = String::new();
+        for (id, t) in &keyed {
+            digest_src.push_str(id);
+            digest_src.push('\u{1f}');
+            digest_src.push_str(t);
+            digest_src.push('\u{1e}');
+        }
+        let templates_digest = crate::engine::normalize::sha256_hex(digest_src.as_bytes());
+        let templates: Vec<(String, Vec<String>)> = raw
             .into_iter()
             .map(|(id, t)| (id, tokenize(&jieba, &t)))
             .filter(|(_, t)| !t.is_empty())
             .collect();
-        ChunkerOptions {
+        let opts_out = ChunkerOptions {
             min_chars: opts.min_paragraph_chars,
             templates,
             normalize: opts.normalize.clone(),
             detect_table: opts.detect_table,
             preserve_page_number: opts.preserve_page_number,
             language: opts.language.clone(),
-        }
+        };
+        (opts_out, templates_digest)
     };
+    let options_hash = opts.options_hash(&templates_digest);
 
     // 阶段 A：顺序校验 + 哈希 + 去重（批内同内容文件只保留第一个；工作区内已有的跳过）
     let total = paths.len();
@@ -176,15 +192,15 @@ pub fn run_import(
     }
 
     // 阶段 B：按文件并行解析（CPU 密集），但 DB 写入串行。
-    // SQLite 单写者：并发的大文档写事务会撞 busy_timeout（SQLITE_BUSY）；
-    // 这把写锁让任一时刻只有一个写事务，解析仍并行，从而既快又不冲突。
+    // SQLite 单写者：并发的大文档写事务会撞 busy_timeout（SQLITE_BUSY）。写入持进程级写锁
+    // （ctx.write_lock，见 JobManager::db_write）串行——不止本任务内部，跨任务/跨工作区的
+    // 导入与比对写事务也共用一把，解析仍在锁外并行，既快又不冲突。
     let parse_total = work.len();
     let done = AtomicUsize::new(0);
-    let db_write = std::sync::Mutex::new(());
     let results: Vec<AppResult<()>> = work
         .par_iter()
         .map(|item| {
-            let r = import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash, &db_write);
+            let r = import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             ctx.progress("parse", n, parse_total, format!("已解析 {n} / {parse_total}"));
             r
@@ -211,7 +227,7 @@ pub fn run_import(
 }
 
 /// 单文件导入。返回 Err 仅用于数据库错误 / 取消；解析失败落到 documents.status=failed。
-/// 解析（含 OCR）在 db_write 锁外并行；所有 DB 写入持锁串行，避免 SQLite 并发写冲突。
+/// 解析（含 OCR）在写锁外并行；所有 DB 写入持 ctx.write_lock() 串行，避免 SQLite 并发写冲突。
 #[allow(clippy::too_many_arguments)] // 导入单文件的固有上下文集合
 fn import_one(
     ctx: &JobCtx,
@@ -221,7 +237,6 @@ fn import_one(
     chunker_opts: &ChunkerOptions,
     opts: &ImportOptions,
     options_hash: &str,
-    db_write: &std::sync::Mutex<()>,
 ) -> AppResult<()> {
     ctx.check()?;
 
@@ -230,7 +245,7 @@ fn import_one(
         let conn = ctx.db.get()?;
         if let Some(src) = document_repo::find_parsed_by_hash(&conn, &item.file_hash, options_hash)? {
             drop(conn);
-            let _w = db_write.lock().unwrap();
+            let _w = ctx.write_lock();
             let conn = ctx.db.get()?;
             let doc = document_repo::create_parsing(
                 &conn,
@@ -253,7 +268,7 @@ fn import_one(
     }
 
     let doc = {
-        let _w = db_write.lock().unwrap();
+        let _w = ctx.write_lock();
         let conn = ctx.db.get()?;
         document_repo::create_parsing(
             &conn,
@@ -275,7 +290,7 @@ fn import_one(
     );
     if ctx.cancelled() {
         // 解析被打断的半成品不保留（该行还没有任何分块）
-        let _w = db_write.lock().unwrap();
+        let _w = ctx.write_lock();
         let conn = ctx.db.get()?;
         let _ = document_repo::remove(&conn, &doc.id);
         return Err(AppError::new(AppErrorCode::JobCancelled, "任务已取消"));
@@ -283,7 +298,7 @@ fn import_one(
 
     match parsed {
         Err(e) => {
-            let _w = db_write.lock().unwrap();
+            let _w = ctx.write_lock();
             let conn = ctx.db.get()?;
             document_repo::mark_failed(&conn, &doc.id, &e)?;
             Ok(())
@@ -304,7 +319,7 @@ fn import_one(
             let fingerprint_json = serde_json::to_string(&pb.fingerprint)
                 .unwrap_or_else(|_| "{}".to_string());
             // 写入持锁串行（大文档事务可达数秒，不能与他文档并发写）
-            let _w = db_write.lock().unwrap();
+            let _w = ctx.write_lock();
             let mut conn = ctx.db.get()?;
             if let Err(e) = persist_parsed(
                 &mut conn,
@@ -315,6 +330,7 @@ fn import_one(
                 char_count,
                 &fingerprint_json,
                 pb.ocr_layout_json.as_deref(),
+                pb.truncation_notice.as_deref(),
             ) {
                 // 入库失败时把文档标失败（可见可重试），不留 'parsing' 孤儿
                 let _ = document_repo::mark_failed(&conn, &doc.id, "解析结果入库失败");
@@ -336,6 +352,7 @@ fn persist_parsed(
     char_count: usize,
     fingerprint_json: &str,
     ocr_layout_json: Option<&str>,
+    truncation_notice: Option<&str>,
 ) -> AppResult<()> {
     let tx = conn.transaction()?;
     chunk_repo::insert_all(&tx, doc_id, chunks)?;
@@ -347,6 +364,7 @@ fn persist_parsed(
         char_count,
         fingerprint_json,
         ocr_layout_json,
+        truncation_notice,
     )?;
     tx.commit()?;
     Ok(())
@@ -370,6 +388,7 @@ fn persist_cached(
         src.char_count.unwrap_or(0) as usize,
         src.fingerprint_json.as_deref().unwrap_or("{}"),
         src_layout.as_deref(),
+        src.truncation_notice.as_deref(),
     )?;
     tx.commit()?;
     Ok(())

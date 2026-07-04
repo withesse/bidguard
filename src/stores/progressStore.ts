@@ -37,9 +37,22 @@ export async function initJobEvents(queryClient: QueryClient): Promise<() => voi
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   const offs: Array<() => void> = [];
+  // 导入进度期间节流失效 documents 列表：文档行在 job 线程哈希后才 INSERT，mutation onSuccess 的
+  // 一次性失效几乎必在插入前完成，而 useDocuments 的 refetchInterval 又依赖缓存里已存在 parsing
+  // 行——两者都可能错过。以进度事件为兜底通道，让「解析中」状态与新行及时出现。
+  let lastDocInvalidate = 0;
   for (const name of PROGRESS_EVENTS) {
     offs.push(
-      await listen<ProgressEvent>(name, (e) => useProgressStore.getState().onProgress(e.payload)),
+      await listen<ProgressEvent>(name, (e) => {
+        useProgressStore.getState().onProgress(e.payload);
+        if (name === "document:import:progress") {
+          const now = Date.now();
+          if (now - lastDocInvalidate >= 800) {
+            lastDocInvalidate = now;
+            void queryClient.invalidateQueries({ queryKey: ["documents"] });
+          }
+        }
+      }),
     );
   }
   for (const name of TERMINAL_EVENTS) {

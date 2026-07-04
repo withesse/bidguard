@@ -47,6 +47,7 @@ pub async fn get_model_status() -> AppResult<ModelStatus> {
 
 /// 预热下载某语义模型（直接阻塞命令，前端转圈等待）。
 /// 避免「首次比对时突然卡几分钟下模型」。在工具屏显式发起 → 视为授权联网。
+/// 有自托管下载源（离线/内网友好）先拉到本地，否则回落 HF；随后 ensure 预热加载。
 /// fastembed 无细粒度下载进度，故不任务化，完成即返回。
 #[tauri::command]
 pub async fn download_embedding_model(
@@ -56,7 +57,12 @@ pub async fn download_embedding_model(
     let embedder = state.embedder();
     tauri::async_runtime::spawn_blocking(move || {
         let spec = embed::resolve(&model_key);
-        let mut guard = embedder.lock().unwrap();
+        // 自托管源优先（可控/离线内网）；无源则由下面的 ensure 走 HF 联网下载
+        if spec.download_url.is_some() {
+            embed::download_model(spec)
+                .map_err(|e| AppError::new(AppErrorCode::CompareFailed, "模型下载失败").with_detail(e))?;
+        }
+        let mut guard = embedder.lock().unwrap_or_else(|e| e.into_inner());
         embed::ensure(&mut guard, spec, true).map(|_| ()).ok_or_else(|| {
             AppError::new(AppErrorCode::CompareFailed, "模型下载/加载失败（检查网络或磁盘）")
         })
@@ -121,10 +127,16 @@ pub async fn clear_embedding_cache(state: State<'_, AppState>) -> AppResult<usiz
 }
 
 /// 压缩数据库（VACUUM），回收删除任务/文档后的空洞空间。
+/// 多 GB 库上可达数十秒到分钟级，放 spawn_blocking，避免占住 async runtime worker 线程。
 #[tauri::command]
 pub async fn vacuum_db(state: State<'_, AppState>) -> AppResult<()> {
-    conn(&state)?.execute_batch("VACUUM")?;
-    Ok(())
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
+        db.get().map_err(AppError::from)?.execute_batch("VACUUM")?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::new(AppErrorCode::Unknown, "压缩任务失败").with_detail(e.to_string()))?
 }
 
 #[derive(Serialize)]
@@ -170,9 +182,17 @@ pub async fn run_diagnostics(state: State<'_, AppState>) -> AppResult<Vec<Diagno
         },
     });
 
-    let db_ok = conn(&state)?.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-        .map(|s| s == "ok")
-        .unwrap_or(false);
+    // integrity_check 多 GB 库上可达分钟级，放 spawn_blocking，不占 async runtime worker。
+    let db = state.db.clone();
+    let db_ok = tauri::async_runtime::spawn_blocking(move || {
+        db.get()
+            .ok()
+            .and_then(|c| c.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).ok())
+            .map(|s| s == "ok")
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
     items.push(DiagnosticItem {
         key: "db".into(),
         label: "数据库完整性".into(),

@@ -1,6 +1,6 @@
 // 文档 commands：导入（任务化，立即返回 JobRow）、列表、预览、删除。
 use super::{conn, effective_config};
-use crate::db::repo::{chunk_repo, document_repo, workspace_repo};
+use crate::db::repo::{chunk_repo, document_repo, job_repo, workspace_repo};
 use crate::db::repo::chunk_repo::ChunkRow;
 use crate::db::repo::document_repo::DocumentRow;
 use crate::db::repo::job_repo::JobRow;
@@ -72,7 +72,23 @@ pub async fn get_document_preview(
 
 #[tauri::command]
 pub async fn remove_document(document_id: String, state: State<'_, AppState>) -> AppResult<()> {
-    document_repo::remove(&*conn(&state)?, &document_id)
+    let c = conn(&state)?;
+    let doc = document_repo::get(&c, &document_id)?;
+    // 运行中任务守卫：比对/导入运行中删文档会撞 FK 让任务以晦涩错误失败
+    if job_repo::has_any_active(&c, &doc.workspace_id)? {
+        return Err(AppError::new(
+            AppErrorCode::JobConflict,
+            "该工作区有正在运行的任务，请先取消再删除文档",
+        ));
+    }
+    // 结果引用守卫：级联删除会抽走 cluster_members 使条款组变空壳、矩阵/diff 悬挂（失真的举证）
+    if document_repo::is_in_compare_results(&c, &document_id)? {
+        return Err(AppError::new(
+            AppErrorCode::JobConflict,
+            "该文档已参与比对结果，删除会使这些结果失真，请先删除相关比对任务",
+        ));
+    }
+    document_repo::remove(&c, &document_id)
 }
 
 /// 原始文件字节（原文版式预览：pdf.js / docx-preview 的数据源）。

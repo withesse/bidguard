@@ -27,6 +27,8 @@ export interface DocumentDto {
   chunkCount: number;
   createdAt: string;
   updatedAt: string;
+  /** 解析期「内容不完整」告知语（扫描件超页 / docx XML 截断）；前端以警示条展示。 */
+  truncationNotice: string | null;
 }
 
 export interface JobDto {

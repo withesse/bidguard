@@ -2,7 +2,7 @@
 // 每篇文档默认 1 个 primary（与其他文档平均相似度最高者），其余 duplicate_candidate。
 use crate::engine::corpus::CmpChunk;
 use crate::engine::scoring::ScoreParts;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct ScoredEdge {
     pub a: u32,
@@ -139,12 +139,14 @@ fn group_by_component<'a>(es: &[&'a ScoredEdge]) -> Vec<Vec<&'a ScoredEdge>> {
 
 /// 一组内聚边 → RawCluster（跨 ≥2 文档才成组；含角色分配与统计）。
 fn build_raw(chunks: &[CmpChunk], es: &[&ScoredEdge]) -> Option<RawCluster> {
+    // HashSet 去重（大聚类可有上千成员/数十万边，Vec::contains 是 O(E×V) 线性扫描）
+    let mut seen: HashSet<u32> = HashSet::new();
     let mut members: Vec<u32> = Vec::new();
     for e in es {
-        if !members.contains(&e.a) {
+        if seen.insert(e.a) {
             members.push(e.a);
         }
-        if !members.contains(&e.b) {
+        if seen.insert(e.b) {
             members.push(e.b);
         }
     }

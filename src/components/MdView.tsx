@@ -6,6 +6,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { C } from "../design/tokens";
 import { useTheme } from "../theme";
+import { guardLinkClick } from "../utils/linkGuard";
 
 export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: string | null }) {
   const { dark } = useTheme();
@@ -58,7 +59,7 @@ export function MdView({ data, anchorText }: { data: ArrayBuffer; anchorText: st
   const ink = dark ? "rgba(255,255,255,0.92)" : C.ink;
   const border = dark ? "rgba(255,255,255,0.12)" : C.line;
   return (
-    <div style={{ flex: 1, overflowY: "auto", padding: "20px 32px 40px" }}>
+    <div style={{ flex: 1, overflowY: "auto", padding: "20px 32px 40px" }} onClickCapture={guardLinkClick}>
       <style>{`
         .bg-md-host{max-width:820px;margin:0 auto;font-size:13.5px;line-height:1.85;color:${ink};font-family:${C.font};}
         .bg-md-host h1,.bg-md-host h2,.bg-md-host h3{font-family:${C.serif};line-height:1.4;}

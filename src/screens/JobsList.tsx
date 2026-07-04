@@ -98,6 +98,7 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
+                      e.stopPropagation(); // 否则冒泡到行容器立即 nav 跳走，键盘用户永远收藏不了
                       star.mutate(
                         { jobId: j.id, starred: !j.starred },
                         { onError: (err) => toast.show("操作失败：" + errMsg(err), "error") },
@@ -169,6 +170,7 @@ export function JobsList({ title, mode }: { title: string; mode: "all" | "starre
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
+                      e.stopPropagation(); // 否则冒泡到行容器立即 nav 跳走，键盘用户永远删不了
                       if (confirmDel === j.id) {
                         del.mutate(j.id, {
                           onError: (err) => toast.show("删除失败：" + errMsg(err), "error"),

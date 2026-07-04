@@ -66,39 +66,6 @@ export function DocChip({ type = "docx", style }: { type?: string; style?: CSSPr
   );
 }
 
-// ── Avatar ─────────────────────────────────────────────
-export function Avatar({
-  name,
-  color = C.brand,
-  size = 24,
-}: {
-  name: string;
-  color?: string;
-  size?: number;
-}) {
-  return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        borderRadius: "50%",
-        background: color,
-        color: "#fff",
-        fontSize: size * 0.44,
-        fontWeight: 700,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        letterSpacing: "-0.01em",
-        fontFamily: C.font,
-      }}
-    >
-      {name}
-    </div>
-  );
-}
-
 // ── Button ─────────────────────────────────────────────
 type ButtonKind = "primary" | "secondary" | "ghost";
 type ButtonSize = "sm" | "md" | "lg";

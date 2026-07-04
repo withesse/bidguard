@@ -1,6 +1,6 @@
 // 工作区 commands。
 use super::conn;
-use crate::db::repo::workspace_repo::{self, WorkspaceRow};
+use crate::db::repo::{job_repo, workspace_repo::{self, WorkspaceRow}};
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::state::AppState;
 use tauri::State;
@@ -56,5 +56,14 @@ pub async fn set_workspace_settings(
 
 #[tauri::command]
 pub async fn delete_workspace(workspace_id: String, state: State<'_, AppState>) -> AppResult<()> {
-    workspace_repo::delete(&*conn(&state)?, &workspace_id)
+    let c = conn(&state)?;
+    // 运行中任务守卫：级联删除会抽走正在导入/比对任务的 job 行与数据行（与 delete_job 的
+    // JobConflict 保护一致）——先取消再删。
+    if job_repo::has_any_active(&c, &workspace_id)? {
+        return Err(AppError::new(
+            AppErrorCode::JobConflict,
+            "该工作区有正在运行的任务，请先取消再删除",
+        ));
+    }
+    workspace_repo::delete(&c, &workspace_id)
 }

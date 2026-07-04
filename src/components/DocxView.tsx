@@ -1,6 +1,7 @@
 // docx 原文版式视图：docx-preview 渲染为 HTML（表格/图片/样式保真），文本天然可选中拷贝。
 import { useEffect, useRef, useState } from "react";
 import { renderAsync } from "docx-preview";
+import { guardLinkClick } from "../utils/linkGuard";
 
 export function DocxView({
   data,
@@ -37,7 +38,7 @@ export function DocxView({
     return <div style={{ padding: 24, fontSize: 12.5 }}>docx 渲染失败：{error}</div>;
   }
   return (
-    <div style={{ flex: 1, overflowY: "auto", padding: "16px 0 32px" }}>
+    <div style={{ flex: 1, overflowY: "auto", padding: "16px 0 32px" }} onClickCapture={guardLinkClick}>
       <div ref={hostRef} style={{ margin: "0 auto", maxWidth: "100%", width: "fit-content" }} />
     </div>
   );

@@ -20,7 +20,9 @@ fn init_conn(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Error> {
     // journal_mode 会返回结果行，必须用查询方式设置（内存库返回 "memory" 亦属正常）
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
-    conn.busy_timeout(Duration::from_millis(5000))
+    // 写事务已由进程级写锁（JobManager::db_write）串行；busy_timeout 作兜底，覆盖未走该锁的
+    // 少量小写事务（如模板保存）与 DEFERRED 先读后写的短暂快照冲突。调大到 15s 更稳。
+    conn.busy_timeout(Duration::from_millis(15000))
 }
 
 /// 打开（或创建）`<base>/bidguard.db` 并迁移到最新 schema。`base` 为 app 数据目录。

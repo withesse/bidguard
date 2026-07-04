@@ -9,7 +9,7 @@ import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
 import { useAppInfo, useAppSettings, useSaveAppSettings } from "../queries/data";
 import { relaunchApp, runUpdate, type UpdateState } from "../utils/updater";
-import { getSettings, setSettings, type Settings as DetectSettings, type Scope } from "../prefs";
+import { type Scope } from "../prefs";
 
 const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy", "spacious"];
 const SCOPES: Scope[] = ["full", "tech", "business"];
@@ -120,9 +120,6 @@ export function Settings() {
     );
   };
 
-  // 无后端对应的本地偏好（围标提示/工商联动）；任务清理已迁至「工具箱」的手动入口
-  const [s, setS] = useState<DetectSettings>(() => getSettings());
-  const change = (patch: Partial<DetectSettings>) => setS(setSettings(patch));
   const pct = Math.round((cmp.similarityThreshold as number) * 100);
 
   // 检查更新
@@ -249,18 +246,6 @@ export function Settings() {
                 </select>
               </Row>
             )}
-            <Row label="围标嫌疑提示" sub="3 份及以上共同高相似片段触发" ink={ink} mute={mute}>
-              <Toggle on={s.flagCollusion} onChange={() => change({ flagCollusion: !s.flagCollusion })} />
-            </Row>
-            <Row
-              label="联动工商关联数据"
-              sub="需接入工商数据源（如企业信息 API），未配置时不参与判定"
-              ink={ink}
-              mute={mute}
-              last
-            >
-              <Toggle on={s.industryLink} onChange={() => change({ industryLink: !s.industryLink })} />
-            </Row>
           </Card>
 
           {/* 解析与归一（导入时生效）*/}

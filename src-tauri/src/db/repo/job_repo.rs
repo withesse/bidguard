@@ -99,12 +99,25 @@ pub fn has_active(conn: &rusqlite::Connection, workspace_id: &str, job_type: &st
     Ok(n > 0)
 }
 
-pub fn set_running(conn: &rusqlite::Connection, id: &str) -> AppResult<()> {
-    conn.execute(
-        "UPDATE jobs SET status = 'running', started_at = ?2 WHERE id = ?1",
+/// 工作区内是否有任何类型的未完结任务（删工作区前的守卫：级联删除会抽走运行中任务的数据行）。
+pub fn has_any_active(conn: &rusqlite::Connection, workspace_id: &str) -> AppResult<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE workspace_id = ?1
+         AND status IN ('pending', 'running', 'cancelling')",
+        params![workspace_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// pending → running。返回是否成功跃迁：0 行表示任务已不在 pending（竞态窗口内被取消/终态），
+/// 调用方据此收尾而非照常运行。无状态守卫时唯一能把 cancelling/终态翻回 running 的跃迁。
+pub fn set_running(conn: &rusqlite::Connection, id: &str) -> AppResult<bool> {
+    let n = conn.execute(
+        "UPDATE jobs SET status = 'running', started_at = ?2 WHERE id = ?1 AND status = 'pending'",
         params![id, now_iso()],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 pub fn set_cancelling(conn: &rusqlite::Connection, id: &str) -> AppResult<()> {
@@ -203,10 +216,12 @@ pub fn set_starred(conn: &rusqlite::Connection, id: &str, starred: bool) -> AppR
 /// 收藏（starred）的任务不清理；candidate_edges/clusters 级联删除。
 pub fn delete_finished_older_than(conn: &rusqlite::Connection, days: u32) -> AppResult<usize> {
     let n = conn.execute(
+        // created_at 是 RFC3339（含 'T' 与 'Z'），datetime('now',…) 产出空格分隔格式；
+        // 直接字符串比较在同一天内会因 'T'(0x54)>' '(0x20) 误判。两侧都过 datetime() 归一为可比时刻。
         "DELETE FROM jobs
          WHERE status IN ('completed', 'failed', 'cancelled')
            AND starred = 0
-           AND created_at < datetime('now', ?1)",
+           AND datetime(created_at) < datetime('now', ?1)",
         [format!("-{days} days")],
     )?;
     Ok(n)

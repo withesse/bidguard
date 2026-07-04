@@ -139,3 +139,108 @@ pub fn assess_with(
         signals,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::report::Fingerprint;
+
+    fn cluster(docs: Vec<usize>) -> Cluster {
+        Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![] }
+    }
+    fn doc(flags: Vec<&str>) -> DocInfo {
+        DocInfo {
+            id: "d".into(),
+            name: "n".into(),
+            doc_type: "docx".into(),
+            pages: 1,
+            char_count: 100,
+            fingerprint: Fingerprint {
+                risk_flags: flags.into_iter().map(String::from).collect(),
+                ..Default::default()
+            },
+            parse_error: None,
+        }
+    }
+    fn weight_of(c: &Collusion, kind: &str) -> Option<f32> {
+        c.signals.iter().find(|s| s.kind == kind).map(|s| s.weight)
+    }
+
+    #[test]
+    fn empty_inputs_score_none() {
+        let c = assess_with(0.0, &[], &[], &[], &[]);
+        assert_eq!(c.level, "none");
+        assert_eq!(c.score, 0.0);
+        assert!(c.signals.is_empty());
+    }
+
+    #[test]
+    fn peak_below_floor_yields_no_similarity_signal() {
+        let c = assess_with(SIM_FLOOR - 0.01, &[], &[], &[], &[]);
+        assert!(weight_of(&c, "similarity").is_none());
+        assert_eq!(c.level, "none");
+    }
+
+    #[test]
+    fn full_peak_similarity_weight_is_max_and_medium() {
+        let c = assess_with(1.0, &[], &[], &[], &[]);
+        let w = weight_of(&c, "similarity").expect("应有相似度信号");
+        assert!((w - SIM_WEIGHT).abs() < 1e-6, "满峰值权重应为 SIM_WEIGHT");
+        assert_eq!(c.level, "medium"); // 0.40 ≥ LEVEL_MEDIUM(0.35)
+    }
+
+    #[test]
+    fn single_multi_doc_cluster_triggers_low() {
+        // 一个横跨 3 份文档的雷同条款：w = 0.1 + 0.3*(1/5) = 0.16 > LEVEL_LOW(0.1) → low
+        let c = assess_with(0.0, &[cluster(vec![0, 1, 2])], &[], &[], &[]);
+        let w = weight_of(&c, "cluster").expect("应有 cluster 信号");
+        assert!((w - 0.16).abs() < 1e-6);
+        assert_eq!(c.level, "low");
+    }
+
+    #[test]
+    fn two_doc_cluster_only_base_weight() {
+        // 仅跨 2 份文档（<CLUSTER_MULTI_DOCS）：走 else 分支，权重 = CLUSTER_BASE
+        let c = assess_with(0.0, &[cluster(vec![0, 1])], &[], &[], &[]);
+        let w = weight_of(&c, "cluster").expect("应有 cluster 信号");
+        assert!((w - CLUSTER_BASE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn metadata_needs_min_docs() {
+        let two = vec![doc(vec!["作者相同"]), doc(vec!["作者相同"])];
+        let c = assess_with(0.0, &[], &two, &[], &[]);
+        assert!((weight_of(&c, "metadata").unwrap() - META_WEIGHT).abs() < 1e-6);
+        // 仅 1 份带风险标记 → 不计元数据信号
+        let one = vec![doc(vec!["作者相同"]), doc(vec![])];
+        let c1 = assess_with(0.0, &[], &one, &[], &[]);
+        assert!(weight_of(&c1, "metadata").is_none());
+    }
+
+    #[test]
+    fn shared_terms_threshold() {
+        let mk = |n: usize| -> Vec<SharedTerm> {
+            (0..n).map(|i| SharedTerm { term: format!("t{i}"), docs: vec![0, 1] }).collect()
+        };
+        let at = assess_with(0.0, &[], &[], &mk(SHARED_TERMS_MIN), &[]);
+        assert!((weight_of(&at, "sharedTerms").unwrap() - SHARED_TERMS_WEIGHT).abs() < 1e-6);
+        let below = assess_with(0.0, &[], &[], &mk(SHARED_TERMS_MIN - 1), &[]);
+        assert!(weight_of(&below, "sharedTerms").is_none());
+    }
+
+    #[test]
+    fn price_proximity_signal() {
+        let pp = [PriceProximity { a: 0, b: 1, amount_a: 1_000_000, amount_b: 1_020_000, gap_pct: 0.02 }];
+        let c = assess_with(0.0, &[], &[], &[], &pp);
+        assert!((weight_of(&c, "facts").unwrap() - PRICE_WEIGHT).abs() < 1e-6);
+    }
+
+    #[test]
+    fn level_thresholds_high_medium_low_none() {
+        // 峰值满分(0.40) + 元数据(0.25) = 0.65 ≥ LEVEL_HIGH(0.6) → high
+        let two = vec![doc(vec!["作者相同"]), doc(vec!["作者相同"])];
+        let high = assess_with(1.0, &[], &two, &[], &[]);
+        assert_eq!(high.level, "high");
+        assert!(high.score <= 1.0, "score 必须 clamp 到 ≤1");
+    }
+}
