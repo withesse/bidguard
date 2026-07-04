@@ -31,21 +31,31 @@ npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.d
 - `src-tauri/binaries/`：`libpdfium.dylib`(macOS) / `pdfium.dll`(Windows x64) —— 鲁棒 PDF 解析。
   ⚠️ **macOS 仅 arm64(Apple 芯片)**：Intel/x86 不支持——ort/ONNX Runtime 无 x86_64-apple-darwin
   预编译库，Intel 支持需从源码编译 ONNX Runtime，不提供。
-  ⚠️ **Windows arm64 待验证**：随包 `pdfium.dll` 为 x64，arm64 上加载不了 → PDF 退到 pdf-extract
-  (扫描件 OCR 不可用)；且 ort 须有 aarch64-pc-windows-msvc 预编译库否则该 target 构建会失败。
-  补 arm64 Windows 完整支持需 arm64 版 pdfium.dll(来源：pdfium-binaries，选 win-arm64)。
+  ⚠️ **Windows 仅 x64**：Win11-on-ARM 可用系统自带 x64 仿真运行此 x64 包（Win10-on-ARM 无 x64
+  仿真，不支持）。暂不出原生 arm64——并非 ort 所限（ort 确有 `aarch64-pc-windows-msvc` 静态预编译库），
+  而是需 MSVC ARM64 工具链 + 仅 NSIS 打包（WiX/MSI 不支持 arm64）+ 换 arm64 版 `pdfium.dll`，成本暂不做。
   ⚠️ **Linux 暂不构建**（用户决定）；若恢复需补 `libpdfium.so`(pdfium-binaries，选 linux-x64)。
 - `src-tauri/models/`：PaddleOCR ONNX（检测 + 识别）+ 中文字典 —— 扫描件 OCR
 
-二者通过 `tauri.conf.json` 的 `bundle.resources` 打进安装包；运行时按候选目录解析
+以上通过 `tauri.conf.json` 的 `bundle.resources`（`models/**/*`）打进安装包；运行时按候选目录解析
 （dev：`src-tauri/`；macOS：`*.app/Contents/Resources`；Windows：exe 同级；Linux：`../lib`）。
-语义 embedding 模型（multilingual-e5-small, ~120MB）首次使用时在线下载并缓存到
-`~/.fastembed_cache`（已在 `.gitignore` 排除）。
+
+### 语义 embedding 模型（三种来源，按优先级）
+
+1. **随包内置**（推荐默认档 `bge-small-zh-v1.5`，~95MB）：把 5 个文件放进
+   `src-tauri/models/embeddings/<id>/` 即随安装包内置、开箱离线可用。放法与提取步骤见
+   `src-tauri/models/embeddings/README.md`。运行时以 fastembed user-defined 方式加载，pooling
+   对齐后向量与下载版逐位等价。
+2. **自托管下载**（大模型 bge-large/e5-*，1~2GB 不宜内置）：把 5 个文件打成 `.tar` 传到可控 URL，
+   填 `embed.rs` 的 `EmbedModelSpec.download_url`；工具屏「下载」即走该源（离线内网友好），落地
+   `~/.cache/bidguard/embeddings/<id>/`。
+3. **HF 联网下载**（回落）：1/2 都没有时，`security.allowCloudModel=true` 下由 fastembed 从
+   HuggingFace 拉取，缓存到 `~/.cache/bidguard/fastembed/`（应在 `.gitignore` 排除）。默认关闭。
 
 ## CI / 发布
 
 - `.github/workflows/ci.yml`：push / PR 时跑前端构建 + 引擎测试（macOS runner）。
-- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(arm64) / Windows(x64, arm64)
+- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(arm64) / Windows(x64)
   构建并发布为 GitHub Release 草稿。
 
 ```bash

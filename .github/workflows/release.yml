@@ -1,11 +1,16 @@
 name: release
 
 # 打 tag（v*）或手动触发 → 构建并发布到 GitHub Release（草稿）。
-# 目标：macOS(arm64) + Windows(x64, arm64)。暂不构建 Linux。
+# 目标：macOS(arm64) + Windows(x64)。暂不构建 Linux / Windows arm64。
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布 tag（如 v0.5.1）；手动触发必填，tag 推送时忽略"
+        required: false
+        default: ""
 
 # 创建 Release 需要写权限
 permissions:
@@ -20,14 +25,9 @@ jobs:
           # macOS 原生 aarch64(Apple 芯片)。Intel/x86 不支持：ort 无 x86_64-apple-darwin 预编译库。
           - platform: macos-latest
             args: ""
-          # Windows x64
+          # Windows x64。Win11-on-ARM 靠系统 x64 仿真运行此包；暂不出原生 arm64(见 BUILD.md)。
           - platform: windows-latest
             args: ""
-          # Windows arm64(交叉编译)。⚠️ 待实测：ort 需有 aarch64-pc-windows-msvc 预编译库，
-          # 且随包 pdfium.dll 为 x64 → arm64 上 PDF 会退到 pdf-extract(扫描件 OCR 不可用)，见 BUILD.md。
-          - platform: windows-latest
-            args: "--target aarch64-pc-windows-msvc"
-            rust-target: aarch64-pc-windows-msvc
           # 暂不构建 Linux(用户决定)
     runs-on: ${{ matrix.platform }}
     steps:
@@ -39,12 +39,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: 交叉编译目标(如 Windows arm64)
-        if: matrix.rust-target
-        run: rustup target add ${{ matrix.rust-target }}
-
       - name: 安装前端依赖
-        run: npm install
+        run: npm ci
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -57,8 +53,9 @@ jobs:
           #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
           #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "BidGuard ${{ github.ref_name }}"
+          # tag 推送时 ref_name 即 tag；手动触发时用 inputs.tag（否则 ref_name=分支名会建出错误 tag）
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "BidGuard ${{ github.event.inputs.tag || github.ref_name }}"
           releaseBody: "原本 · 标书查重 —— 本地标书交叉比对与围标识别。发布草稿后 latest.json 才对旧版本生效。"
           releaseDraft: true
           prerelease: false
