@@ -27,7 +27,7 @@ serde_json = "1"
 
 # 引擎依赖（纯 Rust，无系统库依赖）
 zip = { version = "2", default-features = false, features = ["deflate"] } # 解 docx(zip)
-quick-xml = "0.36"   # 解析 docx 正文与元数据 XML
+quick-xml = "0.39"   # 解析 docx 正文与元数据 XML
 jieba-rs = "0.7"     # 中文分词
 pdf-extract = "0.7"  # PDF 文本抽取回落（纯 Rust，文本型 PDF）
 pdfium-render = "0.8" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
