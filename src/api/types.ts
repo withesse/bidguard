@@ -303,3 +303,22 @@ export interface DiagnosticItem {
   ok: boolean;
   detail: string;
 }
+
+// —— 授权 / 激活（与 Rust license::LicenseStatus 对应）——
+export interface LicenseStatusDto {
+  /** trial | licensed | grace | expired | exhausted | machineMismatch | unlicensed */
+  state: string;
+  /** 是否可用（trial / licensed / grace）；false 时路由守卫拦到激活页 */
+  active: boolean;
+  plan: string | null;
+  licenseeName: string | null;
+  expiresAt: string | null;
+  /** null = 不限次 */
+  remainingUses: number | null;
+  usedUses: number | null;
+  trialExpiresAt: string | null;
+  machineCode: string;
+  clockTamper: boolean;
+  tamper: boolean;
+  message: string | null;
+}

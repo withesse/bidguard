@@ -7,6 +7,7 @@ mod engine;
 pub mod error;
 mod export;
 pub mod jobs;
+pub mod license;
 pub mod services;
 pub mod state;
 #[cfg(test)]
@@ -74,7 +75,9 @@ pub fn run() {
                 }
                 Err(e) => log::error!("启动清理取连接失败：{e}"),
             }
-            app.manage(state::AppState::new(pool));
+            // 授权装载：指纹 + 状态双写读取 + 已装许可验签 + 启动次数对账（进程被杀致未退款的补退）
+            let license = std::sync::Arc::new(license::LicenseManager::load(&base, &pool));
+            app.manage(state::AppState::new(pool, license));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -107,6 +110,9 @@ pub fn run() {
             commands::compare::get_cluster_detail,
             commands::compare::set_cluster_review_status,
             commands::compare::get_pair_detail,
+            commands::license::get_license_status,
+            commands::license::get_machine_code,
+            commands::license::import_license,
             commands::settings::get_app_settings,
             commands::settings::set_app_settings,
             commands::settings::get_app_info,

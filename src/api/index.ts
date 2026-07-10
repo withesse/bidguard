@@ -4,6 +4,7 @@ import type {
   AnnotationDto,
   AppInfoDto,
   DiagnosticItem,
+  LicenseStatusDto,
   ModelStatusDto,
   StorageInfoDto,
   ClusterDetailDto,
@@ -116,6 +117,13 @@ export const getStorageInfo = () => call<StorageInfoDto>("get_storage_info");
 export const clearEmbeddingCache = () => call<number>("clear_embedding_cache");
 export const vacuumDb = () => call<void>("vacuum_db");
 export const runDiagnostics = () => call<DiagnosticItem[]>("run_diagnostics");
+
+// —— 授权 / 激活 ——
+export const getLicenseStatus = () => call<LicenseStatusDto>("get_license_status");
+export const getMachineCode = () => call<string>("get_machine_code");
+/** input：armored 许可文本（粘贴）或本机 .lic 文件路径。 */
+export const importLicense = (input: string) =>
+  call<LicenseStatusDto>("import_license", { input });
 
 // —— 设置 / 模板 / 应用信息 ——
 export const getAppSettings = () => call<Record<string, unknown> | null>("get_app_settings");

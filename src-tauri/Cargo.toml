@@ -54,3 +54,9 @@ unicode-normalization = "0.1.25"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 calamine = { version = "0.35.0", features = ["dates"] }
+
+# 授权/激活（license 模块）：纯 Rust，无系统库依赖
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] } # 许可验签（仅公钥）
+hmac = "0.13"          # 授权状态文件 tamper-evidence（配 sha2 0.11 / digest 0.11）
+data-encoding = "2"    # 许可 base64url / 机器码 base32(Crockford)
+machine-uid = "0.5"    # 机器指纹锚（macOS IOPlatformUUID / Windows MachineGuid）

@@ -1,7 +1,9 @@
 // 路由表：Hash 路由（Tauri 生产环境用自定义协议加载，BrowserRouter 刷新会丢路径）。
 // 结果屏 Matrix/Compare/Export 原生消费 DTO（useCompareSummary / 按需 getPairDetail），适配层已移除。
+import type { ReactNode } from "react";
 import {
   createHashRouter,
+  Navigate,
   Outlet,
   useLocation,
   useNavigate,
@@ -13,7 +15,8 @@ import { Button, Pill } from "../components/primitives";
 import { C } from "../design/tokens";
 import { useTheme } from "../theme";
 import type { Screen } from "../routes";
-import { useCompareSummary } from "../queries/data";
+import { useCompareSummary, useLicenseStatus } from "../queries/data";
+import { Activate } from "../screens/Activate";
 import { typeUi } from "../utils/clusterUi";
 import { WorkspaceList } from "../screens/WorkspaceList";
 import { CompareSetup } from "../screens/CompareSetup";
@@ -64,9 +67,22 @@ function Layout() {
       }}
     >
       <Sidebar active={activeKey(pathname)} onNav={(k) => nav(NAV_PATH[k as NavKey] ?? "/")} />
-      <Outlet />
+      <LicenseGate>
+        <Outlet />
+      </LicenseGate>
     </div>
   );
+}
+
+/** 授权守卫：未激活/到期/用尽（active=false）时，除激活页外一律拦到 /activate。
+ *  授权判定在 Rust 层强制，这里仅为 UX 引导（前端不可信）。状态未加载时不拦截，避免闪烁。 */
+function LicenseGate({ children }: { children: ReactNode }) {
+  const { pathname } = useLocation();
+  const { data, isLoading } = useLicenseStatus();
+  if (!isLoading && data && !data.active && pathname !== "/activate") {
+    return <Navigate to="/activate" replace />;
+  }
+  return <>{children}</>;
 }
 
 /** 结果屏壳：各屏原生消费 DTO（useCompareSummary / 按需 getPairDetail），onGo 映射为路由跳转。 */
@@ -214,6 +230,7 @@ export const router = createHashRouter([
     errorElement: <RouteError />,
     children: [
       { path: "/", element: <WorkspaceList /> },
+      { path: "/activate", element: <Activate /> },
       { path: "/starred", element: <JobsList title="我的任务" mode="starred" /> },
       { path: "/history", element: <JobsList title="历史记录" mode="all" /> },
       { path: "/library", element: <Library /> },

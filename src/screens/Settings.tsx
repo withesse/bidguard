@@ -7,9 +7,16 @@ import { Button, Toggle, SegControl } from "../components/primitives";
 import { useTheme, type FontScale, type Highlight } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
-import { useAppInfo, useAppSettings, useSaveAppSettings } from "../queries/data";
+import {
+  useAppInfo,
+  useAppSettings,
+  useLicenseStatus,
+  useSaveAppSettings,
+} from "../queries/data";
 import { relaunchApp, runUpdate, type UpdateState } from "../utils/updater";
 import { type Scope } from "../prefs";
+import { useNavigate } from "react-router-dom";
+import type { LicenseStatusDto } from "../api/types";
 
 const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy", "spacious"];
 const SCOPES: Scope[] = ["full", "tech", "business"];
@@ -61,6 +68,8 @@ export function Settings() {
   const { data: cfgRaw } = useAppSettings();
   const saveCfg = useSaveAppSettings();
   const { data: appInfo } = useAppInfo();
+  const { data: license } = useLicenseStatus();
+  const nav = useNavigate();
   const embeddingModels = appInfo?.embeddingModels ?? [];
   const cmp = useMemo(() => {
     const patch =
@@ -156,6 +165,38 @@ export function Settings() {
       <Topbar title="设置" sub="检测偏好与外观" />
       <div style={{ flex: 1, overflow: "auto", padding: "28px 48px 40px" }}>
         <div style={{ maxWidth: 720, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
+          {/* 授权状态 */}
+          <Card title="授权" cardBg={cardBg} border={border} mute={mute}>
+            <Row
+              label="授权状态"
+              sub={licenseSub(license)}
+              ink={ink}
+              mute={mute}
+              last
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {license && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: licenseUi(license.state).fg,
+                      background: licenseUi(license.state).bg,
+                      padding: "3px 9px",
+                      borderRadius: 999,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {licenseUi(license.state).label}
+                  </span>
+                )}
+                <Button kind="secondary" size="sm" onClick={() => nav("/activate")}>
+                  管理授权
+                </Button>
+              </div>
+            </Row>
+          </Card>
+
           {/* 检测偏好 */}
           <Card title="检测偏好（新任务默认值）" cardBg={cardBg} border={border} mute={mute}>
             <Row label="默认比对范围" sub="新任务默认比对的标段" ink={ink} mute={mute}>
@@ -408,6 +449,46 @@ export function Settings() {
       </div>
     </div>
   );
+}
+
+function licenseUi(state: string): { label: string; fg: string; bg: string } {
+  switch (state) {
+    case "licensed":
+      return { label: "已授权", fg: C.ok, bg: C.okSoft };
+    case "trial":
+      return { label: "试用中", fg: C.warn, bg: C.warnSoft };
+    case "grace":
+      return { label: "宽限期", fg: C.warn, bg: C.warnSoft };
+    case "exhausted":
+      return { label: "次数用尽", fg: C.danger, bg: C.dangerSoft };
+    case "expired":
+      return { label: "已到期", fg: C.danger, bg: C.dangerSoft };
+    case "machineMismatch":
+      return { label: "未绑定本机", fg: C.danger, bg: C.dangerSoft };
+    default:
+      return { label: "未激活", fg: C.danger, bg: C.dangerSoft };
+  }
+}
+
+function licenseSub(st: LicenseStatusDto | undefined): string {
+  if (!st) return "读取中…";
+  const days = (iso: string | null) =>
+    iso ? Math.max(0, Math.ceil((new Date(iso).getTime() - Date.now()) / 86_400_000)) : null;
+  if (st.state === "trial") {
+    const d = days(st.trialExpiresAt);
+    const parts: string[] = [];
+    if (st.remainingUses != null) parts.push(`剩余 ${st.remainingUses} 次`);
+    if (d != null) parts.push(`${d} 天后到期`);
+    return "免费试用 · " + parts.join(" · ");
+  }
+  if (st.state === "licensed" || st.state === "grace") {
+    const parts: string[] = [];
+    if (st.licenseeName) parts.push(st.licenseeName);
+    parts.push(st.remainingUses != null ? `剩余 ${st.remainingUses} 次` : "不限次数");
+    if (st.expiresAt) parts.push(`${days(st.expiresAt)} 天后到期`);
+    return parts.join(" · ");
+  }
+  return st.message ?? "请激活后使用";
 }
 
 function Card({

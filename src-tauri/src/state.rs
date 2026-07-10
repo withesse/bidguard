@@ -2,12 +2,15 @@
 use crate::db::DbPool;
 use crate::engine::embed::LoadedEmbedder;
 use crate::jobs::JobManager;
+use crate::license::LicenseManager;
 use jieba_rs::Jieba;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct AppState {
     pub db: DbPool,
     pub jobs: JobManager,
+    /// 授权管理器（Arc：失败退款 sink 需在任务线程持有）。所有授权决策在 Rust 层。
+    pub license: Arc<LicenseManager>,
     jieba: OnceLock<Arc<Jieba>>,
     /// 语义模型槽位：(已加载 model_id, 实例)；换模型时由 embed::ensure 重载。
     /// Mutex 同时充当推理互斥。
@@ -15,10 +18,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: DbPool) -> Self {
+    pub fn new(db: DbPool, license: Arc<LicenseManager>) -> Self {
         Self {
             db,
             jobs: JobManager::new(),
+            license,
             jieba: OnceLock::new(),
             embedder: Arc::new(Mutex::new(None)),
         }

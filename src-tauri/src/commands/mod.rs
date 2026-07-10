@@ -4,6 +4,7 @@ pub mod compare;
 pub mod document;
 pub mod export;
 pub mod job;
+pub mod license;
 pub mod settings;
 pub mod tools;
 pub mod workspace;

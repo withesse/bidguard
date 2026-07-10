@@ -96,11 +96,21 @@ pub async fn start_compare(
     let config_json = serde_json::to_string(&run)
         .map_err(|e| AppError::new(AppErrorCode::InvalidConfig, "配置序列化失败").with_detail(e.to_string()))?;
 
+    // 授权闸门：校验通过才消费次数（无效请求已在上方拒绝，绝不扣次）。
+    // 消费在 spawn 之前；spawn 失败或任务未 completed 时退款（见下 RefundSink / spawn Err 分支）。
+    let grant = state.license.check_and_consume(&state.db)?;
+
     let jieba = state.jieba();
     let embedder = state.embedder();
-    let sink = Arc::new(TauriEventSink::new(app));
+    // 失败退款装饰：任务终态非 completed（失败/取消）→ 退还次数（幂等）
+    let sink: Arc<dyn crate::jobs::progress::ProgressSink> = Arc::new(crate::license::RefundSink::new(
+        Arc::new(TauriEventSink::new(app)),
+        state.license.clone(),
+        state.db.clone(),
+        grant.clone(),
+    ));
     let ws = workspace_id.clone();
-    state.jobs.spawn(
+    let spawned = state.jobs.spawn(
         &state.db,
         sink,
         &workspace_id,
@@ -108,7 +118,19 @@ pub async fn start_compare(
         Some(&name),
         &config_json,
         move |ctx| compare_service::run_compare(ctx, jieba, embedder, &ws, &run),
-    )
+    );
+    match spawned {
+        Ok(job) => {
+            // 审计关联 job_id（尽力而为）
+            state.license.attach_job(&state.db, &grant, &job.id);
+            Ok(job)
+        }
+        Err(e) => {
+            // spawn 同步失败（如 JobConflict）：execute 未运行、RefundSink 不会触发 → 立即退款
+            state.license.refund(&state.db, grant);
+            Err(e)
+        }
+    }
 }
 
 /// 总览：任务行 + 参评文档（按位次）+ 五块聚合 JSON。

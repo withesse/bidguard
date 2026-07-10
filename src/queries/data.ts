@@ -28,6 +28,19 @@ export function useAppInfo() {
   return useQuery({ queryKey: ["appInfo"], queryFn: api.getAppInfo, staleTime: Infinity });
 }
 
+// —— 授权 / 激活 ——
+export function useLicenseStatus() {
+  return useQuery({ queryKey: ["license"], queryFn: api.getLicenseStatus, staleTime: 5_000 });
+}
+
+export function useImportLicense() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: string) => api.importLicense(input),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["license"] }),
+  });
+}
+
 // —— 工具：模型 / 存储 / 自检 ——
 export function useModelStatus() {
   return useQuery({ queryKey: ["modelStatus"], queryFn: api.getModelStatus });
@@ -249,7 +262,11 @@ export function useStartCompare(workspaceId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (request: CompareRequest) => api.startCompare(workspaceId, request),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ["jobs"] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["jobs"] });
+      // 起了一次比对即消费一次次数，刷新授权状态卡的剩余次数
+      void qc.invalidateQueries({ queryKey: ["license"] });
+    },
   });
 }
 

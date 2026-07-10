@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     DROP_UNUSED_EDGE_INDEXES_V9,
     CLUSTER_MEMBERS_INDEX_V10,
     DOC_TRUNCATION_NOTICE_V11,
+    LICENSE_USAGE_V12,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -320,6 +321,24 @@ CREATE INDEX IF NOT EXISTS idx_cluster_members_doc ON cluster_members(document_i
 // 正文参与比对，多份截断件的相同提示会被聚成假 same 雷同条款并触发假围标信号。旧行为 NULL。
 const DOC_TRUNCATION_NOTICE_V11: &str = "
 ALTER TABLE documents ADD COLUMN truncation_notice TEXT;
+";
+
+// V12：按次授权的使用审计表（license_usage）。
+// 强制计数在 HMAC 状态文件（license::state，DB 可被直接改写不作数）；本表仅为审计与
+// 「失败退款 / 启动对账」的落点：消费时插一行 consumed，任务失败/取消时置 refunded。
+// 无外键到 jobs（job 删除后审计仍应留存；对账按 job 现状态判定）。
+const LICENSE_USAGE_V12: &str = "
+CREATE TABLE license_usage (
+  id         TEXT PRIMARY KEY,
+  license_id TEXT NOT NULL,
+  job_id     TEXT,
+  kind       TEXT NOT NULL,        -- licensed | trial
+  state      TEXT NOT NULL,        -- consumed | refunded
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_license_usage_job ON license_usage(job_id);
+CREATE INDEX idx_license_usage_state ON license_usage(state);
 ";
 
 #[cfg(test)]
