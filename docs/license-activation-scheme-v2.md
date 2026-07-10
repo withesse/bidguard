@@ -446,6 +446,51 @@ CREATE TABLE license_usage (
 
 ---
 
+## 11. 正式化 checklist（发布前必做）
+
+> 现状：MVP 已实机验证通过（试用→激活→已授权），但内嵌的是**开发公钥** `lic-dev-2026a`，keygen 与开发私钥在本地 scratchpad。**未经本清单不可对外发布**——A 组为硬性阻断项，未完成则任何人用泄漏的开发私钥即可伪造合法许可。
+
+### A. 密钥换发（硬性阻断，未完成不得发布）
+- [ ] 离线机（不联网、非 CI）执行 `bidguard-keygen genkey --kid lic-2026a` 生成正式密钥对
+- [ ] 正式私钥离线加密保管（age/GPG + 硬件密钥），**绝不进任何仓库 / CI / 云盘 / 聊天工具**
+- [ ] 用正式公钥替换 `src-tauri/src/license/keys.rs` 的 `TRUSTED_KEYS`：kid 改 `lic-2026a`，移除 `lic-dev-2026a`
+- [ ] 销毁 scratchpad 的 `lic-dev-2026a.priv` 并视开发钥为已泄漏（本文档、对话记录里出现过其种子）
+- [ ] `FP_SALT` / `STATE_HMAC_SALT` 一次性定稿（改动会使既有激活/试用状态失效，发布后不可再改）
+
+### B. 签发工具与服务端隔离
+- [ ] keygen 从 scratchpad 迁入独立**私有**仓库 `bidguard-license-server`（连签发台账）
+- [ ] 建立签发台账：`licenseId ↔ 客户名 ↔ 机器码 ↔ 期限/次数 ↔ 签发日`（换绑与撤销依据）
+- [ ] 与更新签名私钥 `TAURI_SIGNING_PRIVATE_KEY` 区分：license 私钥**不**进 GH Secrets
+- [ ] 换绑流程文档化：凭旧 `licenseId` 免费换绑，1 次/90 天、累计 3 次（§5.3）
+
+### C. 代码签名与防篡改（防二进制 patch 的前置）
+- [ ] macOS：Developer ID 签名 + 公证（notarization）——无签名构建削弱一切防篡改假设
+- [ ] Windows：Authenticode 签名
+- [ ] `tauri.conf.json` 的 `bundle.macOS.signingIdentity` 由 secrets 注入，本地保持 ad-hoc
+
+### D. 参数固化（发布前定稿）
+- [ ] 试用值：`license/mod.rs` 的 `TRIAL_DAYS=7` / `TRIAL_USES=10` 最终确认（影响存量首装）
+- [ ] `clock.rs::ROLLBACK_TOLERANCE=48h` 与签发默认 `graceDays` 确认
+- [ ] 商业形态×定价映射（plan × 期限 × 次数）写入签发台账模板
+
+### E. CI / 仓库卫生
+- [ ] CI 不携带任何 license 私钥；`tests/license_flow.rs` 的 `BIDGUARD_DEV_PRIV` gated 测试在无私钥时自动跳过（现状如此，CI 恒绿）
+- [ ] 确认 `*.priv` / `*.lic` / scratchpad 密钥不会被误提交（检查忽略规则，勿改 .gitignore 除非必要）
+- [ ] 换钥后重跑 `cargo test` + `tsc` + `vite build` 全绿
+
+### F. 发布前回归验收（换钥后逐条实测）
+- [ ] **正式私钥**对真机机器码签发 .lic → 导入 → 已授权
+- [ ] **开发钥**签的旧 .lic 导入 → 被拒（`LicenseInvalid`），确认开发钥彻底失效
+- [ ] 全新机（无状态文件）首启 → 试用态；次数用尽/到期 → 拒绝 + 路由守卫拦到激活页
+- [ ] 一次失败/取消任务 → 次数自动退回；进程被杀留下的 consumed → 启动对账补退
+- [ ] 篡改状态文件（手改 usedCount）→ HMAC 失配回落另一副本严格值；换机导入 → `LicenseMachineMismatch`
+- [ ] 已知残余（不阻断发布，v1.1 服务端锚定关闭）：删双写两份 + 重装 = 试用可重置；时钟冻结可吃满 lease/宽限
+
+### 不在本清单（v1.1+ 再做）
+在线激活 + 心跳续租 + 服务端席位/试用锚定；真实指纹组件位（SMBIOS UUID）；报告水印溯源；硬件绑定状态（SE/DPAPI）；离线激活文件交换。
+
+---
+
 ### 附：与旧方案（离线 Ed25519 机器码+激活码）的差异摘要
 
 | | 旧方案 | 本方案 |
