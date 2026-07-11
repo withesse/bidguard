@@ -294,6 +294,14 @@ pub struct Cluster {
     pub peak: f32,
     pub docs: Vec<usize>,
     pub segments: Vec<ClusterSeg>,
+    /// k-共现查证（W3-3）：本簇经查证命中招标/背景库属合法共享 → 退出围标信号②计数
+    /// （不再按「≥3 家共有强雷同」加分）。默认 false。
+    #[serde(default)]
+    pub exempted: bool,
+    /// k-共现查证（W3-3）：≥3 家共有且两库皆查不到出处、查证质量闸门通过 → 归入独立
+    /// multiDocAnomaly 信号（不计入信号②，不自动 high）。默认 false。
+    #[serde(default)]
+    pub anomaly: bool,
 }
 
 /// 围标判定的单条信号。

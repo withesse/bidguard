@@ -38,8 +38,37 @@ pub struct NewCluster {
     /// 底版分块的位置（「第一章 › 1.1 报价」格式），供列表行内展示
     pub base_section_path: Option<String>,
     pub base_page: Option<i64>,
+    /// k-共现查证（W3-3）：命中招标（'tender'）/背景库（'background'）的合法共享出处；None=未豁免。
+    pub exempt_reason: Option<String>,
+    /// k-共现查证（W3-3）：两库皆查不到出处且查证质量闸门通过 → true（『多家异常一致·待复核』）。
+    pub multi_doc_anomaly: bool,
     pub members: Vec<NewMember>,
     pub diffs: Vec<NewDiff>,
+}
+
+/// 招标文件对减的豁免证据（W3-2）：一个投标分块「引用招标文件」的覆盖率与覆盖区间。
+pub struct NewExemption {
+    pub chunk_id: String,
+    pub kind: String, // tender | background
+    pub coverage: f32,
+    pub spans_json: String,
+}
+
+/// 批量写入 job 级豁免证据（chunk_exemptions）。调用方需已开启事务。
+/// 同 (job,chunk,kind) 幂等覆盖（INSERT OR REPLACE），重跑不重复堆积。
+pub fn insert_exemptions(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+    exemptions: &[NewExemption],
+) -> AppResult<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO chunk_exemptions (job_id, chunk_id, kind, coverage, spans_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for e in exemptions {
+        stmt.execute(params![job_id, e.chunk_id, e.kind, e.coverage, e.spans_json])?;
+    }
+    Ok(())
 }
 
 pub fn insert_edges(conn: &rusqlite::Connection, job_id: &str, edges: &[NewEdge]) -> AppResult<()> {
@@ -76,8 +105,9 @@ pub fn insert_clusters(
     let now = now_iso();
     let mut ins_cluster = conn.prepare(
         "INSERT INTO clusters (id, job_id, cluster_type, topic, summary, severity, score,
-         section_kind, conflict_json, base_section_path, base_page, review_status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12)",
+         section_kind, conflict_json, base_section_path, base_page, exempt_reason,
+         multi_doc_anomaly, review_status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14)",
     )?;
     let mut ins_member = conn.prepare(
         "INSERT INTO cluster_members (cluster_id, document_id, chunk_id, role, score)
@@ -102,6 +132,8 @@ pub fn insert_clusters(
             c.conflict_json,
             c.base_section_path,
             c.base_page,
+            c.exempt_reason,
+            c.multi_doc_anomaly as i64,
             now
         ])?;
         for m in &c.members {
@@ -125,9 +157,12 @@ pub fn insert_clusters(
 }
 
 /// 清理某任务的全部比对产物（取消/失败/重跑前调用）。clusters 级联清 members/diffs。
+/// chunk_exemptions 的 job_id 外键 ON DELETE CASCADE 仅在删 job 行时触发，delete_job_results
+/// 保留 job 行、只清结果，故显式删除（否则取消/重跑会残留上次的豁免证据）。
 pub fn delete_job_results(conn: &rusqlite::Connection, job_id: &str) -> AppResult<()> {
     conn.execute("DELETE FROM candidate_edges WHERE job_id = ?1", [job_id])?;
     conn.execute("DELETE FROM clusters WHERE job_id = ?1", [job_id])?;
+    conn.execute("DELETE FROM chunk_exemptions WHERE job_id = ?1", [job_id])?;
     Ok(())
 }
 
@@ -141,6 +176,12 @@ pub struct ClusterFilter {
     pub review_status: Option<String>,
     pub section_kind: Option<String>,
     pub document_id: Option<String>,
+    /// 按豁免出处筛选（W3-3）：'tender' | 'background'（精确匹配）。
+    pub exempt_reason: Option<String>,
+    /// 仅「多家异常一致·待复核」簇（W3-3）：Some(true)=只看异常簇。
+    pub multi_doc_anomaly: Option<bool>,
+    /// 仅「恰好两家共有」簇（W3-3 首要证据视图）：Some(true)=只看跨 2 份文档的簇。
+    pub two_docs_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +200,10 @@ pub struct ClusterSummaryRow {
     pub page: Option<i64>,
     pub document_ids: Vec<String>,
     pub member_count: i64,
+    /// k-共现查证（W3-3）：命中招标（'tender'）/背景库（'background'）→ 合法共享，UI 置灰；None=未豁免。
+    pub exempt_reason: Option<String>,
+    /// k-共现查证（W3-3）：『多家异常一致·待复核』标记，前端红色徽标、可筛。
+    pub multi_doc_anomaly: bool,
 }
 
 /// 动态过滤条件。占位符从 ?start 开始编号——调用方的固定参数占用 ?1..?(start-1)，
@@ -176,12 +221,22 @@ fn filter_sql(f: &ClusterFilter, start: usize) -> (String, Vec<String>) {
     add("cl.severity", &f.severity, &mut binds, &mut cond);
     add("cl.review_status", &f.review_status, &mut binds, &mut cond);
     add("cl.section_kind", &f.section_kind, &mut binds, &mut cond);
+    add("cl.exempt_reason", &f.exempt_reason, &mut binds, &mut cond);
     if let Some(doc) = &f.document_id {
         binds.push(doc.clone());
         cond.push_str(&format!(
             " AND EXISTS (SELECT 1 FROM cluster_members m WHERE m.cluster_id = cl.id AND m.document_id = ?{})",
             start + binds.len() - 1
         ));
+    }
+    // 布尔筛选无需绑定参数（W3-3）：多家异常一致 / 仅两家共有（跨 2 份文档）。
+    if f.multi_doc_anomaly == Some(true) {
+        cond.push_str(" AND cl.multi_doc_anomaly = 1");
+    }
+    if f.two_docs_only == Some(true) {
+        cond.push_str(
+            " AND (SELECT COUNT(DISTINCT m.document_id) FROM cluster_members m WHERE m.cluster_id = cl.id) = 2",
+        );
     }
     (cond, binds)
 }
@@ -218,7 +273,8 @@ pub fn list_clusters(
         "SELECT cl.id, cl.job_id, cl.cluster_type, cl.topic, cl.summary, cl.severity, cl.score,
          cl.section_kind, cl.review_status, cl.base_section_path, cl.base_page,
          (SELECT GROUP_CONCAT(DISTINCT m.document_id) FROM cluster_members m WHERE m.cluster_id = cl.id),
-         (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id)
+         (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id),
+         cl.exempt_reason, cl.multi_doc_anomaly
          FROM clusters cl WHERE cl.job_id = ?1{cond}
          ORDER BY CASE cl.severity
             WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2
@@ -249,6 +305,8 @@ pub fn list_clusters(
                     .map(|s| s.split(',').map(str::to_string).collect())
                     .unwrap_or_default(),
                 member_count: r.get(12)?,
+                exempt_reason: r.get(13)?,
+                multi_doc_anomaly: r.get::<_, i64>(14)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -279,6 +337,9 @@ pub struct MemberDetailRow {
     pub order_index: i64,
     pub role: String,
     pub score: Option<f64>,
+    /// 引用招标文件覆盖率（W3-2）：该成员分块命中招标指纹的字符占比；
+    /// 非豁免块为 None。前端对 ≥0.8 的块显示「引用招标文件 · 覆盖 xx%」徽标。
+    pub tender_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,7 +368,8 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
             "SELECT cl.id, cl.job_id, cl.cluster_type, cl.topic, cl.summary, cl.severity, cl.score,
              cl.section_kind, cl.review_status, cl.base_section_path, cl.base_page,
              (SELECT GROUP_CONCAT(DISTINCT m.document_id) FROM cluster_members m WHERE m.cluster_id = cl.id),
-             (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id)
+             (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id),
+             cl.exempt_reason, cl.multi_doc_anomaly
              FROM clusters cl WHERE cl.id = ?1",
             [cluster_id],
             |r| {
@@ -328,6 +390,8 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
                         .map(|s| s.split(',').map(str::to_string).collect())
                         .unwrap_or_default(),
                     member_count: r.get(12)?,
+                    exempt_reason: r.get(13)?,
+                    multi_doc_anomaly: r.get::<_, i64>(14)? != 0,
                 })
             },
         )
@@ -339,16 +403,19 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
         .optional()?
         .flatten();
 
+    // LEFT JOIN 招标豁免（同任务、tender kind）：命中块附覆盖率，供前端徽标。
     let mut stmt = conn.prepare(
         "SELECT m.document_id, d.file_name, m.chunk_id, c.text, c.section_path, c.section_kind,
-         c.page, c.order_index, m.role, m.score
+         c.page, c.order_index, m.role, m.score, ce.coverage
          FROM cluster_members m
          JOIN chunks c ON c.id = m.chunk_id
          JOIN documents d ON d.id = m.document_id
+         LEFT JOIN chunk_exemptions ce
+           ON ce.chunk_id = m.chunk_id AND ce.job_id = ?2 AND ce.kind = 'tender'
          WHERE m.cluster_id = ?1 ORDER BY m.document_id, c.order_index",
     )?;
     let members = stmt
-        .query_map([cluster_id], |r| {
+        .query_map(params![cluster_id, cluster.job_id], |r| {
             Ok(MemberDetailRow {
                 document_id: r.get(0)?,
                 document_name: r.get(1)?,
@@ -360,6 +427,7 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
                 order_index: r.get(7)?,
                 role: r.get(8)?,
                 score: r.get(9)?,
+                tender_coverage: r.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -402,6 +470,10 @@ pub struct ExportRow {
     pub review_status: String,
     pub section_kind: Option<String>,
     pub conflict_json: Option<String>,
+    /// k-共现查证（W3-3）：命中招标/背景库的合法共享出处（'tender'|'background'）；None=未豁免。
+    pub exempt_reason: Option<String>,
+    /// k-共现查证（W3-3）：『多家异常一致·待复核』标记。
+    pub multi_doc_anomaly: bool,
     pub document_id: String,
     pub text: String,
     pub page: Option<i64>,
@@ -412,7 +484,7 @@ pub struct ExportRow {
 pub fn export_rows(conn: &rusqlite::Connection, job_id: &str) -> AppResult<Vec<ExportRow>> {
     let mut stmt = conn.prepare(
         "SELECT cl.id, cl.cluster_type, cl.severity, cl.topic, cl.summary, cl.score,
-         cl.review_status, cl.section_kind, cl.conflict_json,
+         cl.review_status, cl.section_kind, cl.conflict_json, cl.exempt_reason, cl.multi_doc_anomaly,
          m.document_id, c.text, c.page, c.section_path, m.role
          FROM clusters cl
          JOIN cluster_members m ON m.cluster_id = cl.id
@@ -435,11 +507,13 @@ pub fn export_rows(conn: &rusqlite::Connection, job_id: &str) -> AppResult<Vec<E
                 review_status: r.get(6)?,
                 section_kind: r.get(7)?,
                 conflict_json: r.get(8)?,
-                document_id: r.get(9)?,
-                text: r.get(10)?,
-                page: r.get(11)?,
-                section_path: r.get(12)?,
-                role: r.get(13)?,
+                exempt_reason: r.get(9)?,
+                multi_doc_anomaly: r.get::<_, i64>(10)? != 0,
+                document_id: r.get(11)?,
+                text: r.get(12)?,
+                page: r.get(13)?,
+                section_path: r.get(14)?,
+                role: r.get(15)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

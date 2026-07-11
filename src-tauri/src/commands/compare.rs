@@ -30,6 +30,7 @@ pub struct CompareRequest {
     pub ignore_templates: Option<bool>,
     pub detect_moved_paragraph: Option<bool>,
     pub scope: Option<String>,
+    pub subtract_tender: Option<bool>,
     pub embedding_model: Option<String>,
 }
 
@@ -89,6 +90,7 @@ pub async fn start_compare(
             .detect_moved_paragraph
             .unwrap_or(d.detect_moved_paragraph),
         scope,
+        subtract_tender: request.subtract_tender.unwrap_or(d.subtract_tender),
         embedding_model: request.embedding_model.unwrap_or(d.embedding_model),
         allow_model_download: cfg_all.security.allow_cloud_model,
     };

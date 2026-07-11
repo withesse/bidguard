@@ -20,7 +20,7 @@ import {
 import type { AnnotationDto } from "../api/types";
 import { NoteEditor } from "../components/NoteEditor";
 import { docTag } from "../utils/docTag";
-import { REVIEW_UI, severityUi, typeUi } from "../utils/clusterUi";
+import { REVIEW_UI, severityUi, typeUi, zoneUi } from "../utils/clusterUi";
 
 interface ConflictJson {
   risk: string;
@@ -101,6 +101,7 @@ export function ClusterDetail() {
   const c = data.cluster;
   const t = typeUi(c.clusterType);
   const sev = severityUi(c.severity);
+  const zone = zoneUi(c.sectionKind);
   const rv = REVIEW_UI[c.reviewStatus] ?? REVIEW_UI.pending;
   // 成员按文档位次排序，primary 优先
   const members = [...data.members].sort((a, b) => {
@@ -134,6 +135,9 @@ export function ClusterDetail() {
           <Pill fg={t.fg} bg={t.bg} size={11} weight={700}>
             {t.label}
           </Pill>
+          <Pill fg={zone.fg} bg={zone.bg} size={11}>
+            {zone.label}
+          </Pill>
           {sev && sev.label && (
             <Pill fg={sev.fg} bg={sev.bg} size={11}>
               {sev.label}
@@ -143,6 +147,72 @@ export function ClusterDetail() {
             <span style={{ fontSize: 12, color: mute }}>组内平均相似 {Math.round(c.score * 100)}%</span>
           )}
         </div>
+
+        {/* 分区阈值说明（W3-5）：legal 区阈值已上调、price 区证据主体为金额事实冲突。 */}
+        {(c.sectionKind === "legal" || c.sectionKind === "price") && (
+          <div
+            style={{
+              background: "rgba(128,128,128,0.06)",
+              border: `1px solid ${border}`,
+              borderRadius: 10,
+              padding: "9px 14px",
+              fontSize: 11.5,
+              lineHeight: 1.7,
+              color: mute,
+            }}
+          >
+            {c.sectionKind === "legal" ? (
+              <>
+                <b style={{ color: ink }}>法定格式区</b>
+                {" · 相似阈值已上调（+12%），仅计法定格式套话雷同；法定格式内填空字段 / 错误一致属真信号，另走共同错误指纹，不受本阈值影响。"}
+              </>
+            ) : (
+              <>
+                <b style={{ color: ink }}>报价清单区</b>
+                {" · 该区证据主体是金额事实冲突（数值层），非文字雷同；文字相似仅供定位，请以金额差异为准。"}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* k-共现查证（W3-3）：豁免簇标注合法共享出处；异常簇『待复核』涉嫌措辞 + 评标委员会脚注。 */}
+        {c.exemptReason && (
+          <div
+            style={{
+              background: "rgba(128,128,128,0.08)",
+              border: `1px solid ${border}`,
+              borderRadius: 12,
+              padding: "11px 16px",
+              fontSize: 12,
+              color: mute,
+            }}
+          >
+            <span style={{ fontWeight: 700 }}>合法共享（已从围标信号与风险统计剔除）</span>
+            {" · "}
+            {c.exemptReason === "tender"
+              ? "多数成员经查证引用招标文件，属对招标条款的合法逐字应答。"
+              : "多数成员经查证为行业范本套话（内置背景范本库命中），非本场特有雷同。"}
+          </div>
+        )}
+        {c.multiDocAnomaly && (
+          <div
+            style={{
+              background: "rgba(192,57,43,0.07)",
+              border: "1px solid rgba(192,57,43,0.35)",
+              borderRadius: 12,
+              padding: "11px 16px",
+            }}
+          >
+            <div style={{ fontSize: 12.5, fontWeight: 700, color: "#C0392B", marginBottom: 6 }}>
+              涉嫌多家异常一致 · 待复核
+            </div>
+            <div style={{ fontSize: 12, lineHeight: 1.7, color: ink }}>
+              该段在 3 家及以上投标间高度雷同，且招标文件与行业范本库均未查得出处，涉嫌《招标投标法实施条例》
+              第四十条『投标文件异常一致』情形。此为线索级提示、非定性结论，未自动判为高风险，
+              <b>需评标委员会结合原文依法认定</b>，未命中不代表清白。
+            </div>
+          </div>
+        )}
 
         {/* 冲突解释 */}
         {conflict && (
@@ -352,6 +422,14 @@ function MemberPane({
           {sectionPath.join(" › ")}
           {m.page != null && ` · 第 ${m.page} 页`}
           {` · 段 ${m.orderIndex + 1}`}
+        </div>
+      )}
+      {/* W3-2 招标对减：引用招标文件的块置徽标（标记不删除，仍展示可解释）。 */}
+      {m.tenderCoverage != null && m.tenderCoverage >= 0.8 && (
+        <div>
+          <Pill fg="#7A5AB8" bg="rgba(122,90,184,0.13)" size={10}>
+            引用招标文件 · 覆盖 {Math.round(m.tenderCoverage * 100)}%
+          </Pill>
         </div>
       )}
       <div style={{ fontSize: 12.5, lineHeight: 1.8, color: ink, userSelect: "text" }}>

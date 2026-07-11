@@ -41,3 +41,16 @@ export const REVIEW_UI: Record<string, { label: string; fg: string }> = {
   confirmed: { label: "已确认", fg: "#0E9A8F" },
   ignored: { label: "已忽略", fg: "#75646C" },
 };
+
+// 五区（W3-5）章节分区展示约定：徽标文案 + 配色，ClustersScreen 筛选与 ClusterDetail 徽标共用。
+export const ZONE_UI: Record<string, { label: string; fg: string; bg: string }> = {
+  tech: { label: "技术标", fg: "#4A7FB5", bg: "rgba(74,127,181,0.12)" },
+  business: { label: "商务标", fg: "#8A5BA6", bg: "rgba(138,91,166,0.12)" },
+  legal: { label: "法定格式", fg: "#0E9A8F", bg: "rgba(14,154,143,0.12)" },
+  price: { label: "报价清单", fg: "#B06A3B", bg: "rgba(176,106,59,0.12)" },
+  other: { label: "其他", fg: "#75646C", bg: "rgba(117,100,108,0.10)" },
+};
+
+export function zoneUi(s: string | null | undefined) {
+  return (s && ZONE_UI[s]) || ZONE_UI.other;
+}

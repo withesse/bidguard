@@ -10,7 +10,7 @@ import { useTheme } from "../theme";
 import type { ClusterFilter, ClusterSummaryDto } from "../api/types";
 import { useClustersInfinite, useCompareSummary, useSetReviewStatus } from "../queries/data";
 import { docTag } from "../utils/docTag";
-import { REVIEW_UI, severityUi, typeUi } from "../utils/clusterUi";
+import { REVIEW_UI, severityUi, typeUi, zoneUi } from "../utils/clusterUi";
 
 const TYPE_FILTERS: Array<{ key: string | undefined; label: string }> = [
   { key: undefined, label: "全部" },
@@ -24,19 +24,36 @@ const TYPE_FILTERS: Array<{ key: string | undefined; label: string }> = [
   { key: "deleted", label: "基准独有" },
 ];
 
+// 五区筛选（W3-5）：标段分区。legal 阈值已上调、price 证据主体为金额事实冲突。
+const ZONE_FILTERS: Array<{ key: string | undefined; label: string }> = [
+  { key: undefined, label: "全部区" },
+  { key: "tech", label: "技术标" },
+  { key: "business", label: "商务标" },
+  { key: "legal", label: "法定格式" },
+  { key: "price", label: "报价清单" },
+  { key: "other", label: "其他" },
+];
+
 export function ClustersScreen() {
   const { wsId, jobId } = useParams<{ wsId: string; jobId: string }>();
   const nav = useNavigate();
   const { dark } = useTheme();
   const [typeKey, setTypeKey] = useState<string | undefined>(undefined);
+  const [zoneKey, setZoneKey] = useState<string | undefined>(undefined);
   const [onlyPending, setOnlyPending] = useState(false);
+  // k-共现查证（W3-3）快捷筛选：仅两家共有（首要证据视图）/ 仅多家异常一致（待复核）。
+  const [onlyTwoDocs, setOnlyTwoDocs] = useState(false);
+  const [onlyAnomaly, setOnlyAnomaly] = useState(false);
 
   const filter: ClusterFilter = useMemo(
     () => ({
       clusterType: typeKey,
+      sectionKind: zoneKey,
       reviewStatus: onlyPending ? "pending" : undefined,
+      twoDocsOnly: onlyTwoDocs ? true : undefined,
+      multiDocAnomaly: onlyAnomaly ? true : undefined,
     }),
-    [typeKey, onlyPending],
+    [typeKey, zoneKey, onlyPending, onlyTwoDocs, onlyAnomaly],
   );
   const { data: summary } = useCompareSummary(jobId);
   const q = useClustersInfinite(jobId, filter);
@@ -123,23 +140,68 @@ export function ClustersScreen() {
           );
         })}
         <span style={{ flex: 1 }} />
-        <span
-          role="button"
-          tabIndex={0}
-          onClick={() => setOnlyPending((v) => !v)}
-          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOnlyPending((v) => !v); } }}
-          style={{
-            fontSize: 11,
-            padding: "4px 10px",
-            borderRadius: 999,
-            cursor: "pointer",
-            color: onlyPending ? "var(--accent, #4F58A8)" : mute,
-            border: `1px solid ${onlyPending ? "var(--accent, #4F58A8)" : border}`,
-            fontWeight: onlyPending ? 700 : 500,
-          }}
-        >
-          只看待确认
-        </span>
+        <QuickToggle
+          label="仅两家共有"
+          active={onlyTwoDocs}
+          activeColor="var(--accent, #4F58A8)"
+          mute={mute}
+          border={border}
+          onToggle={() => setOnlyTwoDocs((v) => !v)}
+        />
+        <QuickToggle
+          label="多家异常一致"
+          active={onlyAnomaly}
+          activeColor="#C0392B"
+          mute={mute}
+          border={border}
+          onToggle={() => setOnlyAnomaly((v) => !v)}
+        />
+        <QuickToggle
+          label="只看待确认"
+          active={onlyPending}
+          activeColor="var(--accent, #4F58A8)"
+          mute={mute}
+          border={border}
+          onToggle={() => setOnlyPending((v) => !v)}
+        />
+      </div>
+
+      {/* 五区筛选（W3-5）：按标段分区过滤 */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "8px 24px",
+          borderBottom: `1px solid ${border}`,
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ fontSize: 11, color: mute, marginRight: 2 }}>标段</span>
+        {ZONE_FILTERS.map((f) => {
+          const active = zoneKey === f.key;
+          return (
+            <span
+              key={f.label}
+              role="button"
+              tabIndex={0}
+              onClick={() => setZoneKey(f.key)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setZoneKey(f.key); } }}
+              style={{
+                fontSize: 11,
+                padding: "4px 10px",
+                borderRadius: 999,
+                cursor: "pointer",
+                background: active ? "rgba(79,88,168,0.15)" : "transparent",
+                color: active ? "var(--accent, #4F58A8)" : mute,
+                border: `1px solid ${active ? "var(--accent, #4F58A8)" : border}`,
+                fontWeight: active ? 700 : 500,
+              }}
+            >
+              {f.label}
+            </span>
+          );
+        })}
       </div>
 
       {/* 虚拟列表 */}
@@ -212,7 +274,11 @@ function ClusterRow({
 }) {
   const t = typeUi(c.clusterType);
   const sev = severityUi(c.severity);
+  const zone = zoneUi(c.sectionKind);
   const review = REVIEW_UI[c.reviewStatus] ?? REVIEW_UI.pending;
+  // k-共现查证（W3-3）：豁免簇（合法共享）置灰、标出处；异常簇标『待复核·涉嫌一致』红徽标。
+  const exemptLabel =
+    c.exemptReason === "tender" ? "引用招标文件" : c.exemptReason === "background" ? "行业范本套话" : null;
   return (
     <div
       role="button"
@@ -221,20 +287,34 @@ function ClusterRow({
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}
       style={{
         background: cardBg,
-        border: `1px solid ${border}`,
+        border: `1px solid ${c.multiDocAnomaly ? "rgba(192,57,43,0.5)" : border}`,
         borderRadius: 10,
         padding: "11px 14px",
         cursor: "pointer",
         display: "flex",
         flexDirection: "column",
         gap: 7,
+        opacity: exemptLabel ? 0.55 : 1,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Pill fg={t.fg} bg={t.bg} size={10.5} weight={700}>
           {t.label}
         </Pill>
-        {sev && sev.label && (
+        <Pill fg={zone.fg} bg={zone.bg} size={10.5}>
+          {zone.label}
+        </Pill>
+        {exemptLabel && (
+          <Pill fg={mute} bg="rgba(128,128,128,0.14)" size={10.5}>
+            {`合法共享 · ${exemptLabel}`}
+          </Pill>
+        )}
+        {c.multiDocAnomaly && (
+          <Pill fg="#C0392B" bg="rgba(192,57,43,0.12)" size={10.5} weight={700}>
+            待复核 · 涉嫌多家异常一致
+          </Pill>
+        )}
+        {sev && sev.label && !c.multiDocAnomaly && (
           <Pill fg={sev.fg} bg={sev.bg} size={10.5}>
             {sev.label}
           </Pill>
@@ -301,6 +381,42 @@ function ClusterRow({
         )}
       </div>
     </div>
+  );
+}
+
+function QuickToggle({
+  label,
+  active,
+  activeColor,
+  mute,
+  border,
+  onToggle,
+}: {
+  label: string;
+  active: boolean;
+  activeColor: string;
+  mute: string;
+  border: string;
+  onToggle: () => void;
+}) {
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={onToggle}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(); } }}
+      style={{
+        fontSize: 11,
+        padding: "4px 10px",
+        borderRadius: 999,
+        cursor: "pointer",
+        color: active ? activeColor : mute,
+        border: `1px solid ${active ? activeColor : border}`,
+        fontWeight: active ? 700 : 500,
+      }}
+    >
+      {label}
+    </span>
   );
 }
 

@@ -49,6 +49,7 @@ export function CompareSetup() {
   const [semantic, setSemantic] = useState(false);
   const [factConflict, setFactConflict] = useState(true);
   const [ignoreTemplates, setIgnoreTemplates] = useState(true);
+  const [subtractTender, setSubtractTender] = useState(true);
   const [scopeIdx, setScopeIdx] = useState(0);
   const [levelIdx, setLevelIdx] = useState(1); // section/paragraph/sentence
   const [threshold, setThreshold] = useState(0.7);
@@ -78,6 +79,7 @@ export function CompareSetup() {
     if (typeof cmp.enableSemantic === "boolean") setSemantic(cmp.enableSemantic);
     if (typeof cmp.enableFactConflict === "boolean") setFactConflict(cmp.enableFactConflict);
     if (typeof cmp.ignoreTemplates === "boolean") setIgnoreTemplates(cmp.ignoreTemplates);
+    if (typeof cmp.subtractTender === "boolean") setSubtractTender(cmp.subtractTender);
     if (typeof cmp.similarityThreshold === "number") setThreshold(cmp.similarityThreshold);
     const si = ["full", "tech", "business"].indexOf(String(cmp.scope ?? ""));
     if (si >= 0) setScopeIdx(si);
@@ -188,6 +190,7 @@ export function CompareSetup() {
         enableSemantic: semantic,
         enableFactConflict: factConflict,
         ignoreTemplates,
+        subtractTender,
         similarityThreshold: threshold,
         scope: (["full", "tech", "business"] as const)[scopeIdx] ?? "full",
       });
@@ -209,6 +212,7 @@ export function CompareSetup() {
           enableSemantic: semantic,
           enableFactConflict: factConflict,
           ignoreTemplates,
+          subtractTender,
         },
       };
       await setWorkspaceSettings(wsId, JSON.stringify(patch));
@@ -418,7 +422,7 @@ export function CompareSetup() {
         <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 16 }}>
           <div style={{ fontSize: 12, fontWeight: 700, color: ink, marginBottom: 12 }}>检测设置</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <SettingRow label="比对范围" hint="技术标/商务标按段落关键词识别">
+            <SettingRow label="比对范围" hint="按段落关键词分五区（技术/商务/法定格式/报价清单/其他）；法定格式区阈值已上调只压套话雷同，报价清单区证据主体为金额事实冲突。商务范围含法定格式与报价清单段。">
               <SegControl options={["完整标书", "仅技术标", "仅商务标"]} value={scopeIdx < 0 ? 0 : scopeIdx} onChange={setScopeIdx} />
             </SettingRow>
             <SettingRow label="分块粒度" hint="章节粗看 / 段落均衡（推荐）/ 句子精查">
@@ -465,9 +469,20 @@ export function CompareSetup() {
             <SettingRow label="事实冲突检测" hint="同一条款金额/工期/日期不一致 → 风险标记">
               <Toggle on={factConflict} onChange={() => setFactConflict((v) => !v)} />
             </SettingRow>
-            <SettingRow label="忽略查重源样板" hint="命中查重源样板的段落不参与比对">
+            <SettingRow
+              label="忽略查重源样板"
+              hint="命中查重源样板、或内置范本背景库判定的行业套话（投标函/承诺书等法定格式）的段落不参与比对"
+            >
               <Toggle on={ignoreTemplates} onChange={() => setIgnoreTemplates((v) => !v)} />
             </SettingRow>
+            {tenderDocs.length > 0 && (
+              <SettingRow
+                label="剔除招标文件内容"
+                hint="识别投标对招标条款的合法逐字应答并从相似度中剥离；风险分级采用剔除后口径"
+              >
+                <Toggle on={subtractTender} onChange={() => setSubtractTender((v) => !v)} />
+              </SettingRow>
+            )}
             <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 4 }}>
               <Button kind="ghost" size="sm" onClick={saveAsWorkspaceDefault}>
                 保存为本工作区默认

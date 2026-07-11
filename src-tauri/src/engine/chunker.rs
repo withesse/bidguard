@@ -5,7 +5,7 @@ use crate::db::repo::chunk_repo::NewChunk;
 use crate::engine::features;
 use crate::engine::normalize::{self, NormalizeOptions};
 use crate::engine::parse::Block;
-use crate::engine::segment::{self, Section};
+use crate::engine::segment;
 use crate::engine::similarity::{cosine, tokenize_lang};
 use jieba_rs::Jieba;
 
@@ -381,13 +381,15 @@ fn make(
         }
     }
     let is_template = template_id.is_some();
-    let section_kind = match segment::classify(text) {
-        Section::Tech => "tech",
-        Section::Business => "business",
-        Section::Other => "other",
-    };
     let entities = features::extract_entities(&normalized);
     let ngrams = features::char_ngrams(&normalized);
+    // 五区分类（§5 W3-5）：标题路径优先于正文关键词；表格行且含金额实体 → price（数值层证据）。
+    // section_kind 落 chunks 表（TEXT 列直接容纳 legal/price 新值，无迁移）；旧库由 corpus 比对期重算兼容。
+    let titles: Vec<String> = ctx.stack.iter().map(|(_, t)| t.clone()).collect();
+    let has_amount = entities.iter().any(|e| e.kind == "amount");
+    let is_table_row = chunk_type == "table_row";
+    let section_kind =
+        segment::section_kind_str(segment::classify_zone(&titles, text, is_table_row, has_amount));
     NewChunk {
         chunk_type: chunk_type.to_string(),
         chunk_level: chunk_level.to_string(),

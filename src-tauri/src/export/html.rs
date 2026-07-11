@@ -156,6 +156,31 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 多家异常一致清单（W3-3）：≥3 家共有且招标文件与行业范本库均查不到出处的段落。
+    // §1.5：强制「涉嫌」措辞 +「需评标委员会依法认定」脚注，独立「待复核」，不并入高风险统计。
+    let anomalies: Vec<_> = data.clusters.iter().filter(|c| c.multi_doc_anomaly).collect();
+    if !anomalies.is_empty() {
+        let _ = write!(h, "<h2>多家异常一致清单（{} 处·待复核）</h2>", anomalies.len());
+        h.push_str(
+            "<p class=\"muted\">下列段落在 3 家及以上投标间高度雷同，且招标文件与行业范本库均未查得出处，\
+             涉嫌《招标投标法实施条例》第四十条『投标文件异常一致』情形。此为线索级提示、非定性结论，\
+             未自动判为高风险，需评标委员会结合原文依法认定，未命中不代表清白。</p>",
+        );
+        for c in &anomalies {
+            h.push_str("<div class=\"conf\">");
+            let _ = write!(
+                h,
+                "<b>#{} {}</b><span class=\"meta\">（涉嫌多家异常一致·待复核）</span>",
+                c.index,
+                e(c.topic.as_deref().unwrap_or(""))
+            );
+            for m in &c.members {
+                let _ = write!(h, "<div class=\"seg\"><span class=\"tag\">{}</span>{}</div>", m.tag, e(&m.text));
+            }
+            h.push_str("</div>");
+        }
+    }
+
     // 条款明细
     let shown = data.clusters.len().min(MAX_DETAIL_CLUSTERS);
     let _ = write!(h, "<h2>雷同条款明细（{} 组）</h2>", data.clusters.len());
@@ -187,6 +212,24 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
             docs.join("·"),
             review_cn(&c.review_status)
         );
+        // k-共现查证标记（W3-3）：豁免簇标注合法共享出处、异常簇标注待复核。
+        match c.exempt_reason.as_deref() {
+            Some("tender") => h.push_str("<p class=\"muted\">· 已核为引用招标文件的合法共享，不计入风险统计</p>"),
+            Some("background") => h.push_str("<p class=\"muted\">· 已核为行业范本套话的合法共享，不计入风险统计</p>"),
+            _ if c.multi_doc_anomaly => h.push_str(
+                "<p class=\"muted\">· 涉嫌多家异常一致（招标/范本库均无出处）·待复核，需评标委员会依法认定</p>",
+            ),
+            _ => {}
+        }
+        // 分区标注（§5 W3-5）：标注条款所属五区；legal 区附阈值上调口径、price 区附证据主体说明。
+        if let Some(sk) = c.section_kind.as_deref() {
+            let note = match sk {
+                "legal" => "（法定格式文本，阈值已上调，仅压套话雷同）",
+                "price" => "（证据主体为金额事实冲突，非文字雷同）",
+                _ => "",
+            };
+            let _ = write!(h, "<p class=\"muted\">· 分区：{}{}</p>", section_cn(sk), note);
+        }
         for m in &c.members {
             let page = m.page.map(|p| format!("<span class=\"meta\">（第 {p} 页）</span>")).unwrap_or_default();
             let _ = write!(h, "<div class=\"seg\"><span class=\"tag\">{}</span>{}{}</div>", m.tag, e(&m.text), page);

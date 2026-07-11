@@ -8,7 +8,9 @@ use crate::db::repo::document_repo::DocumentRow;
 use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
-use crate::engine::{candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring};
+use crate::engine::{
+    background, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring, winnow,
+};
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
 use crate::engine::embed::LoadedEmbedder;
@@ -33,6 +35,10 @@ pub struct CompareRunConfig {
     pub ignore_templates: bool,
     pub detect_moved_paragraph: bool,
     pub scope: String,
+    /// 招标文件对减（W3-2）：剥离投标对招标条款的合法逐字应答，风险分级用剔除后口径。
+    /// 旧任务 config_json 无此键 → 默认 true（口径与新任务一致；无招标文件时对减自然空转）。
+    #[serde(default = "default_true")]
+    pub subtract_tender: bool,
     /// 语义模型选择（compare.embeddingModel：bge-zh(默认) | bge-large-zh | e5-large | e5-small | e5-base）。
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -43,6 +49,10 @@ pub struct CompareRunConfig {
 
 fn default_embedding_model() -> String {
     "bge-zh".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 总览统计（jobs.summary_json）。
@@ -62,6 +72,19 @@ pub struct CompareSummary {
     pub uncertain_count: usize,
     pub high_risk_count: usize,
     pub semantic_degraded: bool,
+    /// 被识别为「引用招标文件」（覆盖率≥0.8）并从残差比对剔除的投标分块数（W3-2）。
+    /// 前端在矩阵摘要注明「已剔除招标文件引用 N 块」；0 表示无对减发生。
+    pub tender_ref_chunk_count: usize,
+    /// 被内置静态范本背景库判为「行业范本套话」（boiler_fraction≥0.6）并从聚类剔除的分块数（W3-4）。
+    /// 仅在 ignore_templates 开启时非零；0 表示无背景套话剔除。
+    pub background_exempt_chunk_count: usize,
+    // —— 分区分层五区簇计数（§5 W3-5）：含 deleted 在内的每个簇按 section_kind 归一区，
+    //    五者之和恒等于 cluster_count（catch-all 落 other）。
+    pub zone_legal_count: usize,
+    pub zone_price_count: usize,
+    pub zone_tech_count: usize,
+    pub zone_business_count: usize,
+    pub zone_other_count: usize,
 }
 
 /// 每 chunk 的可选语义向量（None=该 chunk 无嵌入，如模型缺失或文本为空）。
@@ -75,16 +98,74 @@ const EMBED_BATCH: usize = 128;
 const SHORT_TEXT_CHARS: usize = 30;
 const SHORT_TEXT_BUMP: f32 = 0.08;
 
-/// 一对分块的有效相似阈值：任一侧为短文本则上浮（封顶 0.98 防不可达）。
+// —— 分区分层阈值（§5 W3-5）常量集中区 ——
+/// 法定格式区（投标函 / 承诺 / 声明 / 资格审查等）阈值上浮：该类文本天然一致，抬高阈值只压
+/// 「法定格式套话」雷同——【不压】法定格式内填空字段 / 错误一致（那是真信号，走共同错误指纹，
+/// 本条只做阈值分层；边界见 docs §5 W3-5「风险」段）。
+const LEGAL_ZONE_BUMP: f32 = 0.12;
+/// zone 阈值上浮统一封顶（legal + 短文本叠加后），防阈值不可达。
+const ZONE_BUMP_CAP: f32 = 0.98;
+
+/// 一对分块的有效相似阈值：zone 感知（§5 W3-5）+ 短文本上浮（§9.5），封顶防不可达。
+/// · legal 区法定格式天然一致：阈值 +LEGAL_ZONE_BUMP，只压套话雷同——【不压】法定格式内填空
+///   字段 / 错误一致（那是真信号，走共同错误指纹，本条只做阈值分层，边界见 docs §5 W3-5「风险」段）；
+/// · price 区【维持现阈值】（docs §5 W3-5）：其证据链主体是事实冲突 / 金额通道（数值层 M6）而非
+///   文字雷同，故文本相似不做额外上浮、按基础阈值参与聚类，以保住「同一明细行金额不一致 →
+///   事实冲突」价值链（等 M6 数值层落地后再把 price 文本相似从围标口径中剥离）；
+/// · 短文本（任一侧 < SHORT_TEXT_CHARS）再 +SHORT_TEXT_BUMP；
+/// · tech/business/other 用基础阈值。
 fn effective_threshold(base: f32, a: &CmpChunk, b: &CmpChunk) -> f32 {
+    let mut t = base;
+    if a.section_kind == "legal" || b.section_kind == "legal" {
+        t += LEGAL_ZONE_BUMP;
+    }
     if a.char_count.min(b.char_count) < SHORT_TEXT_CHARS {
-        (base + SHORT_TEXT_BUMP).min(0.98)
-    } else {
-        base
+        t += SHORT_TEXT_BUMP;
+    }
+    t.min(ZONE_BUMP_CAP)
+}
+
+/// 比对范围（scope）与五区（§5 W3-5）的映射：business 家族含 legal/price。
+/// tech 范围 = tech + other（排除 business/legal/price）；business 范围 = 非 tech（含 business/
+/// legal/price/other）；完整（其他值）全保留。
+fn zone_in_scope(section_kind: &str, scope: &str) -> bool {
+    match scope {
+        "tech" => !matches!(section_kind, "business" | "legal" | "price"),
+        "business" => section_kind != "tech",
+        _ => true,
+    }
+}
+
+/// 簇 zone → summary 五区计数槽位（0=legal 1=price 2=tech 3=business 4=other，None/未知 → other）。
+/// catch-all 落 other 保证五区计数之和恒等于簇总数（验收 §5 W3-5 (4)）。
+fn zone_slot(section_kind: Option<&str>) -> usize {
+    match section_kind {
+        Some("legal") => 0,
+        Some("price") => 1,
+        Some("tech") => 2,
+        Some("business") => 3,
+        _ => 4,
     }
 }
 /// 视为「基准文档内容缺失」前，允许的最高近似分（有更高的近似 → uncertain 而非 deleted）
 const DELETED_FLOOR: f32 = 0.55;
+
+// —— k-共现过滤升级（W3-3）常量集中区 ——
+/// ≥N 家共有才进入 k-共现查证（与 collusion::CLUSTER_MULTI_DOCS 对齐）。
+const MULTI_DOC_MIN: usize = 3;
+/// ≥3 家共有簇的出处判定门槛：多数成员（严格 >50%）命中同一库即视为合法共享 → 豁免。
+const SHARED_EXEMPT_MAJORITY: f32 = 0.5;
+/// 「多家异常一致」升级的查证质量闸门（§1.5 铁律）：招标对减覆盖率抽样下限。抽样口径=参评
+/// 分块 tender_coverage 的最大值——招标文本若真被投标引用，至少有一块高覆盖；全场覆盖过低
+/// （招标件错传 / OCR 乱码打断 k-gram 链）则降级中性提示、不升级，防止用不可信索引做指控。
+const ANOMALY_COVERAGE_SAMPLE_FLOOR: f32 = 0.5;
+/// 异常簇 severity 值：独立「待复核」标记（渲染为「待复核」），不自动 high、不进 high 风险统计。
+const SEVERITY_REVIEW: &str = "review";
+/// 异常簇 summary 追加（§1.5：强制「涉嫌」措辞 + 评标委员会脚注；法条引用在 collusion 信号）。
+const ANOMALY_SUMMARY_SUFFIX: &str =
+    " · 涉嫌多家异常一致（招标文件与行业范本库均无出处），此为线索级提示、非定性结论，需评标委员会依法认定";
+/// 查证质量闸门未过（招标件 OCR/扫描件 或 覆盖率抽样过低）时的中性提示——不引法条、不升 severity。
+const NEUTRAL_SUMMARY_SUFFIX: &str = " · 多家共有段落，出处未能核实";
 
 pub fn run_compare(
     ctx: &JobCtx,
@@ -106,6 +187,20 @@ pub fn run_compare(
         }
     }
     r
+}
+
+/// 招标文件豁免物料（M4 接线）：一次加载招标/补遗文档产出四类对减依据——
+/// winnowing 指纹索引（残差矩阵/覆盖率）、rsid 集（含 rsidRoot）、内嵌图片 sha256 集、
+/// 共同错误豁免（tokens + 原文串）。`Some(_)` 即表示「工作区已导入招标文件且豁免对减生效」，
+/// 是条件化硬命中 floor 的启用前提（§1.5）。无招标文件/未开对减/索引为空时整体为 None。
+struct TenderRefs {
+    index: winnow::TenderIndex,
+    rsids: HashSet<String>,
+    image_hashes: HashSet<String>,
+    error_exempt: TenderExemption,
+    /// 任一参评招标文件为 OCR/扫描件（parse_method 含 "ocr"）——查证质量闸门（§1.5）：
+    /// OCR 错字打断精确 k-gram 指纹链，招标索引不可信 → 禁用「多家异常一致」升级，降级中性提示。
+    ocr: bool,
 }
 
 fn run_inner(
@@ -137,7 +232,79 @@ fn run_inner(
             .collect::<AppResult<Vec<_>>>()?
     };
 
+    // 1.5) 招标文件对减（W3-2 + M4 豁免接线）：加载本工作区招标/补遗文档，一次产出四类对减依据——
+    //   · winnowing 指纹索引（残差矩阵/覆盖率）；· rsid 集（含 rsidRoot，投标间共享但源自招标模板的
+    //     rsid 不再触发 rsid 信号）；· 内嵌图片 sha256 集（各家照贴招标方效果图/区位图不再触发 imageReuse）；
+    //   · 共同错误豁免 TenderExemption（源自招标文件的共同笔误不再触发 sharedErrors）。
+    // 无招标文件或未开对减时为 None，全流程退化为原口径（残差=全量、豁免集恒空，逐字节不变）。
+    let tender_refs: Option<TenderRefs> = if cfg.subtract_tender {
+        let conn = ctx.db.get()?;
+        let tenders =
+            document_repo::list_by_role(&conn, workspace_id, &["tender", "tender_supplement"])?;
+        let mut texts: Vec<String> = Vec::new();
+        let mut rsids: HashSet<String> = HashSet::new();
+        let mut image_hashes: HashSet<String> = HashSet::new();
+        let mut ex_tokens: HashSet<String> = HashSet::new();
+        let mut ex_text = String::new();
+        for t in &tenders {
+            if t.status != "parsed" {
+                continue; // 未解析成功的招标文件不贡献豁免依据
+            }
+            // rsid 集（含 rsidRoot）：招标模板下发的修订会话标识各家天然共享，须先减去
+            if let Some(fp) = t
+                .fingerprint_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Fingerprint>(s).ok())
+            {
+                rsids.extend(fp.rsids);
+                if let Some(root) = fp.rsid_root {
+                    rsids.insert(root);
+                }
+            }
+            // 内嵌图片 sha256：招标方统一提供的图片各家照贴属合规雷同
+            for img in image_repo::list_images(&conn, &t.id)? {
+                image_hashes.insert(img.sha256);
+            }
+            // 分块：winnow 指纹源（normalized）+ 共同错误豁免（token_json 与投标同口径、原文串供上下文子串匹配）
+            for row in chunk_repo::load_for_compare(&conn, &t.id, &cfg.chunk_level)? {
+                if let Some(toks) = row
+                    .token_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                {
+                    ex_tokens.extend(toks);
+                }
+                ex_text.push_str(&row.text);
+                ex_text.push('\n');
+                texts.push(row.normalized_text);
+            }
+        }
+        // 查证质量闸门（§1.5）：任一解析成功的招标文件为 OCR/扫描件 → 索引不可信。
+        let ocr = tenders
+            .iter()
+            .filter(|t| t.status == "parsed")
+            .any(|t| t.parse_method.as_deref().is_some_and(|m| m.contains("ocr")));
+        let index = winnow::TenderIndex::build(texts.iter().map(|s| s.as_str()));
+        // 索引为空（无实质招标内容）视为豁免不可用：退化为无对减、floor 不启用。
+        (!index.is_empty()).then_some(TenderRefs {
+            index,
+            rsids,
+            image_hashes,
+            error_exempt: TenderExemption { tokens: ex_tokens, normalized_text: ex_text },
+            ocr,
+        })
+    } else {
+        None
+    };
+    let tender_index: Option<&winnow::TenderIndex> = tender_refs.as_ref().map(|r| &r.index);
+
+    // 内置静态范本背景库（W3-4）：随包版本化、固定语料、双阈值 4-gram DF；进程级单例只算一次。
+    let bg = background::load();
+
     let mut comparable: Vec<CmpChunk> = Vec::new();
+    // 豁免证据：招标引用块（kind='tender'，标记不删除仍进 comparable）与背景套话块
+    // （kind='background'，从聚类剔除但落库置灰可解释）。随任务落库，供 UI/导出与人工复核。
+    let mut exemptions: Vec<compare_repo::NewExemption> = Vec::new();
     {
         let conn = ctx.db.get()?;
         for (di, d) in docs.iter().enumerate() {
@@ -148,19 +315,67 @@ fn run_inner(
                 // load_for_compare 已排除 heading（order_index 有空洞），直接用会使 rel_pos>1.0。
                 // rows 已按 order_index 排序，按加载顺序重编稠密序即可。
                 row.order_index = rank as i64;
-                let c = corpus::from_row(row, di, total);
-                // 比对范围：tech 排除商务段，business 排除技术段
-                let keep_scope = match cfg.scope.as_str() {
-                    "tech" => c.section_kind != "business",
-                    "business" => c.section_kind != "tech",
-                    _ => true,
+                // 招标覆盖率与背景占比都在 normalized_text 被 from_row 消费前算出（避免克隆全文）。
+                let (coverage, spans) = match tender_index {
+                    Some(idx) => winnow::coverage(&row.normalized_text, idx),
+                    None => (0.0, Vec::new()),
                 };
-                let keep_template = !(cfg.ignore_templates && c.is_template);
-                if keep_scope && keep_template && !c.tokens.is_empty() {
-                    comparable.push(c);
+                // 背景占比：ignore_templates 开启时用于套话剔除；已导入招标文件时另需它做 k-共现
+                // 出处查证（W3-3：≥3 家共有簇多数成员 boiler≥0.6 → background 豁免而非异常升级）。
+                // 两者皆不涉及时不计算（0.0），保冷启动确定性与 CPU。
+                let boiler = if cfg.ignore_templates || tender_index.is_some() {
+                    bg.boiler_fraction(&row.normalized_text)
+                } else {
+                    0.0
+                };
+                let mut c = corpus::from_row(row, di, total);
+                c.tender_coverage = coverage;
+                c.boiler_fraction = boiler;
+                // 比对范围（§5 W3-5）：business 家族含 legal/price，故 business 范围仍纳报价段。
+                let keep_scope = zone_in_scope(&c.section_kind, &cfg.scope);
+                if !keep_scope || c.tokens.is_empty() {
+                    continue;
                 }
+                // ignore_templates 语义扩展（W3-4）：样板余弦命中 OR 背景加权命中 → 不进聚类。
+                let bg_hit = boiler >= background::BOILER_FRACTION_EXEMPT;
+                if cfg.ignore_templates && (c.is_template || bg_hit) {
+                    // 背景加权命中：落 chunk_exemptions(kind='background') 证据（延续 is_template
+                    // 「标记不删除」哲学——簇里不出现，但 chunks 行保留、库中可见可解释、UI 置灰可筛）。
+                    // 纯样板余弦命中沿用 chunks.is_template 标记，不额外落库。
+                    if bg_hit {
+                        exemptions.push(compare_repo::NewExemption {
+                            chunk_id: c.id.clone(),
+                            kind: "background".into(),
+                            coverage: boiler,
+                            spans_json: "[]".into(),
+                        });
+                    }
+                    continue;
+                }
+                // 保留块：招标引用块（coverage≥0.8）记 tender 证据，仍进 comparable（全量口径可见），
+                // 残差口径靠边集减法剔除。
+                if coverage >= winnow::COVERAGE_EXEMPT {
+                    exemptions.push(compare_repo::NewExemption {
+                        chunk_id: c.id.clone(),
+                        kind: "tender".into(),
+                        coverage,
+                        spans_json: serde_json::to_string(&spans).unwrap_or_else(|_| "[]".into()),
+                    });
+                }
+                comparable.push(c);
             }
         }
+    }
+    // 背景库剔除的取证审计线（含语料版本+篇数）：支撑「同库同输入可复现、可举证」。
+    let background_exempt_count = exemptions.iter().filter(|e| e.kind == "background").count();
+    if background_exempt_count > 0 {
+        log::info!(
+            "背景范本库剔除 {background_exempt_count} 块（语料 {} · {} 篇 · boilerplate {} / legal {} 个 4-gram）",
+            background::CORPUS_VERSION,
+            bg.doc_count(),
+            bg.boiler_gram_count(),
+            bg.legal_gram_count(),
+        );
     }
     ctx.check()?;
     corpus::fill_tfidf(&mut comparable);
@@ -237,10 +452,31 @@ fn run_inner(
         );
     ctx.check()?;
 
-    // 5) 聚类
+    // 5) 聚类（招标对减双口径）：
+    //  · 残差簇 `raw`：剔除「双方 coverage≥0.8」的边（双方都在逐字引用招标 → 合法共享），
+    //    驱动分类/diff/围标/主矩阵与风险分级（剔除后口径）。
+    //  · 全量簇 `raw_full`：不对减，仅供 matrixOriginal/peakOriginal（原始相似度）。
+    //  无对减时残差即全量，raw_full=None，主矩阵直接复用（避免重复聚类，逐字节不变）。
     ctx.progress("cluster", 0, 1, "聚合雷同条款");
-    let mut raw = clustering::cluster(&comparable, &edges, cfg.similarity_threshold);
+    let exempt = |i: u32| comparable[i as usize].tender_coverage >= winnow::COVERAGE_EXEMPT;
+    let residual_edges: Option<Vec<ScoredEdge>> = tender_index.as_ref().map(|_| {
+        edges
+            .iter()
+            .filter(|e| !(exempt(e.a) && exempt(e.b)))
+            .map(|e| ScoredEdge { a: e.a, b: e.b, parts: e.parts })
+            .collect()
+    });
+    let mut raw = clustering::cluster(
+        &comparable,
+        residual_edges.as_deref().unwrap_or(&edges),
+        cfg.similarity_threshold,
+    );
     raw.truncate(MAX_STORE_CLUSTERS);
+    let raw_full: Option<Vec<clustering::RawCluster>> = residual_edges.as_ref().map(|_| {
+        let mut rf = clustering::cluster(&comparable, &edges, cfg.similarity_threshold);
+        rf.truncate(MAX_STORE_CLUSTERS);
+        rf
+    });
 
     // 6) 分类 + diff + 组装入库结构
     let base_idx = cfg
@@ -249,6 +485,27 @@ fn run_inner(
         .and_then(|id| docs.iter().position(|d| d.id == *id));
     let mut new_clusters =
         build_clusters(jieba, &comparable, &docs, &raw, base_idx, cfg.detect_moved_paragraph);
+
+    // 6.2) k-共现过滤升级（W3-3）：对 docs_present≥3 的每个残差簇逐成员查两库——命中招标/背景库
+    //   → 写 exempt_reason（合法共享，退出信号②/残差矩阵/high 统计，簇保留落库置灰可筛）；
+    //   两查皆空且查证质量闸门通过 → multi_doc_anomaly=1（『多家异常一致·待复核』，§1.5 不自动 high）。
+    // 查证质量闸门（§1.5）：招标文件已导入（tender_refs=Some）且非 OCR/扫描件（!ocr）且对减覆盖率
+    // 抽样达标（max tender_coverage ≥ FLOOR）时才允许升级；否则降级中性提示、不引法条、不升 severity。
+    // 无招标文件（tender_refs=None）→ 完全不标记，维持既有行为（冷启动/合成 docset 逐字节不变）。
+    let anomaly_gate_open = match tender_refs.as_ref() {
+        Some(r) if !r.ocr => {
+            comparable.iter().map(|c| c.tender_coverage).fold(0.0f32, f32::max)
+                >= ANOMALY_COVERAGE_SAMPLE_FLOOR
+        }
+        _ => false,
+    };
+    apply_shared_exemptions(
+        &comparable,
+        &raw,
+        &mut new_clusters,
+        tender_refs.is_some(),
+        anomaly_gate_open,
+    );
 
     // 6.5) 事实抽取与冲突检测：量化字段（金额/工期/日期/比例）跨文档不一致 → conflict
     let mut fact_rows: Vec<(String, fact::Fact)> = Vec::new();
@@ -282,18 +539,40 @@ fn run_inner(
         compare_repo::insert_edges(&tx, &ctx.job_id, &kept_edges)?;
         compare_repo::insert_clusters(&tx, &ctx.job_id, &new_clusters)?;
         compare_repo::insert_clusters(&tx, &ctx.job_id, &deleted)?;
+        compare_repo::insert_exemptions(&tx, &ctx.job_id, &exemptions)?;
         crate::db::repo::fact_repo::replace_for_chunks(&tx, &fact_rows)?;
         tx.commit()?;
     }
     ctx.check()?;
 
     // 8) 聚合：矩阵 / 章节热力 / 共有特征词 / 围标判定 / 总览
-    let (m, peak) = matrix::doc_matrix(docs.len(), &comparable, &raw);
+    // 主矩阵（残差·剔除后）：风险分级与围标信号①的唯一输入。k-共现豁免簇（引用招标/行业范本）
+    // 属合法共享，不得抬升残差矩阵/peak——从矩阵聚合剔除（异常簇仍保留：其为真嫌疑）。
+    // 无豁免簇时直接复用 raw（零克隆，冷启动/合成 docset 逐字节不变）。
+    let any_exempt = new_clusters.iter().any(|c| c.exempt_reason.is_some());
+    let (m, peak) = if any_exempt {
+        let kept: Vec<clustering::RawCluster> = raw
+            .iter()
+            .zip(new_clusters.iter())
+            .filter(|(_, nc)| nc.exempt_reason.is_none())
+            .map(|(rc, _)| rc.clone())
+            .collect();
+        matrix::doc_matrix(docs.len(), &comparable, &kept)
+    } else {
+        matrix::doc_matrix(docs.len(), &comparable, &raw)
+    };
+    // 原始矩阵（未对减）：仅供对照展示。无对减时与主矩阵同源，直接复用。
+    let (m_original, peak_original) = match &raw_full {
+        Some(rf) => matrix::doc_matrix(docs.len(), &comparable, rf),
+        None => (m.clone(), peak),
+    };
     let sections = section_stats(&comparable, &best);
     let shared = shared_terms_of(&comparable);
     // 共同错误指纹（词典外词/异常标点/错误引用）：跑在已有内存分块上，产出 kind="sharedErrors"
-    // 的 SharedTerm，与罕见词共用 shared_terms_json 通道。招标文件笔误豁免待 M4 接线，当前恒 None。
-    let shared_errors = shared_error_fingerprints(jieba, &comparable, None);
+    // 的 SharedTerm，与罕见词共用 shared_terms_json 通道。招标文件笔误豁免（M4 接线）：源自招标
+    // 文件的共同笔误/词元/悬空引用在检测侧减去，不再触发 sharedErrors。
+    let shared_errors =
+        shared_error_fingerprints(jieba, &comparable, tender_refs.as_ref().map(|r| &r.error_exempt));
 
     let mut doc_infos: Vec<DocInfo> = docs
         .iter()
@@ -315,13 +594,17 @@ fn run_inner(
         })
         .collect();
     fingerprint::cross_flags(&mut doc_infos);
-    // rsid 交集同源命中：豁免集合待 M4 招标文件对减接线，当前恒空
-    let exempt_rsids: HashSet<String> = HashSet::new();
-    let rsid_hits = fingerprint::rsid_pairs(&mut doc_infos, &exempt_rsids);
+    // rsid 交集同源命中（M4 接线）：先减去招标文件模板的 rsid 集（含 rsidRoot），投标间共享但
+    // 源自招标模板的 rsid 不再触发 rsid 信号；无招标文件时豁免集为空，行为不变。
+    let empty_hashes: HashSet<String> = HashSet::new();
+    let exempt_rsids: &HashSet<String> =
+        tender_refs.as_ref().map(|r| &r.rsids).unwrap_or(&empty_hashes);
+    let rsid_hits = fingerprint::rsid_pairs(&mut doc_infos, exempt_rsids);
     // PDF 血缘命中：trailer ID/XMP GUID（硬）、字体子集标签（中）；弱命中并入 metadata 标记
     let lineage_hits = fingerprint::lineage_pairs(&mut doc_infos);
     // 内嵌图片同源命中：加载参评文档图片指纹（与 docs 同序），两两跨文档碰撞
-    // （sha256 精确 / dHash 近似）。豁免集合待 M4 招标文件对减接线，当前恒空。
+    // （sha256 精确 / dHash 近似）。M4 接线：先减去招标文件图片 sha256 集，各家照贴招标方统一
+    // 提供的效果图/区位图不再触发 imageReuse；无招标文件时豁免集为空，行为不变。
     let doc_images: Vec<Vec<collusion::ImageFp>> = {
         let conn = ctx.db.get()?;
         docs.iter()
@@ -338,13 +621,17 @@ fn run_inner(
             })
             .collect::<AppResult<Vec<_>>>()?
     };
-    let exempt_hashes: HashSet<String> = HashSet::new();
-    let image_hits = collusion::image_pairs(&doc_images, &exempt_hashes);
+    let exempt_hashes: &HashSet<String> =
+        tender_refs.as_ref().map(|r| &r.image_hashes).unwrap_or(&empty_hashes);
+    let image_hits = collusion::image_pairs(&doc_images, exempt_hashes);
 
-    // 围标判定复用旧引擎的信号加权（输入适配为 report::Cluster）
+    // 围标判定复用旧引擎的信号加权（输入适配为 report::Cluster）。
+    // exempted/anomaly 取自 apply_shared_exemptions 落在 new_clusters 上的标记（与 raw 同序）：
+    // 豁免簇退出信号②，异常簇归入独立 multiDocAnomaly 信号（§1.5：不自动 high）。
     let r_clusters: Vec<RCluster> = raw
         .iter()
-        .map(|rc| {
+        .zip(new_clusters.iter())
+        .map(|(rc, nc)| {
             let docs_set: BTreeSet<usize> =
                 rc.members.iter().map(|&i| comparable[i as usize].doc).collect();
             RCluster {
@@ -359,6 +646,8 @@ fn run_inner(
                         text: comparable[i as usize].text.clone(),
                     })
                     .collect(),
+                exempted: nc.exempt_reason.is_some(),
+                anomaly: nc.multi_doc_anomaly,
             }
         })
         .collect();
@@ -378,6 +667,9 @@ fn run_inner(
         image_hits: &image_hits,
         shared_errors: &shared_errors,
         evasion: &evasion,
+        // 条件化硬命中 floor 启用前提（§1.5）：招标文件已导入且豁免对减已生效
+        // （tender_refs=Some ⇒ 上述三处豁免均已作用于本轮信号提取）。
+        tender_exemption_active: tender_refs.is_some(),
     });
 
     let mut summary = CompareSummary {
@@ -385,6 +677,8 @@ fn run_inner(
         chunk_count: comparable.len(),
         cluster_count: new_clusters.len() + deleted.len(),
         semantic_degraded,
+        tender_ref_chunk_count: exemptions.iter().filter(|e| e.kind == "tender").count(),
+        background_exempt_chunk_count: background_exempt_count,
         ..Default::default()
     };
     for c in new_clusters.iter().chain(deleted.iter()) {
@@ -398,15 +692,29 @@ fn run_inner(
             "conflict" => summary.conflict_count += 1,
             _ => summary.uncertain_count += 1,
         }
-        if c.severity == "high" {
+        // high 风险统计剔除 k-共现豁免簇（合法共享，§1.5）；异常簇 severity='review' 天然不计。
+        if c.severity == "high" && c.exempt_reason.is_none() {
             summary.high_risk_count += 1;
+        }
+        // 五区簇计数（§5 W3-5）：每簇归一区，五者之和恒等于 cluster_count。
+        match zone_slot(c.section_kind.as_deref()) {
+            0 => summary.zone_legal_count += 1,
+            1 => summary.zone_price_count += 1,
+            2 => summary.zone_tech_count += 1,
+            3 => summary.zone_business_count += 1,
+            _ => summary.zone_other_count += 1,
         }
     }
 
+    // 附录 A 冻结 schema：matrix(剔除后·主口径) + matrixOriginal(未对减) + peak/peakOriginal；
+    // mode="cluster"（M4a 不出区段口径）。segmentMatrix/segmentPeak 为 M5 追加键，此处不填。
     let matrix_json = serde_json::json!({
         "documentIds": cfg.document_ids,
         "matrix": m,
         "peak": peak,
+        "matrixOriginal": m_original,
+        "peakOriginal": peak_original,
+        "mode": "cluster",
     });
     // 罕见词 + 共同错误指纹并入同一 shared_terms_json 通道（错误条目 kind="sharedErrors"）
     let mut shared_out = shared;
@@ -646,11 +954,62 @@ fn build_clusters(
                 conflict_json: None,
                 base_section_path,
                 base_page,
+                exempt_reason: None,
+                multi_doc_anomaly: false,
                 members,
                 diffs,
             }
         })
         .collect()
+}
+
+/// k-共现过滤升级（W3-3）：对 docs_present≥3 的每个残差簇逐成员查两库并标记（raw 与 clusters
+/// 一一对应，build_clusters 保序映射）。
+///   · 多数成员 tender_coverage≥0.8 → exempt_reason='tender'（引用招标文件的合法共享）；
+///   · 否则多数成员 boiler_fraction≥0.6 → exempt_reason='background'（行业范本套话）；
+///   · 两查皆空且 anomaly_gate_open → multi_doc_anomaly=1、severity='review'（『待复核』），
+///     summary 追加「涉嫌…需评标委员会依法认定」（§1.5：不自动 high、不进 high 统计）；
+///   · 两查皆空但仅 tender_present（闸门未过：招标件 OCR/覆盖率过低）→ 中性提示，不升级；
+///   · 无招标文件 → 不标记，维持既有行为。
+/// 恰好 2 家共有的簇（docs_present<3）一律不动。
+fn apply_shared_exemptions(
+    chunks: &[CmpChunk],
+    raw: &[clustering::RawCluster],
+    clusters: &mut [NewCluster],
+    tender_present: bool,
+    anomaly_gate_open: bool,
+) {
+    for (rc, nc) in raw.iter().zip(clusters.iter_mut()) {
+        let members: Vec<&CmpChunk> = rc.members.iter().map(|&i| &chunks[i as usize]).collect();
+        let docs_present: BTreeSet<usize> = members.iter().map(|c| c.doc).collect();
+        if docs_present.len() < MULTI_DOC_MIN {
+            continue;
+        }
+        let n = members.len() as f32;
+        let tender_frac = members
+            .iter()
+            .filter(|c| c.tender_coverage >= winnow::COVERAGE_EXEMPT)
+            .count() as f32
+            / n;
+        let bg_frac = members
+            .iter()
+            .filter(|c| c.boiler_fraction >= background::BOILER_FRACTION_EXEMPT)
+            .count() as f32
+            / n;
+        if tender_frac > SHARED_EXEMPT_MAJORITY {
+            nc.exempt_reason = Some("tender".into());
+        } else if bg_frac > SHARED_EXEMPT_MAJORITY {
+            nc.exempt_reason = Some("background".into());
+        } else if anomaly_gate_open {
+            nc.multi_doc_anomaly = true;
+            nc.severity = SEVERITY_REVIEW.into();
+            let base = nc.summary.take().unwrap_or_default();
+            nc.summary = Some(format!("{base}{ANOMALY_SUMMARY_SUFFIX}"));
+        } else if tender_present {
+            let base = nc.summary.take().unwrap_or_default();
+            nc.summary = Some(format!("{base}{NEUTRAL_SUMMARY_SUFFIX}"));
+        }
+    }
 }
 
 /// 事实冲突：对每个跨文档 cluster 的 primary 成员抽取事实，量化字段不一致 → conflict。
@@ -816,6 +1175,8 @@ fn build_deleted(
                     Some(c.section_path.join(" › "))
                 },
                 base_page: c.page.map(|p| p as i64),
+                exempt_reason: None,
+                multi_doc_anomaly: false,
                 members: vec![NewMember {
                     document_id: docs[base_idx].id.clone(),
                     chunk_id: c.id.clone(),
@@ -1166,6 +1527,7 @@ mod tests {
             ignore_templates: true,
             detect_moved_paragraph: true,
             scope: "full".into(),
+            subtract_tender: true,
             embedding_model: "e5-small".into(),
             allow_model_download: false,
         }
@@ -2071,7 +2433,77 @@ mod tests {
             minhash: vec![],
             entities,
             tfidf: HashMap::new(),
+            tender_coverage: 0.0,
+            boiler_fraction: 0.0,
         }
+    }
+
+    // —— 分区分层阈值（§5 W3-5）——
+
+    fn zoned(doc: usize, text: &str, kind: &str) -> CmpChunk {
+        let mut c = ecmp(doc, text, &[], vec![], vec![]);
+        c.section_kind = kind.into();
+        c
+    }
+
+    #[test]
+    fn effective_threshold_legal_bump_and_price_gate() {
+        let base = 0.7f32;
+        let long = "字".repeat(40); // 40 字 > SHORT_TEXT_CHARS → 无短文本上浮，隔离 zone 效应
+        // tech 区：基础阈值不变 → 同相似度 0.75 的段对照常聚类（0.75 ≥ 0.70）。
+        let (ta, tb) = (zoned(0, &long, "tech"), zoned(1, &long, "tech"));
+        assert!((effective_threshold(base, &ta, &tb) - base).abs() < 1e-6);
+        assert!(0.75 >= effective_threshold(base, &ta, &tb), "tech 区 0.75 应聚类");
+        // legal 区：阈值 +0.12 → 0.82，相似度 0.75 不聚类。
+        let (la, lb) = (zoned(0, &long, "legal"), zoned(1, &long, "legal"));
+        let lt = effective_threshold(base, &la, &lb);
+        assert!((lt - 0.82).abs() < 1e-6, "legal 阈值应为 0.82，实际 {lt}");
+        assert!(0.75 < lt, "legal 区 0.75 不应聚类");
+        // price 区：维持现阈值（docs §5 W3-5）——不上浮、不阻断，按基础阈值参与聚类，保住
+        // 「同一明细行金额不一致 → 事实冲突」价值链（数值层 M6 落地后再从围标口径剥离 price 文本相似）。
+        let (pa, pb) = (zoned(0, &long, "price"), zoned(1, &long, "price"));
+        assert!((effective_threshold(base, &pa, &pb) - base).abs() < 1e-6, "price 区应维持基础阈值");
+    }
+
+    #[test]
+    fn effective_threshold_legal_short_text_capped() {
+        // legal + 短文本叠加封顶 ZONE_BUMP_CAP（0.9+0.12+0.08=1.10 → 0.98），防阈值不可达。
+        let (a, b) = (zoned(0, "短句", "legal"), zoned(1, "短句", "legal"));
+        assert!((effective_threshold(0.9, &a, &b) - ZONE_BUMP_CAP).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zone_in_scope_business_family_and_tech() {
+        // business 范围含 legal/price（验收 (3)：scope=business 仍含报价段）。
+        for k in ["business", "legal", "price", "other"] {
+            assert!(zone_in_scope(k, "business"), "business 范围应含 {k}");
+        }
+        assert!(!zone_in_scope("tech", "business"));
+        // tech 范围排除 business 家族（含 legal/price）。
+        assert!(zone_in_scope("tech", "tech"));
+        assert!(zone_in_scope("other", "tech"));
+        for k in ["business", "legal", "price"] {
+            assert!(!zone_in_scope(k, "tech"), "tech 范围应排除 {k}");
+        }
+        // 完整范围全保留。
+        assert!(zone_in_scope("price", "full"));
+    }
+
+    #[test]
+    fn zone_slot_partition_sums_to_total() {
+        // 五区槽位互斥且穷尽：任意 section_kind 序列五区计数之和 = 序列长度（验收 (4)）。
+        let kinds = [
+            Some("legal"), Some("price"), Some("tech"), Some("business"),
+            Some("other"), None, Some("weird"),
+        ];
+        let mut counts = [0usize; 5];
+        for k in kinds {
+            counts[zone_slot(k)] += 1;
+        }
+        assert_eq!(counts.iter().sum::<usize>(), kinds.len());
+        assert_eq!(counts[0], 1, "legal");
+        assert_eq!(counts[1], 1, "price");
+        assert_eq!(counts[4], 3, "other + None + 未知值 均归 other");
     }
 
     #[test]
@@ -2232,5 +2664,621 @@ mod tests {
             collusion2.signals.iter().all(|s| s.kind != "evasion"),
             "清白工作区不产生 evasion 信号（不做检查通过背书）"
         );
+    }
+
+    // —— W3-2 招标文件对减：winnowing 双口径矩阵 + chunk_exemptions ——
+
+    /// 招标文件 T + 两份大量逐字引用 T 且另有私有雷同段的投标 A/B：
+    /// 断言 matrixOriginal > matrix、残差簇不含引用段文本、chunk_exemptions 行数=引用块数。
+    #[test]
+    fn tender_subtraction_splits_matrix_and_records_exemptions() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "招标对减").unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+
+        // 招标条款（一整段，逐字被两家引用）；含独特串「出厂合格证明」供残差断言。
+        let tender_clause = "招标人要求所有投标人严格按照本章技术规范逐项应答，全部核心设备必须为原厂全新正品并随附完整的出厂合格证明与第三方检验报告，投标文件须对本节全部技术条款作出实质性响应，不得存在任何负偏离，否则将按无效投标处理并不予评审。";
+        // 私有雷同段（A/B 完全相同，招标文件中不存在）。
+        let private_clause = "本公司组建了一支经验丰富的专业实施团队，建立了覆盖需求分析、开发测试、上线运维全周期的质量管理体系与应急响应机制，确保项目按期高质量交付验收。";
+
+        let dir = std::env::temp_dir().join(format!("bg_sub_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, content).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let tender_path = write("招标文件.txt", tender_clause);
+        // 首行「投标单位」各异 → 文件 hash 不同 → 两份独立投标文档（否则同 hash 去重成一份）。
+        let bid_a = write(
+            "投标A.txt",
+            &format!("投标单位甲：华信智联科技有限公司\n{tender_clause}\n{private_clause}"),
+        );
+        let bid_b = write(
+            "投标B.txt",
+            &format!("投标单位乙：启明数字技术有限公司\n{tender_clause}\n{private_clause}"),
+        );
+
+        // 招标文件以 tender 角色导入（不参评），投标以 bid 角色导入。
+        let ictx_t = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx_t, jieba.clone(), &ws, &[tender_path], &Default::default(), "tender").unwrap();
+        let ictx_b = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx_b, jieba.clone(), &ws, &[bid_a, bid_b], &Default::default(), "bid").unwrap();
+
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            ["投标A.txt", "投标B.txt"]
+                .iter()
+                .map(|n| docs.iter().find(|d| &d.file_name == n).unwrap().id.clone())
+                .collect()
+        };
+
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        let cfg = cfg_with(ids.clone(), 0.5); // subtract_tender 默认 true
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg).unwrap();
+        let job_id = cctx.job_id.clone();
+
+        // (1)(4) matrix_json 双口径：对角线均为 1，matrixOriginal[0][1] > matrix[0][1]。
+        let v: serde_json::Value = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.matrix_json.unwrap()).unwrap()
+        };
+        let m: Vec<Vec<f32>> = serde_json::from_value(v["matrix"].clone()).unwrap();
+        let mo: Vec<Vec<f32>> = serde_json::from_value(v["matrixOriginal"].clone()).unwrap();
+        assert!((m[0][0] - 1.0).abs() < 1e-6 && (m[1][1] - 1.0).abs() < 1e-6, "matrix 对角线应为 1");
+        assert!((mo[0][0] - 1.0).abs() < 1e-6 && (mo[1][1] - 1.0).abs() < 1e-6, "matrixOriginal 对角线应为 1");
+        assert!(
+            mo[0][1] > m[0][1] + 1e-4,
+            "剔除招标引用后相似度应下降：原始 {} 剔除后 {}",
+            mo[0][1],
+            m[0][1]
+        );
+        assert!(
+            v["peakOriginal"].as_f64().unwrap() > v["peak"].as_f64().unwrap(),
+            "peakOriginal 应高于剔除后 peak"
+        );
+
+        // (2) 残差簇成员不含招标引用段文本（独特串「出厂合格证明」只在招标引用段出现）。
+        let clusters = clusters_of(&pool, &job_id);
+        assert!(!clusters.is_empty(), "残差应仍有私有雷同段聚类");
+        {
+            let conn = pool.get().unwrap();
+            for c in &clusters {
+                let detail = compare_repo::get_cluster_detail(&conn, &c.id).unwrap();
+                for mem in &detail.members {
+                    assert!(
+                        !mem.text.contains("出厂合格证明"),
+                        "残差簇不应含招标引用段：{}",
+                        mem.text
+                    );
+                }
+            }
+        }
+        // 但残差仍应聚出私有雷同段
+        let has_private = {
+            let conn = pool.get().unwrap();
+            clusters.iter().any(|c| {
+                compare_repo::get_cluster_detail(&conn, &c.id)
+                    .unwrap()
+                    .members
+                    .iter()
+                    .any(|m| m.text.contains("应急响应机制"))
+            })
+        };
+        assert!(has_private, "残差应保留 A/B 私有雷同段");
+
+        // (3) chunk_exemptions 行数 = coverage≥0.8 的引用块数（A、B 各一段引用 → 2）。
+        let n_exempt: i64 = {
+            let conn = pool.get().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunk_exemptions WHERE job_id=?1 AND kind='tender'",
+                [&job_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(n_exempt, 2, "两家各一段逐字引用 → 2 条豁免证据");
+        // summary 计数一致，且每条 coverage≥0.8
+        let summary: CompareSummary = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.summary_json.unwrap()).unwrap()
+        };
+        assert_eq!(summary.tender_ref_chunk_count, 2);
+        {
+            let conn = pool.get().unwrap();
+            let min_cov: f64 = conn
+                .query_row(
+                    "SELECT MIN(coverage) FROM chunk_exemptions WHERE job_id=?1",
+                    [&job_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(min_cov >= 0.8, "豁免块覆盖率均应≥0.8，最低 {min_cov}");
+        }
+
+        // 关闭对减：matrixOriginal 与 matrix 逐格一致（口径回退，向后兼容）。
+        let cctx_off = ctx_for(&pool, &ws, "compare", false);
+        let cfg_off = CompareRunConfig { subtract_tender: false, ..cfg_with(ids, 0.5) };
+        run_compare(&cctx_off, Arc::new(Jieba::new()), Arc::new(Mutex::new(None)), &ws, &cfg_off).unwrap();
+        let voff: serde_json::Value = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx_off.job_id).unwrap();
+            serde_json::from_str(&r.matrix_json.unwrap()).unwrap()
+        };
+        assert_eq!(voff["matrix"], voff["matrixOriginal"], "关闭对减时两矩阵应一致");
+        let n_off: i64 = {
+            let conn = pool.get().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunk_exemptions WHERE job_id=?1",
+                [&cctx_off.job_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(n_off, 0, "关闭对减不产生豁免证据");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // —— W3-4 内置静态范本背景库：boiler_fraction 豁免 + 可复现 ——
+
+    /// 三份投标共享同一法定套话段（廉政承诺，属静态背景库）与一段库中不存在的私有原创段：
+    /// 套话段 boiler_fraction≥0.6 → 进 chunk_exemptions(kind='background')、不进聚类；
+    /// 私有段不被豁免、照常聚类；同库同输入两次比对背景豁免集合逐字节一致（可复现）。
+    #[test]
+    fn background_boilerplate_is_exempted_private_content_is_not() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "背景库").unwrap().id
+        };
+        // 法定套话（与 fixtures/templates 中廉政承诺逐字一致 → 全 4-gram df=5 → boiler_fraction≈1）。
+        let boiler = "为维护公平竞争的招标投标秩序，我方郑重承诺，在参与本次投标活动中自觉遵守国家有关法律法规和廉政建设的各项规定，不向招标人评标委员会成员及有关工作人员行贿或者提供其他不正当利益，不与其他投标人相互串通投标报价，不以任何方式排挤其他投标人的公平竞争，自觉维护招标投标活动的正常秩序。";
+        // 库中不存在的私有原创段（三家共享 → 应聚类，且不得被背景库豁免）。
+        let private = "本公司自主研发的智能边缘计算调度平台采用容器化微服务架构实现全链路可观测与弹性伸缩并通过自研分布式一致性算法保障多活数据中心的强一致性。";
+        let mk = |head: &str| format!("{head}\n{boiler}\n{private}");
+        let files = vec![
+            ("投标A.txt", mk("投标单位甲：华信智联科技有限公司")),
+            ("投标B.txt", mk("投标单位乙：启明数字技术有限公司")),
+            ("投标C.txt", mk("投标单位丙：中科盛世信息股份公司")),
+        ];
+        let (job_id, ids) = import_and_compare(&pool, &ws, &files, 0.5);
+
+        // (1) 背景套话段各家一段 → 3 条 kind='background' 证据，coverage(=boiler_fraction)≥0.6，无 tender。
+        let (n_bg, min_cov): (i64, f64) = {
+            let conn = pool.get().unwrap();
+            let n = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunk_exemptions WHERE job_id=?1 AND kind='background'",
+                    [&job_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let c = conn
+                .query_row(
+                    "SELECT MIN(coverage) FROM chunk_exemptions WHERE job_id=?1 AND kind='background'",
+                    [&job_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (n, c)
+        };
+        assert_eq!(n_bg, 3, "三家各一段法定套话 → 3 条背景豁免");
+        assert!(min_cov >= 0.6, "背景豁免块 boiler_fraction 均应≥0.6，最低 {min_cov}");
+        let n_tender: i64 = {
+            let conn = pool.get().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM chunk_exemptions WHERE job_id=?1 AND kind='tender'",
+                [&job_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(n_tender, 0, "无招标文件 → 无 tender 豁免");
+
+        let summary: CompareSummary = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.summary_json.unwrap()).unwrap()
+        };
+        assert_eq!(summary.background_exempt_chunk_count, 3);
+        assert_eq!(summary.tender_ref_chunk_count, 0);
+
+        // (2) 套话段不进聚类（廉政承诺独有串「串通投标报价」不出现在任何簇成员）；
+        //     库中不存在的私有段照常聚类（「边缘计算调度平台」出现在某簇）。
+        let clusters = clusters_of(&pool, &job_id);
+        let (mut saw_boiler, mut saw_private) = (false, false);
+        {
+            let conn = pool.get().unwrap();
+            for c in &clusters {
+                let detail = compare_repo::get_cluster_detail(&conn, &c.id).unwrap();
+                for mem in &detail.members {
+                    if mem.text.contains("串通投标报价") {
+                        saw_boiler = true;
+                    }
+                    if mem.text.contains("边缘计算调度平台") {
+                        saw_private = true;
+                    }
+                }
+            }
+        }
+        assert!(!saw_boiler, "法定套话段应被背景库剔除，不应出现在任何聚类");
+        assert!(saw_private, "库中不存在的本场私有段应照常聚类（未被误豁免）");
+
+        // (3) 可复现：同库同输入再跑一次，kind='background' 的 (chunk_id, coverage) 集合逐字节一致。
+        let bg_set = |jid: &str| -> Vec<(String, f64)> {
+            let conn = pool.get().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT chunk_id, coverage FROM chunk_exemptions
+                     WHERE job_id=?1 AND kind='background' ORDER BY chunk_id",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([jid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        let first = bg_set(&job_id);
+        assert_eq!(first.len(), 3);
+        let cctx2 = ctx_for(&pool, &ws, "compare", false);
+        run_compare(
+            &cctx2,
+            Arc::new(Jieba::new()),
+            Arc::new(Mutex::new(None)),
+            &ws,
+            &cfg_with(ids, 0.5),
+        )
+        .unwrap();
+        assert_eq!(first, bg_set(&cctx2.job_id), "同库同输入两次比对背景豁免集合应逐字节一致");
+    }
+
+    // —— M4 招标文件豁免接线 + 条件化硬命中 floor（§1.5）——
+
+    fn collusion_of(pool: &DbPool, job_id: &str) -> crate::engine::report::Collusion {
+        let conn = pool.get().unwrap();
+        let r = job_repo::get_result_jsons(&conn, job_id).unwrap();
+        serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+    }
+
+    /// 给某文档注入一张内嵌图片指纹（模拟招标方统一提供、各家照贴的同一张图）。
+    fn seed_image(pool: &DbPool, doc_id: &str, sha: &str) {
+        let mut conn = pool.get().unwrap();
+        let tx = conn.transaction().unwrap();
+        image_repo::insert_images(
+            &tx,
+            doc_id,
+            &[crate::engine::parse::ImageHash {
+                source: "docx",
+                page: None,
+                width: 320,
+                height: 240,
+                sha256: sha.to_string(),
+                dhash: Some(0x0f0f_0f0f_0f0f_0f0f),
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// 招标文件 T（含模板 rsid 集 / 统一图片 / 共同标点笔误）+ 两份各自引用它的投标 C/D：
+    /// 工作区已导入 T 且开启对减后，rsid / imageReuse / sharedErrors 均【不】因 T 的共享内容触发；
+    /// 关闭对减（等价于无 T 可用）时同样输入照常触发（回归）。
+    #[test]
+    fn tender_shared_signals_are_exempted_and_fire_without_tender() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "招标豁免接线").unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_ex_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 招标模板 rsid（含 rsidRoot），C/D 各自照用；共同标点笔误「质量。。管理」逐字源自 T。
+        let tpl_rsids = r#"<w:rsidRoot w:val="00TP0001"/><w:rsid w:val="00TP0001"/><w:rsid w:val="00TP0002"/><w:rsid w:val="00TP0003"/>"#;
+        let err_phrase = "严格执行质量。。管理体系认证";
+        let tender = write_forensic_docx(
+            &dir, "招标文件.docx",
+            &format!("招标人要求投标人{err_phrase}并按本章逐项应答全部技术条款。"),
+            tpl_rsids, "2024-05-01T09:00:00Z", "Normal.dotm",
+        );
+        let c = write_forensic_docx(
+            &dir, "投标C.docx",
+            &format!("华信智联科技公司专注城市轨道信号系统的设计集成；{err_phrase}。"),
+            tpl_rsids, "2024-05-02T10:00:00Z", "Normal.dotm",
+        );
+        let d = write_forensic_docx(
+            &dir, "投标D.docx",
+            &format!("启明数字技术公司主营医院信息化平台建设运营；{err_phrase}。"),
+            tpl_rsids, "2024-05-09T14:00:00Z", "Normal.dotm",
+        );
+        let it = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&it, jieba.clone(), &ws, &[tender], &Default::default(), "tender").unwrap();
+        let ib = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ib, jieba.clone(), &ws, &[c, d], &Default::default(), "bid").unwrap();
+
+        let (tender_id, ids) = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            let tid = docs.iter().find(|x| x.file_name == "招标文件.docx").unwrap().id.clone();
+            let bids: Vec<String> = ["投标C.docx", "投标D.docx"]
+                .iter()
+                .map(|n| docs.iter().find(|x| &x.file_name == n).unwrap().id.clone())
+                .collect();
+            (tid, bids)
+        };
+        // 招标方统一提供的同一张图片（同 sha）：T 与 C/D 各持一份。
+        let img_sha = "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233";
+        seed_image(&pool, &tender_id, img_sha);
+        seed_image(&pool, &ids[0], img_sha);
+        seed_image(&pool, &ids[1], img_sha);
+
+        // (A) 开启对减（T 已导入）：三类信号均不因 T 的共享内容触发，亦无 forensicFloor。
+        let on = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&on, jieba.clone(), Arc::new(Mutex::new(None)), &ws, &cfg_with(ids.clone(), 0.5)).unwrap();
+        let col_on = collusion_of(&pool, &on.job_id);
+        assert!(col_on.signals.iter().all(|s| s.kind != "rsid"), "招标模板 rsid 应被对减，不触发 rsid 信号");
+        assert!(col_on.signals.iter().all(|s| s.kind != "imageReuse"), "招标方统一图片应被对减，不触发 imageReuse");
+        assert!(col_on.signals.iter().all(|s| s.kind != "sharedErrors"), "源自 T 的共同笔误应被对减，不触发 sharedErrors");
+        assert!(col_on.signals.iter().all(|s| s.kind != "forensicFloor"), "无残余硬命中 → 不置等级下限");
+
+        // (B) 关闭对减（等价于无 T 可用）：同样输入照常触发三类信号（回归）。
+        let off = ctx_for(&pool, &ws, "compare", false);
+        let cfg_off = CompareRunConfig { subtract_tender: false, ..cfg_with(ids, 0.5) };
+        run_compare(&off, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_off).unwrap();
+        let col_off = collusion_of(&pool, &off.job_id);
+        assert!(col_off.signals.iter().any(|s| s.kind == "rsid"), "无对减 → 共享 rsid 照常触发");
+        assert!(col_off.signals.iter().any(|s| s.kind == "imageReuse"), "无对减 → 同图照常触发");
+        assert!(col_off.signals.iter().any(|s| s.kind == "sharedErrors"), "无对减 → 共同笔误照常触发");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 硬命中（投标间共享一个【非招标模板】的 rsidRoot，扣除 T 的 rsid 集后仍命中）：
+    /// 工作区已导入 T 且对减生效 → 强制等级下限 medium + forensicFloor 纪律信号；
+    /// 关闭对减（无 T 可用）→ 硬命中仅作 rsid 信号展示，不置等级下限（无 forensicFloor）。
+    #[test]
+    fn conditional_hard_hit_floor_requires_tender_exemption() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "条件化下限").unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_floor_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let tender = write_forensic_docx(
+            &dir, "招标文件.docx",
+            "招标人提供统一投标文件模板，投标人应据此编制并逐项响应技术条款。",
+            r#"<w:rsidRoot w:val="00TP0001"/><w:rsid w:val="00TP0002"/><w:rsid w:val="00TP0003"/>"#,
+            "2024-05-01T09:00:00Z", "Normal.dotm",
+        );
+        // E/F 共享一个非模板 rsidRoot 00CO0009（扣除 T 后仍硬命中），另各带模板 rsid（被对减）。
+        let coll_rsids = r#"<w:rsidRoot w:val="00CO0009"/><w:rsid w:val="00CO0009"/><w:rsid w:val="00TP0002"/><w:rsid w:val="00TP0003"/>"#;
+        let e = write_forensic_docx(
+            &dir, "投标E.docx",
+            "远东建工集团承担综合管廊与地下空间开发的施工总承包业务。",
+            coll_rsids, "2024-05-02T10:00:00Z", "Normal.dotm",
+        );
+        let f = write_forensic_docx(
+            &dir, "投标F.docx",
+            "北方勘察设计院提供水利枢纽与灌区改造的全过程工程咨询。",
+            coll_rsids, "2024-05-08T16:00:00Z", "Normal.dotm",
+        );
+        let it = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&it, jieba.clone(), &ws, &[tender], &Default::default(), "tender").unwrap();
+        let ib = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ib, jieba.clone(), &ws, &[e, f], &Default::default(), "bid").unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            ["投标E.docx", "投标F.docx"]
+                .iter()
+                .map(|n| docs.iter().find(|x| &x.file_name == n).unwrap().id.clone())
+                .collect()
+        };
+
+        // (A) 对减生效：非模板 rsidRoot 存活 → 硬命中 → 等级下限 medium + forensicFloor。
+        let on = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&on, jieba.clone(), Arc::new(Mutex::new(None)), &ws, &cfg_with(ids.clone(), 0.5)).unwrap();
+        let col_on = collusion_of(&pool, &on.job_id);
+        assert!(col_on.signals.iter().any(|s| s.kind == "rsid"), "非模板 rsidRoot 应存活并触发 rsid 信号");
+        let floor = col_on
+            .signals
+            .iter()
+            .find(|s| s.kind == "forensicFloor")
+            .expect("对减生效+硬命中 → 应有 forensicFloor 信号");
+        assert!(floor.detail.contains("已扣除招标文件统一下发模板"), "floor 文案应说明扣除模板后仍硬命中");
+        assert!(matches!(col_on.level.as_str(), "medium" | "high"), "等级下限应≥medium，实际 {}", col_on.level);
+
+        // (B) 关闭对减（无 T 可用）：硬命中仅作 rsid 信号展示，不置等级下限。
+        let off = ctx_for(&pool, &ws, "compare", false);
+        let cfg_off = CompareRunConfig { subtract_tender: false, ..cfg_with(ids, 0.5) };
+        run_compare(&off, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_off).unwrap();
+        let col_off = collusion_of(&pool, &off.job_id);
+        assert!(col_off.signals.iter().any(|s| s.kind == "rsid"), "无对减 → rsid 信号仍展示");
+        assert!(
+            col_off.signals.iter().all(|s| s.kind != "forensicFloor"),
+            "无对减 → 不置等级下限（无 forensicFloor）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // —— W3-3 k-共现过滤升级：≥3 家共有先查证，查得到豁免、查不到升级『多家异常一致·待复核』——
+
+    /// 招标文件（可选）+ 3 份投标 → 导入 → 比对，返回 (pool, ws, job_id, bid_ids)。
+    /// mark_tender_ocr=true 时把招标文件 parse_method 改为 'ocr'（模拟扫描件，触发查证质量闸门）。
+    fn setup_kcooc(
+        name: &str,
+        tender: Option<&str>,
+        bids: &[(&str, String)],
+        mark_tender_ocr: bool,
+    ) -> (DbPool, String, String, Vec<String>) {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, name).unwrap().id
+        };
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_kc_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |n: &str, c: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, c).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        if let Some(t) = tender {
+            let tp = write("招标文件.txt", t);
+            let it = ctx_for(&pool, &ws, "import", false);
+            import_service::run_import(&it, jieba.clone(), &ws, &[tp], &Default::default(), "tender").unwrap();
+            if mark_tender_ocr {
+                let conn = pool.get().unwrap();
+                conn.execute("UPDATE documents SET parse_method='ocr' WHERE doc_role='tender'", []).unwrap();
+            }
+        }
+        let bid_paths: Vec<String> = bids.iter().map(|(n, c)| write(n, c)).collect();
+        let ib = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ib, jieba.clone(), &ws, &bid_paths, &Default::default(), "bid").unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            bids.iter()
+                .map(|(n, _)| docs.iter().find(|d| &d.file_name == n).unwrap().id.clone())
+                .collect()
+        };
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_with(ids.clone(), 0.5)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (pool, ws, cctx.job_id, ids)
+    }
+
+    /// 招标条款（三家共引，boiler<0.6、非套话）。
+    const TENDER_X: &str = "招标人要求所有投标人严格按照本章技术规范逐项应答，全部核心设备必须为原厂全新正品并随附完整的出厂合格证明与第三方检验报告，投标文件须对本节全部技术条款作出实质性响应，不得存在任何负偏离，否则将按无效投标处理并不予评审。";
+    /// 库中不存在的私有原创段（三家共享 → 查不到出处）。
+    const PRIVATE_P: &str = "本公司自主研发的智能边缘计算调度平台采用容器化微服务架构实现全链路可观测与弹性伸缩并通过自研分布式一致性算法保障多活数据中心的强一致性与秒级故障切换能力。";
+
+    /// (1) 三份投标共享某段且该段在招标文件中（多数成员覆盖率≥0.8）→ 簇 exempt_reason='tender'、
+    ///     无 multiDocAnomaly 信号、信号②不含该簇。
+    #[test]
+    fn kcooc_tender_shared_cluster_is_exempted_not_anomaly() {
+        let y = "此外我方将为本项目单独配置驻场质量总监并按周提交独立第三方质检报告以确保交付质量达到预期。";
+        let bids = vec![
+            ("投标A.txt", format!("华信智联\n{TENDER_X}")),
+            ("投标B.txt", format!("启明数字\n{TENDER_X}")),
+            // C 在同段追加私有句 → 覆盖率<0.8（多数成员仍≥0.8），且残差簇经 C 桥接存活可标记。
+            ("投标C.txt", format!("中科盛世\n{TENDER_X}{y}")),
+        ];
+        let (pool, _ws, job_id, _ids) = setup_kcooc("kcooc豁免", Some(TENDER_X), &bids, false);
+        let clusters = clusters_of(&pool, &job_id);
+        let c3 = clusters
+            .iter()
+            .find(|c| c.document_ids.len() == 3)
+            .expect("应有 3 家共有簇（引用招标段，经 C 桥接存活）");
+        assert_eq!(c3.exempt_reason.as_deref(), Some("tender"), "多数成员引用招标文件 → tender 豁免");
+        assert!(!c3.multi_doc_anomaly, "豁免簇不得标异常");
+        let col = collusion_of(&pool, &job_id);
+        assert!(col.signals.iter().all(|s| s.kind != "multiDocAnomaly"), "豁免簇不产生 multiDocAnomaly 信号");
+        assert!(col.signals.iter().all(|s| s.kind != "cluster"), "豁免簇退出围标信号②（无 cluster 信号）");
+    }
+
+    /// (2) 同场景但该段不在招标/背景、且查证条件具备（招标文件已导入、非 OCR、覆盖率抽样达标）
+    ///     → multi_doc_anomaly=1、severity='review'（待复核·非 high）、signals 含 multiDocAnomaly、
+    ///     detail 含『涉嫌』+『评标委员会』。
+    #[test]
+    fn kcooc_private_shared_triggers_multi_doc_anomaly_review() {
+        let bids = vec![
+            ("投标A.txt", format!("华信智联\n{TENDER_X}\n{PRIVATE_P}")),
+            ("投标B.txt", format!("启明数字\n{TENDER_X}\n{PRIVATE_P}")),
+            ("投标C.txt", format!("中科盛世\n{TENDER_X}\n{PRIVATE_P}")),
+        ];
+        let (pool, _ws, job_id, _ids) = setup_kcooc("kcooc异常", Some(TENDER_X), &bids, false);
+        let clusters = clusters_of(&pool, &job_id);
+        let anom = clusters
+            .iter()
+            .find(|c| c.multi_doc_anomaly)
+            .expect("私有共有段查不到出处 → 应升级为多家异常一致");
+        assert_eq!(anom.document_ids.len(), 3);
+        assert_eq!(anom.severity.as_deref(), Some("review"), "异常簇 severity='review'（待复核·非 high）");
+        assert!(anom.exempt_reason.is_none(), "异常簇非豁免");
+        let summary = anom.summary.clone().unwrap_or_default();
+        assert!(
+            summary.contains("涉嫌") && summary.contains("评标委员会"),
+            "簇 summary 应含『涉嫌』+『评标委员会』脚注：{summary}"
+        );
+        // high 风险统计不含异常簇（§1.5：不自动 high）
+        let summary_obj: CompareSummary = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.summary_json.unwrap()).unwrap()
+        };
+        assert_eq!(summary_obj.high_risk_count, 0, "多家异常一致不进 high 风险统计");
+        let col = collusion_of(&pool, &job_id);
+        let s = col
+            .signals
+            .iter()
+            .find(|s| s.kind == "multiDocAnomaly")
+            .expect("signals 应含 multiDocAnomaly");
+        assert!(
+            s.detail.contains("涉嫌") && s.detail.contains("评标委员会") && s.detail.contains("第四十条"),
+            "信号 detail 应含涉嫌+法条+评标委员会：{}",
+            s.detail
+        );
+        assert!(col.signals.iter().all(|s| s.kind != "cluster"), "异常簇退出信号②");
+        assert_ne!(col.level, "high", "多家异常一致不得把总判定自动抬为 high");
+    }
+
+    /// (3) 招标文件为 OCR/扫描件 → 禁用 anomaly 升级、降级中性提示『出处未能核实』（不带法条、不升 severity）。
+    #[test]
+    fn kcooc_ocr_tender_disables_upgrade_neutral_prompt() {
+        let bids = vec![
+            ("投标A.txt", format!("华信智联\n{TENDER_X}\n{PRIVATE_P}")),
+            ("投标B.txt", format!("启明数字\n{TENDER_X}\n{PRIVATE_P}")),
+            ("投标C.txt", format!("中科盛世\n{TENDER_X}\n{PRIVATE_P}")),
+        ];
+        let (pool, _ws, job_id, _ids) = setup_kcooc("kcoocOCR", Some(TENDER_X), &bids, true);
+        let clusters = clusters_of(&pool, &job_id);
+        let p3 = clusters
+            .iter()
+            .find(|c| c.document_ids.len() == 3 && c.exempt_reason.is_none())
+            .expect("应有 3 家私有共有簇");
+        assert!(!p3.multi_doc_anomaly, "招标件 OCR → 禁用异常升级");
+        assert_ne!(p3.severity.as_deref(), Some("review"), "OCR 时不置待复核");
+        let summary = p3.summary.clone().unwrap_or_default();
+        assert!(summary.contains("出处未能核实"), "OCR 时降级中性提示：{summary}");
+        assert!(!summary.contains("涉嫌"), "中性提示不带『涉嫌』措辞");
+        let col = collusion_of(&pool, &job_id);
+        assert!(col.signals.iter().all(|s| s.kind != "multiDocAnomaly"), "OCR 时无 multiDocAnomaly 信号");
+    }
+
+    /// (4) 无招标文件且背景库不可作出处升级 → 不升级异常，维持既有行为（≥3 家共有仍按信号②计数）。
+    #[test]
+    fn kcooc_no_tender_keeps_existing_behavior() {
+        let bids = vec![
+            ("投标A.txt", format!("华信智联\n{PRIVATE_P}")),
+            ("投标B.txt", format!("启明数字\n{PRIVATE_P}")),
+            ("投标C.txt", format!("中科盛世\n{PRIVATE_P}")),
+        ];
+        let (pool, _ws, job_id, _ids) = setup_kcooc("kcooc无招标", None, &bids, false);
+        let clusters = clusters_of(&pool, &job_id);
+        let c3 = clusters.iter().find(|c| c.document_ids.len() == 3).expect("应有 3 家共有簇");
+        assert!(!c3.multi_doc_anomaly, "无招标文件 → 不升级异常");
+        assert!(c3.exempt_reason.is_none(), "无招标文件 → 不豁免");
+        let summary = c3.summary.clone().unwrap_or_default();
+        assert!(
+            !summary.contains("出处未能核实") && !summary.contains("涉嫌"),
+            "无招标文件不加任何 k-共现提示：{summary}"
+        );
+        let col = collusion_of(&pool, &job_id);
+        assert!(col.signals.iter().all(|s| s.kind != "multiDocAnomaly"), "无招标文件无异常信号");
+        assert!(col.signals.iter().any(|s| s.kind == "cluster"), "≥3 家共有簇仍按信号②计数（既有行为不变）");
     }
 }

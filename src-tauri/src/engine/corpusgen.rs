@@ -1190,7 +1190,7 @@ fn map_pred(cluster_type: &str) -> &'static str {
 }
 
 /// 文本 → 无模型层 CmpChunk（严格对齐 chunker::make 的特征口径：sanitize→normalize→
-/// tokenize_lang→extract_entities→char_ngrams→minhash；section_kind 由 segment::classify）。
+/// tokenize_lang→extract_entities→char_ngrams→minhash；section_kind 由 segment::classify_zone）。
 fn regr_build_chunk(
     jieba: &Jieba,
     id: String,
@@ -1204,12 +1204,11 @@ fn regr_build_chunk(
     let (sanitized, _st) = normalize::sanitize_with_stats(text);
     let normalized = normalize::normalize_sanitized(&sanitized, &NormalizeOptions::default());
     let tokens = similarity::tokenize_lang(jieba, &sanitized, "auto");
-    let section_kind = match segment::classify(text) {
-        segment::Section::Tech => "tech",
-        segment::Section::Business => "business",
-        segment::Section::Other => "other",
-    };
     let entities = features::extract_entities(&normalized);
+    // 五区分类（§5 W3-5）：与 chunker::make / corpus::from_row 同口径（标题优先、金额表格行→price），
+    // 使回归语料反映分区阈值分层。regr 语料无表格行，is_table_row 恒 false。
+    let has_amount = entities.iter().any(|e| e.kind == "amount");
+    let section_kind = segment::section_kind_str(segment::classify_zone(&section_path, text, false, has_amount));
     let ngrams = features::char_ngrams(&normalized);
     let minhash = features::minhash(&ngrams);
     CmpChunk {
@@ -1229,6 +1228,8 @@ fn regr_build_chunk(
         minhash,
         entities,
         tfidf: HashMap::new(),
+        tender_coverage: 0.0,
+        boiler_fraction: 0.0,
         text: text.to_string(),
     }
 }
@@ -1406,6 +1407,8 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
                     .iter()
                     .map(|&i| ClusterSeg { doc: chunks[i as usize].doc, text: chunks[i as usize].text.clone() })
                     .collect(),
+                exempted: false,
+                anomaly: false,
             }
         })
         .collect();

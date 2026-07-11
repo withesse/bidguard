@@ -19,6 +19,8 @@ const MIGRATIONS: &[&str] = &[
     EVASION_JSON_V13,
     DOC_ROLE_V14,
     DOCUMENT_IMAGES_V15,
+    CHUNK_EXEMPTIONS_V16,
+    CLUSTERS_EXEMPT_V17,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -382,6 +384,37 @@ CREATE TABLE document_images (
 CREATE INDEX idx_document_images_doc ON document_images(document_id);
 ";
 
+// V16：招标文件对减的豁免证据表（W3-2）。每行是一个投标分块「引用招标文件」的取证记录：
+// coverage=命中招标 winnowing 指纹的字符覆盖率，spans_json=合并后的覆盖区间（供 UI/导出解释、
+// 人工复核被剥离内容）。job 级证据（同一分块在不同任务/口径下覆盖率不同），随任务删除级联清理。
+// kind 预留：'tender'（M4a）| 'background'（M4b 背景库复用）。job_id/chunk_id 双外键 ON DELETE
+// CASCADE + 索引：删任务/文档时级联清理需索引（与 V10 级联外键须有索引同理）。旧库无表，向后兼容。
+const CHUNK_EXEMPTIONS_V16: &str = "
+CREATE TABLE chunk_exemptions (
+  job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  chunk_id   TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL,        -- tender | background
+  coverage   REAL NOT NULL,
+  spans_json TEXT,
+  PRIMARY KEY (job_id, chunk_id, kind)
+);
+CREATE INDEX idx_chunk_exemptions_job ON chunk_exemptions(job_id);
+CREATE INDEX idx_chunk_exemptions_chunk ON chunk_exemptions(chunk_id);
+";
+
+// V17：k-共现过滤升级（W3-3）——clusters 增两列：
+//   · exempt_reason：≥3 家共有簇经查证命中招标文件（'tender'）或行业范本背景库（'background'）
+//     的合法共享出处 → 从围标信号②/残差矩阵/high 统计剔除，但簇保留落库、UI 置灰可筛
+//     （延续 is_template『标记不删除』哲学）；NULL = 未豁免。
+//   · multi_doc_anomaly：两库皆查不到出处且查证质量闸门通过（招标文件已导入、非 OCR/扫描件、
+//     对减覆盖率抽样达标）→ 1（『多家异常一致·待复核』，severity='review' 不自动 high、不进
+//     high 统计，最终认定权属评标委员会）；0 = 非异常。
+// 纯加列向后兼容：旧库 clusters 行取默认（NULL / 0），list_clusters 正常返回；豁免明细复用 V16。
+const CLUSTERS_EXEMPT_V17: &str = "
+ALTER TABLE clusters ADD COLUMN exempt_reason TEXT;
+ALTER TABLE clusters ADD COLUMN multi_doc_anomaly INTEGER NOT NULL DEFAULT 0;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +590,86 @@ mod tests {
         assert_eq!(after, 0, "删文档后 document_images 应级联清空");
 
         // 幂等：重跑不报错、版本不变
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn chunk_exemptions_migration_cascades_and_is_idempotent() {
+        // 老库（V15：chunk_exemptions 表出现之前）升级：补 V16，表可写；
+        // 删任务级联清空豁免行、删文档亦级联清空（双外键）。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..15] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 15).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+             status, created_at, updated_at)
+             VALUES ('d1', 'w1', 'f', 'p', 'h', 'docx', 'parsed', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (id, document_id, chunk_type, chunk_level, text, normalized_text,
+             order_index, created_at) VALUES ('c1', 'd1', 'paragraph', 'paragraph', 't', 't', 0, 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_exemptions (job_id, chunk_id, kind, coverage, spans_json)
+             VALUES ('j1', 'c1', 'tender', 0.95, '[[0,30]]')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunk_exemptions WHERE job_id='j1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        // 删任务 → 豁免行级联清空
+        conn.execute("DELETE FROM jobs WHERE id='j1'", []).unwrap();
+        let after_job: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunk_exemptions", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_job, 0, "删任务后 chunk_exemptions 应级联清空");
+
+        // 删文档也级联（重插一行，删 chunk 所属文档）
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j2', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk_exemptions (job_id, chunk_id, kind, coverage, spans_json)
+             VALUES ('j2', 'c1', 'tender', 0.9, '[]')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM documents WHERE id='d1'", []).unwrap();
+        let after_doc: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunk_exemptions", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_doc, 0, "删文档后 chunk_exemptions 应级联清空");
+
+        // 幂等
         run(&mut conn).unwrap();
         assert_eq!(version(&conn), MIGRATIONS.len() as i64);
     }

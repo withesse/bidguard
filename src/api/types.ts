@@ -153,6 +153,8 @@ export interface CompareRequest {
   ignoreTemplates?: boolean;
   detectMovedParagraph?: boolean;
   scope?: "full" | "tech" | "business";
+  /** 剔除招标文件内容（W3-2 招标对减）：默认 true；工作区无招标文件时自然空转。 */
+  subtractTender?: boolean;
   embeddingModel?: string;
 }
 
@@ -161,7 +163,16 @@ export interface CompareSummaryDto {
   documents: DocumentDto[];
   config: Record<string, unknown> & { documentIds?: string[] };
   summary: CompareSummary | null;
-  matrix: { documentIds: string[]; matrix: number[][]; peak: number } | null;
+  matrix: {
+    documentIds: string[];
+    matrix: number[][];
+    peak: number;
+    /** 未对减口径（原始相似度）；旧任务缺键。M4 起填充。 */
+    matrixOriginal?: number[][];
+    peakOriginal?: number;
+    /** 前端主显口径："cluster" | "segment"；旧任务缺键按 cluster 渲染。 */
+    mode?: string;
+  } | null;
   collusion: Record<string, unknown> | null;
   sharedTerms: unknown[] | null;
   sections: unknown[] | null;
@@ -181,6 +192,16 @@ export interface CompareSummary {
   uncertainCount: number;
   highRiskCount: number;
   semanticDegraded: boolean;
+  /** 被识别为「引用招标文件」并从残差比对剔除的投标分块数（W3-2）；0 表示无对减。 */
+  tenderRefChunkCount: number;
+  /** 被内置静态范本背景库判为「行业范本套话」并从聚类剔除的分块数（W3-4）；仅 ignoreTemplates 开启时非零。 */
+  backgroundExemptChunkCount: number;
+  /** 分区分层五区簇计数（W3-5）：五者之和恒等于 clusterCount。legal 区阈值已上调；price 区证据主体为金额事实冲突。 */
+  zoneLegalCount: number;
+  zonePriceCount: number;
+  zoneTechCount: number;
+  zoneBusinessCount: number;
+  zoneOtherCount: number;
 }
 
 export interface ClusterSummaryDto {
@@ -191,6 +212,7 @@ export interface ClusterSummaryDto {
   summary: string | null;
   severity: string | null;
   score: number | null;
+  /** 五区（W3-5）：'tech' | 'business' | 'legal'(法定格式·阈值上调) | 'price'(报价清单) | 'other'。 */
   sectionKind: string | null;
   reviewStatus: "pending" | "confirmed" | "ignored" | string;
   /** 底版分块位置：「第一章 › 1.1 报价」 */
@@ -198,6 +220,10 @@ export interface ClusterSummaryDto {
   page: number | null;
   documentIds: string[];
   memberCount: number;
+  /** k-共现查证（W3-3）：命中招标（'tender'）/背景库（'background'）的合法共享出处 → UI 置灰；null=未豁免。 */
+  exemptReason: string | null;
+  /** k-共现查证（W3-3）：『多家异常一致·待复核』——红色徽标、涉嫌措辞，需评标委员会依法认定。 */
+  multiDocAnomaly: boolean;
 }
 
 export interface PageResult<T> {
@@ -211,8 +237,15 @@ export interface ClusterFilter {
   clusterType?: string;
   severity?: string;
   reviewStatus?: string;
+  /** 五区筛选（W3-5）：'tech' | 'business' | 'legal' | 'price' | 'other'。 */
   sectionKind?: string;
   documentId?: string;
+  /** 按豁免出处筛选（W3-3）：'tender' | 'background'。 */
+  exemptReason?: string;
+  /** 仅『多家异常一致·待复核』簇（W3-3）。 */
+  multiDocAnomaly?: boolean;
+  /** 仅『恰好两家共有』簇（W3-3 首要证据视图）。 */
+  twoDocsOnly?: boolean;
 }
 
 export interface MemberDetailDto {
@@ -226,6 +259,8 @@ export interface MemberDetailDto {
   orderIndex: number;
   role: "primary" | "duplicate_candidate" | "missing" | string;
   score: number | null;
+  /** 引用招标文件覆盖率（W3-2）：命中招标指纹的字符占比；非豁免块为 null。≥0.8 显示徽标。 */
+  tenderCoverage: number | null;
 }
 
 export interface DiffRowDto {

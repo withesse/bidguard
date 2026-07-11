@@ -141,6 +141,8 @@ pub fn assemble(
                     .conflict_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<FactConflict>(s).ok()),
+                exempt_reason: row.exempt_reason.clone(),
+                multi_doc_anomaly: row.multi_doc_anomaly,
                 members: Vec::new(),
             });
         }
@@ -437,6 +439,7 @@ mod tests {
             ignore_templates: true,
             detect_moved_paragraph: true,
             scope: "full".into(),
+            subtract_tender: true,
             embedding_model: "e5-small".into(),
             allow_model_download: false,
         };

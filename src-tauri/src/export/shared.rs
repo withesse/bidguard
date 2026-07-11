@@ -25,6 +25,8 @@ pub fn section_cn(s: &str) -> &'static str {
     match s {
         "tech" => "技术标",
         "business" => "商务标",
+        "legal" => "法定格式",
+        "price" => "报价清单",
         _ => "其他",
     }
 }

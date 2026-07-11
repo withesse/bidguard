@@ -24,6 +24,20 @@ pub fn char_ngrams(s: &str) -> HashSet<u64> {
     out
 }
 
+/// 单一 n 的字符 n-gram 哈希集合（去重）。背景范本库（W3-4）用 n=4 的字符 4-gram
+/// 计算文档频率 DF 与逐块 boiler_fraction；哈希复用同一 hash64。文本不足 n 字返回空集。
+pub fn char_ngrams_n(s: &str, n: usize) -> HashSet<u64> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = HashSet::new();
+    if n == 0 || chars.len() < n {
+        return out;
+    }
+    for w in chars.windows(n) {
+        out.insert(hash64(&w.iter().collect::<String>()));
+    }
+    out
+}
+
 pub fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;

@@ -88,6 +88,14 @@ const CLUSTER_MULTI_DOCS: usize = 3; // ≥N 份共现算强雷同
 const CLUSTER_BASE: f32 = 0.1; // 有雷同条款的基础权重
 const CLUSTER_SCALE: f32 = 0.3; // 强雷同随数量增长的权重
 const CLUSTER_SCALE_CAP: f32 = 5.0; // multi/CAP 封顶到 1
+// 多家异常一致信号（W3-3，连续特征）：贡献 = MULTI_ANOMALY_WEIGHT × min(异常簇数/SAT, 1)。
+// ≥3 家共有且招标文件与行业范本库【均查不到出处】、且查证质量闸门通过（招标件已导入、非
+// OCR/扫描件、对减覆盖率抽样达标）的簇，对应《招标投标法实施条例》第四十条『投标文件异常一致』
+// 涉嫌情形。§1.5 铁律：单信号权重不达 high 线(0.6) 是有意设计——不自动 high、不定性，簇 severity
+// 独立标『待复核』、不进 high 统计，最终认定权属评标委员会。
+// ⚠️未经校准：0.30 为经验初值，尚无带标注真实案例语料回测（同现有五信号，随 scheme §9.3 校准）。
+const MULTI_ANOMALY_WEIGHT: f32 = 0.30;
+const MULTI_ANOMALY_SATURATION: f32 = 3.0; // 3 处异常一致即满档
 const META_MIN_DOCS: usize = 2; // ≥N 份元数据同源才计
 const META_WEIGHT: f32 = 0.25;
 const SHARED_TERMS_MIN: usize = 5; // ≥N 个共有特征词才计
@@ -130,9 +138,20 @@ const LEVEL_MEDIUM: f32 = 0.35;
 const LEVEL_LOW: f32 = 0.1; // score > LEVEL_LOW → low
 /// 取证类信号（rsid / PDF 血缘 / 内嵌图片同源 / 共同错误指纹）对总分的合计封顶：
 /// 四类各自满档相加可达 1.20，不封顶则任意两三类叠满即直接 high，越过「单点定案需人工核实」
-/// 的产品边界。此处只封顶四类对 score 的合计贡献（各信号 detail 仍呈现原始权重供人工判断），
-/// 条件化 floor 规则本里程碑不启用（M4 招标豁免落地后再激活）。⚠️ 0.45 未经语料校准。
+/// 的产品边界。此处只封顶四类对 score 的合计贡献（各信号 detail 仍呈现原始权重供人工判断）。
+/// ⚠️ 0.45 未经语料校准。
 const FORENSIC_CAP: f32 = 0.45;
+/// 条件化硬命中 floor（§1.5 铁律，M4 招标豁免落地后激活）：硬命中（rsid rsidRoot 相同 /
+/// PDF DocumentID·DerivedFrom·trailer-ID 相同）在【工作区已导入招标文件且豁免对减生效】
+/// (CollusionInputs.tender_exemption_active) 时，强制围标等级下限 medium（不直接 high）。
+/// 招标文件不存在或豁免不可用时，硬命中只作信号展示（保留 rsid/pdfLineage 信号与免责文案），
+/// 不设等级下限、不进等级判定——防「招标代理统一下发投标模板」这一主流合规场景被系统性抬级
+/// （§9 排期审查 HIGH：豁免对减先于 floor 生效，扣除模板后仍硬命中才触发下限）。
+const HARD_HIT_FLOOR_LEVEL: &str = "medium";
+/// floor 触发时的取证纪律文案（常量集中，导出/UI 复用）。
+const HARD_HIT_FLOOR_DETAIL: &str = "已扣除招标文件统一下发模板（rsid/图片/共同错误已对减）后仍存在硬命中（同一母文件），\
+     围标等级下限置为 medium 供人工复核；此为等级下限规则、非定性结论，未命中不代表清白，\
+     最终认定权属评标委员会";
 // 检测到疑似规避特征（M2 入口对抗层聚合）：独立信号，【在 FORENSIC_CAP 之外】——规避行为
 // 本身即极强串通证据（正常投标人不会做字体重映射/零宽注入/PDF 隐藏文字层），比文本相似度
 // 更难抵赖。连续特征 x = 任一文档 confirmed ? 1.0 : 仅 suspect ? 0.5 : 0；同类证据不叠加。
@@ -174,6 +193,10 @@ pub struct CollusionInputs<'a> {
     /// 与 docs 同序、同下标；元素 None = 该文档无 evasion_json/无发现）。独立信号在 FORENSIC_CAP
     /// 之外，见 EVASION_WEIGHT。空切片 = 无规避数据（旧任务/全清白）——
     pub evasion: &'a [Option<EvasionSummary>],
+    /// —— M4 豁免接线：工作区已导入招标文件且三类豁免对减（rsid/图片/共同错误）已生效。
+    /// 仅当为 true 时启用条件化硬命中 floor（见 HARD_HIT_FLOOR_LEVEL）；Default=false ⇒
+    /// 招标文件不存在/未开对减时硬命中只作信号展示、不设等级下限——
+    pub tender_exemption_active: bool,
 }
 
 pub fn assess_with(inputs: CollusionInputs) -> Collusion {
@@ -188,6 +211,7 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         image_hits,
         shared_errors,
         evasion,
+        tender_exemption_active,
     } = inputs;
     let mut signals = Vec::new();
     let mut score = 0.0f32;
@@ -206,8 +230,12 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         });
     }
 
-    // 2) 跨文档雷同条款（3 份及以上的聚类是强信号）
-    let multi = clusters.iter().filter(|c| c.docs.len() >= CLUSTER_MULTI_DOCS).count();
+    // 2) 跨文档雷同条款（3 份及以上的聚类是强信号）。k-共现查证（W3-3）：豁免簇（引用招标/
+    //    行业范本，合法共享）与异常簇（归入独立 multiDocAnomaly 信号）均退出本信号计数——
+    //    scoring_clusters 只含未豁免、未升级异常的普通雷同簇。无招标文件时二者恒 false，口径不变。
+    let scoring_clusters: Vec<&Cluster> =
+        clusters.iter().filter(|c| !c.exempted && !c.anomaly).collect();
+    let multi = scoring_clusters.iter().filter(|c| c.docs.len() >= CLUSTER_MULTI_DOCS).count();
     if multi > 0 {
         let w = CLUSTER_BASE + CLUSTER_SCALE * (multi as f32 / CLUSTER_SCALE_CAP).clamp(0.0, 1.0);
         score += w;
@@ -216,12 +244,31 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
             detail: format!("{multi} 处条款在 {CLUSTER_MULTI_DOCS} 份及以上标书间高度雷同"),
             weight: w,
         });
-    } else if !clusters.is_empty() {
+    } else if !scoring_clusters.is_empty() {
         score += CLUSTER_BASE;
         signals.push(CollusionSignal {
             kind: "cluster".into(),
-            detail: format!("{} 处跨标书雷同条款", clusters.len()),
+            detail: format!("{} 处跨标书雷同条款", scoring_clusters.len()),
             weight: CLUSTER_BASE,
+        });
+    }
+
+    // 2.5) 多家异常一致（W3-3，连续特征）：≥3 家共有且两库皆查不到出处、查证质量闸门已通过的
+    //      簇归入此独立信号（不计入信号②，不自动 high）。§1.5：强制「涉嫌」措辞 + 法条 +「需评标
+    //      委员会依法认定」脚注；单信号不定性。查证质量闸门未过时簇不带 anomaly 标记，不入此信号。
+    let anomaly_count = clusters.iter().filter(|c| c.anomaly).count();
+    if anomaly_count > 0 {
+        let x = (anomaly_count as f32 / MULTI_ANOMALY_SATURATION).clamp(0.0, 1.0);
+        let w = MULTI_ANOMALY_WEIGHT * x;
+        score += w;
+        signals.push(CollusionSignal {
+            kind: "multiDocAnomaly".into(),
+            detail: format!(
+                "{anomaly_count} 处段落在 {CLUSTER_MULTI_DOCS} 份及以上投标间高度雷同，招标文件与行业\
+                 范本库均未查得出处，涉嫌《招标投标法实施条例》第四十条『投标文件异常一致』情形；\
+                 此为线索级提示、非定性结论，未自动判为高风险，需评标委员会依法认定，未命中不代表清白"
+            ),
+            weight: w,
         });
     }
 
@@ -475,7 +522,7 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
     // 取证四类合计封顶后并入总分（防叠满直接 high；各信号 detail 权重不受此影响）
     score += forensic.min(FORENSIC_CAP);
     let score = score.clamp(0.0, 1.0);
-    let level = if score >= LEVEL_HIGH {
+    let mut level = if score >= LEVEL_HIGH {
         "high"
     } else if score >= LEVEL_MEDIUM {
         "medium"
@@ -484,6 +531,26 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
     } else {
         "none"
     };
+
+    // 条件化硬命中 floor（§1.5 铁律，见 HARD_HIT_FLOOR_LEVEL/DETAIL）：硬命中 = rsid rsidRoot
+    // 相同 或 PDF 血缘硬档（同一母文件 GUID/trailer-ID）。仅在豁免对减已生效时才置下限——
+    // 招标模板产生的共享 rsid/图片/笔误已在信号提取侧对减，能走到这里的硬命中是扣除模板后仍存
+    // 的同源证据。豁免不可用（tender_exemption_active=false）时不改等级、不加 floor 信号，硬命中
+    // 仅由 rsid/pdfLineage 信号呈现。floor 是等级下限 max(level, medium)：只上抬 none/low 到 medium
+    // （不直接 high），已 medium/high 不改；forensicFloor 信号在此前提下必出，承载纪律文案。
+    let hard_hit = rsid_valid.iter().any(|h| h.root_match)
+        || lineage_valid.iter().any(|h| h.is_hard());
+    if tender_exemption_active && hard_hit {
+        if matches!(level, "none" | "low") {
+            level = HARD_HIT_FLOOR_LEVEL;
+        }
+        signals.push(CollusionSignal {
+            kind: "forensicFloor".into(),
+            detail: HARD_HIT_FLOOR_DETAIL.into(),
+            weight: 0.0,
+        });
+    }
+
     Collusion {
         level: level.into(),
         score,
@@ -497,7 +564,13 @@ mod tests {
     use crate::engine::report::{Fingerprint, SEVERITY_CONFIRMED, SEVERITY_NONE, SEVERITY_SUSPECT};
 
     fn cluster(docs: Vec<usize>) -> Cluster {
-        Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![] }
+        Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![], exempted: false, anomaly: false }
+    }
+    fn anomaly_cluster(docs: Vec<usize>) -> Cluster {
+        Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![], exempted: false, anomaly: true }
+    }
+    fn exempt_cluster(docs: Vec<usize>) -> Cluster {
+        Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![], exempted: true, anomaly: false }
     }
     fn doc(flags: Vec<&str>) -> DocInfo {
         DocInfo {
@@ -572,6 +645,53 @@ mod tests {
         });
         let w = weight_of(&c, "cluster").expect("应有 cluster 信号");
         assert!((w - CLUSTER_BASE).abs() < 1e-6);
+    }
+
+    // —— W3-3 k-共现过滤升级：豁免簇退出信号②、异常簇归入独立 multiDocAnomaly（不自动 high）——
+
+    #[test]
+    fn multi_doc_anomaly_emits_signal_and_never_auto_high() {
+        // 「多家异常一致」簇 → multiDocAnomaly 信号（涉嫌措辞 + 法条 + 评标委员会），不自动 high，
+        // 且退出信号②（无 cluster 信号）。
+        let c = assess_with(CollusionInputs {
+            clusters: &[anomaly_cluster(vec![0, 1, 2])],
+            ..Default::default()
+        });
+        let s = c.signals.iter().find(|s| s.kind == "multiDocAnomaly").expect("应有 multiDocAnomaly 信号");
+        assert!(s.weight > 0.0 && s.weight <= MULTI_ANOMALY_WEIGHT, "权重应在 (0, 0.30]：{}", s.weight);
+        assert!(s.detail.contains("涉嫌"), "detail 应含『涉嫌』措辞：{}", s.detail);
+        assert!(s.detail.contains("第四十条"), "detail 应引《条例》第四十条");
+        assert!(s.detail.contains("评标委员会"), "detail 应把最终认定权留给评标委员会");
+        assert_ne!(c.level, "high", "多家异常一致不得自动判为 high（§1.5）");
+        assert!(weight_of(&c, "cluster").is_none(), "异常簇不应计入信号②");
+    }
+
+    #[test]
+    fn exempted_cluster_excluded_from_cluster_signal() {
+        // 豁免簇（引用招标/行业范本，合法共享）退出信号②，也不进 multiDocAnomaly。
+        let c = assess_with(CollusionInputs {
+            clusters: &[exempt_cluster(vec![0, 1, 2])],
+            ..Default::default()
+        });
+        assert!(weight_of(&c, "cluster").is_none(), "豁免簇不应计入信号②");
+        assert!(weight_of(&c, "multiDocAnomaly").is_none(), "豁免簇不进异常信号");
+        assert_eq!(c.level, "none");
+    }
+
+    #[test]
+    fn multi_anomaly_weight_scales_and_saturates() {
+        let w_of = |cl: &[Cluster]| {
+            weight_of(&assess_with(CollusionInputs { clusters: cl, ..Default::default() }), "multiDocAnomaly")
+        };
+        let w1 = w_of(&[anomaly_cluster(vec![0, 1, 2])]).expect("1 处异常应有信号");
+        assert!((w1 - MULTI_ANOMALY_WEIGHT / 3.0).abs() < 1e-6, "1 处 → 0.30×1/3，实际 {w1}");
+        let three = [
+            anomaly_cluster(vec![0, 1, 2]),
+            anomaly_cluster(vec![0, 1, 3]),
+            anomaly_cluster(vec![0, 2, 3]),
+        ];
+        let w3 = w_of(&three).unwrap();
+        assert!((w3 - MULTI_ANOMALY_WEIGHT).abs() < 1e-6, "3 处封顶满权重，实际 {w3}");
     }
 
     #[test]
@@ -663,6 +783,74 @@ mod tests {
         let c = assess_with(CollusionInputs { rsid_hits: &hits, ..Default::default() });
         assert!(weight_of(&c, "rsid").is_none());
         assert_eq!(c.level, "none");
+    }
+
+    // —— M4 豁免接线：条件化硬命中 floor（§1.5）——
+
+    #[test]
+    fn hard_hit_floor_active_forces_medium_and_emits_discipline_signal() {
+        // 硬命中（rsidRoot 相同）+ 豁免对减已生效 → 等级下限 medium + forensicFloor 纪律信号。
+        let hits = [rsid_hit(0, true)];
+        let c = assess_with(CollusionInputs {
+            rsid_hits: &hits,
+            tender_exemption_active: true,
+            ..Default::default()
+        });
+        assert!(matches!(c.level.as_str(), "medium" | "high"), "硬命中+豁免生效 → level ≥ medium");
+        let s = c.signals.iter().find(|s| s.kind == "forensicFloor").expect("应有 forensicFloor 信号");
+        assert!(s.detail.contains("已扣除招标文件统一下发模板"), "floor 文案应说明已扣除模板后仍硬命中");
+        assert!(s.detail.contains("未命中不代表清白"));
+        assert!(s.detail.contains("评标委员会"), "应保留最终认定权归属");
+    }
+
+    #[test]
+    fn hard_hit_floor_inactive_does_not_apply_no_discipline_signal() {
+        // 招标文件不存在/豁免不可用 → 不加 forensicFloor 信号（floor 不启用），硬命中仅由 rsid 信号呈现。
+        let hits = [rsid_hit(0, true)];
+        let c = assess_with(CollusionInputs {
+            rsid_hits: &hits,
+            tender_exemption_active: false,
+            ..Default::default()
+        });
+        assert!(
+            c.signals.iter().all(|s| s.kind != "forensicFloor"),
+            "豁免不可用时不应设等级下限（无 forensicFloor 信号）"
+        );
+        assert!(c.signals.iter().any(|s| s.kind == "rsid"), "硬命中仍作 rsid 信号展示");
+    }
+
+    #[test]
+    fn pdf_lineage_hard_hit_also_triggers_conditional_floor() {
+        // PDF 血缘硬档（同一母文件 GUID/trailer-ID）同为硬命中，豁免生效时同样置下限。
+        let hits = [lineage_hit(true, &[])];
+        let active = assess_with(CollusionInputs {
+            lineage_hits: &hits,
+            tender_exemption_active: true,
+            ..Default::default()
+        });
+        assert!(active.signals.iter().any(|s| s.kind == "forensicFloor"));
+        assert!(matches!(active.level.as_str(), "medium" | "high"));
+        let inactive = assess_with(CollusionInputs {
+            lineage_hits: &hits,
+            tender_exemption_active: false,
+            ..Default::default()
+        });
+        assert!(inactive.signals.iter().all(|s| s.kind != "forensicFloor"));
+    }
+
+    #[test]
+    fn floor_not_triggered_without_hard_hit_even_when_active() {
+        // 弱命中（PDF 血缘中档：仅共享字体子集标签，非硬档）不触发 floor，即便豁免已生效。
+        let hits = [lineage_hit(false, &["ABCDEF+SimSun"])];
+        let c = assess_with(CollusionInputs {
+            lineage_hits: &hits,
+            tender_exemption_active: true,
+            ..Default::default()
+        });
+        assert!(
+            c.signals.iter().all(|s| s.kind != "forensicFloor"),
+            "非硬命中不触发条件化 floor"
+        );
     }
 
     // —— M1 取证：metadata 信号只认强类别、detail 枚举具体命中项 ——

@@ -53,6 +53,9 @@ interface MatrixView {
   peakPct: number;
   peakColor: string;
   peakPair: string;
+  /** W3-2 招标对减：剔除的引用块数（0=无对减）与原始峰值（对照用）。 */
+  tenderRefCount: number;
+  peakOriginalPct: number;
   conclusion: { pill: string; statement: string; desc: string };
   pairRows: PairRow[];
   insights: Insight[];
@@ -71,6 +74,8 @@ const KIND_META: Record<string, { tag: string; fg: string; bg: string }> = {
   imageReuse: { tag: "图片", fg: C.hi2, bg: C.hi2Soft },
   sharedErrors: { tag: "错误", fg: C.hi4, bg: C.hi4Soft },
   evasion: { tag: "规避特征", fg: C.danger, bg: C.dangerSoft },
+  // W3-3 多家异常一致：独立「待复核」档（不自动 high）；detail 自带涉嫌措辞 + 条例第四十条 + 评标委员会脚注。
+  multiDocAnomaly: { tag: "待复核 · 涉嫌一致", fg: C.danger, bg: C.dangerSoft },
 };
 const KIND_META_DEFAULT = { tag: "相似", fg: C.hi3, bg: C.brandSoft };
 // 取证指纹折叠区消费的信号 kind（rsid/PDF 血缘/图片同源/共同错误）。
@@ -195,6 +200,8 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
     peakPct,
     peakColor,
     peakPair: `${docs[pi].tag} ←→ ${docs[pj].tag}`,
+    tenderRefCount: sm.summary?.tenderRefChunkCount ?? 0,
+    peakOriginalPct: Math.round((sm.matrix?.peakOriginal ?? sm.matrix?.peak ?? 0) * 100),
     conclusion: { pill: lv.pill, statement, desc },
     pairRows,
     insights,
@@ -345,6 +352,20 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
               <div style={{ fontSize: 12, color: mute, marginTop: 8 }}>
                 出现在 <span style={{ color: ink, fontWeight: 700 }}>{v.peakPair}</span> 之间
               </div>
+              {/* W3-2 招标对减：剔除后为主口径，原始峰值作对照（Pill 切换完整版在 M5）。 */}
+              {v.tenderRefCount > 0 && (
+                <div style={{ fontSize: 11, color: mute, marginTop: 10, lineHeight: 1.6 }}>
+                  已剔除招标文件引用 <span style={{ color: ink, fontWeight: 700 }}>{v.tenderRefCount}</span> 块
+                  {v.peakOriginalPct !== v.peakPct && (
+                    <>
+                      {" · "}原始峰值 <span style={{ color: ink, fontWeight: 700 }}>{v.peakOriginalPct}%</span> → 剔除后{" "}
+                      <span style={{ color: ink, fontWeight: 700 }}>{v.peakPct}%</span>
+                    </>
+                  )}
+                  <br />
+                  风险分级采用剔除后口径（对招标条款的合法逐字应答已剥离）
+                </div>
+              )}
             </div>
           </div>
 

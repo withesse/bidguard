@@ -144,6 +144,11 @@ pub struct ExportCluster {
     pub section_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict: Option<FactConflict>,
+    /// k-共现查证（W3-3）：合法共享出处（'tender'|'background'）→ 报告置灰、退出风险统计；None=未豁免。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exempt_reason: Option<String>,
+    /// k-共现查证（W3-3）：『多家异常一致·待复核』——进导出「多家异常一致清单」小节（涉嫌措辞+脚注）。
+    pub multi_doc_anomaly: bool,
     pub members: Vec<ExportMember>,
 }
 
