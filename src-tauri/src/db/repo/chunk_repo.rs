@@ -26,6 +26,10 @@ pub struct NewChunk {
     pub token_json: Option<String>,
     pub entity_json: Option<String>,
     pub minhash_blob: Option<Vec<u8>>,
+    /// 隐形码点/同形字/混合脚本统计（W2 入口对抗层）；无发现为 None，
+    /// insert_all 仅对非空统计写 chunk_features.extra_json（"evasion" 命名空间下，
+    /// 后续特征可加兄弟键不互相踩）。
+    pub evasion: Option<crate::engine::normalize::InvisibleStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,8 +59,8 @@ pub fn insert_all(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
     )?;
     let mut ins_feat = conn.prepare(
-        "INSERT INTO chunk_features (chunk_id, token_json, entity_json, minhash_blob, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO chunk_features (chunk_id, token_json, entity_json, minhash_blob, extra_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for c in chunks {
         let id = uuid::Uuid::new_v4().to_string();
@@ -80,7 +84,11 @@ pub fn insert_all(
             c.normalized_hash,
             now,
         ])?;
-        ins_feat.execute(params![id, c.token_json, c.entity_json, c.minhash_blob, now])?;
+        let extra_json = c
+            .evasion
+            .as_ref()
+            .and_then(|e| serde_json::to_string(&serde_json::json!({ "evasion": e })).ok());
+        ins_feat.execute(params![id, c.token_json, c.entity_json, c.minhash_blob, extra_json, now])?;
     }
     Ok(())
 }

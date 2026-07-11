@@ -360,8 +360,16 @@ fn make(
     order_index: i64,
 ) -> NewChunk {
     let page = if ctx.opts.preserve_page_number { page } else { None };
-    let normalized = normalize::normalize(text, &ctx.opts.normalize);
-    let tokens = tokenize_lang(ctx.jieba, text, &ctx.opts.language);
+    // 带统计归一化（W2 入口对抗层）：normalized_text/normalized_hash 与全部特征
+    // （tokens/entities/ngrams/minhash）基于清洗后文本，恢复被隐形码点/同形字破坏的
+    // 一致性；块级统计随 NewChunk 落 chunk_features.extra_json（定位「扰动集中在
+    // 哪些块」），text 保留原始字节供取证下钻。分两步取中间产物：分词吃 sanitize
+    // 产物而非原文（词内零宽/同形注入会拆碎 token，击穿 lexical 通道），也非归一
+    // 终态（cn_numbers/去标点改变词面，偏离既有分词口径）；模板侧分词同口径，见
+    // import_service::run_import。
+    let (sanitized, evasion) = normalize::sanitize_with_stats(text);
+    let normalized = normalize::normalize_sanitized(&sanitized, &ctx.opts.normalize);
+    let tokens = tokenize_lang(ctx.jieba, &sanitized, &ctx.opts.language);
     // 命中余弦最高的样板（≥ 阈值）：标记 is_template 并记录其 id 供命中统计。
     let mut template_id: Option<String> = None;
     let mut best = -1.0f32;
@@ -398,6 +406,7 @@ fn make(
         token_json: serde_json::to_string(&tokens).ok(),
         entity_json: serde_json::to_string(&entities).ok(),
         minhash_blob: Some(features::minhash_to_blob(&features::minhash(&ngrams))),
+        evasion: if evasion.is_clean() { None } else { Some(evasion) },
     }
 }
 
@@ -641,6 +650,67 @@ mod tests {
             .unwrap();
         assert!(!normal.is_template);
         assert!(normal.template_id.is_none());
+    }
+
+    #[test]
+    fn tokens_come_from_sanitized_text() {
+        // W2-1「全部特征基于清洗后文本」：token_json 也是特征列。词内零宽拆词
+        // （微服\u{200B}务）与同形字替换（Pагe）不得拆碎/变形 token——否则
+        // normalized_hash/MinHash 恢复了命中，权重最高的 lexical 通道（tfidf 余弦、
+        // 共有词交集、模板余弦）仍被击穿
+        let jieba = Jieba::new();
+        let clean = "本项目采用分层解耦的微服务总体架构设计方案（Page 编号）。";
+        let dirty = "本项目采用分层解耦的微服\u{200B}务总体架构设计方案\
+                     （P\u{0430}\u{0433}\u{0435} 编号）。";
+        let a = chunk(&jieba, &blocks_md(clean), &ChunkerOptions::default());
+        let b = chunk(&jieba, &blocks_md(dirty), &ChunkerOptions::default());
+        let pa = a.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        let pb = b.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        assert_eq!(pa.token_json, pb.token_json, "扰动块 tokens 应与干净文本一致");
+        assert!(pb.token_json.as_ref().unwrap().contains("Page"), "同形字应折回拉丁词面");
+        // 回归护栏：直接对原文分词（修复前行为）产出的词面与清洗后不同——
+        // 同形词以西里尔原貌入 token，lexical 通道两侧词面失配
+        let raw = serde_json::to_string(&tokenize(&jieba, dirty)).unwrap();
+        assert!(!raw.contains("Page"), "原文分词不该有拉丁词面（否则本测试失去意义）");
+    }
+
+    #[test]
+    fn template_match_survives_invisible_injection() {
+        // 样板剔除的对抗面：雷同段落词内插零宽后，分词吃清洗产物，模板余弦不应失配
+        let jieba = Jieba::new();
+        let tpl = "我方承诺提供7×24小时技术支持服务，质保期内免费维护，确保系统稳定运行";
+        let opts = ChunkerOptions {
+            templates: vec![("tpl-1".to_string(), tokenize(&jieba, tpl))],
+            ..Default::default()
+        };
+        let dirty = "我方承诺提供7×24小时技术支\u{200B}持服务，质\u{200B}保期内免费维\u{200B}护，确保系统稳定运行。";
+        let chunks = chunk(&jieba, &blocks_md(dirty), &opts);
+        let para = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("7×24"))
+            .unwrap();
+        assert!(para.is_template, "零宽注入不应击穿模板匹配");
+        assert_eq!(para.template_id.as_deref(), Some("tpl-1"));
+    }
+
+    #[test]
+    fn evasion_stats_flow_into_chunks() {
+        let jieba = Jieba::new();
+        let clean = "本项目采用分层解耦的微服务总体架构设计方案。";
+        let dirty = "本项目采用分层\u{200B}解耦的微服务总体架构\u{200B}设计方案。";
+        let a = chunk(&jieba, &blocks_md(clean), &ChunkerOptions::default());
+        let b = chunk(&jieba, &blocks_md(dirty), &ChunkerOptions::default());
+        let pa = a.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        let pb = b.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        // 隐形字符不破坏 normalized_hash（词面通道恢复命中），原文保留供取证
+        assert_eq!(pa.normalized_hash, pb.normalized_hash);
+        assert_ne!(pa.exact_hash, pb.exact_hash, "exact_hash 基于原始字节，应不同");
+        assert!(pb.text.contains('\u{200B}'), "chunks.text 保留原始字节");
+        // 统计只在有发现的块上携带
+        assert!(pa.evasion.is_none());
+        let ev = pb.evasion.as_ref().unwrap();
+        assert_eq!(ev.zero_width, 2);
+        assert_eq!(ev.stripped_total(), 2);
     }
 
     #[test]

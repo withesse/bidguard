@@ -10,7 +10,7 @@ import { useToast } from "../components/Toast";
 import { errMsg, isTauri } from "../api/client";
 import { setWorkspaceSettings } from "../api";
 import { pickBidFiles } from "../engine";
-import type { DocumentDto } from "../api/types";
+import type { DocRole, DocumentDto } from "../api/types";
 import {
   useAppSettings,
   useDocuments,
@@ -85,7 +85,14 @@ export function CompareSetup() {
     setCfgApplied(true);
   }, [cfgRaw, ws, wsQuery.isLoading, cfgApplied]);
 
-  const parsed = useMemo(() => (documents ?? []).filter((d) => d.status === "parsed"), [documents]);
+  // 文档按角色分组：投标（参评可勾选）/ 招标+补遗（对减语料，不参评、不占 2-10 名额）
+  const bidDocs = useMemo(() => (documents ?? []).filter((d) => d.docRole === "bid"), [documents]);
+  const tenderDocs = useMemo(
+    () => (documents ?? []).filter((d) => d.docRole !== "bid"),
+    [documents],
+  );
+  // 参评可选集只含投标文件——招标文件混入会与各家的合法应答形成整片假雷同
+  const parsed = useMemo(() => bidDocs.filter((d) => d.status === "parsed"), [bidDocs]);
 
   // 首批解析完成后默认全选（≤10）
   useEffect(() => {
@@ -127,20 +134,27 @@ export function CompareSetup() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsId]);
 
-  const doImport = (paths: string[]) => {
-    importDocs.mutate(paths, {
-      onError: (e) => toast.show("导入失败：" + errMsg(e), "error"),
-    });
+  const doImport = (paths: string[], docRole?: DocRole) => {
+    importDocs.mutate(
+      { paths, docRole },
+      {
+        onError: (e) => toast.show("导入失败：" + errMsg(e), "error"),
+      },
+    );
   };
 
-  const onPick = async () => {
+  const onPick = async (docRole?: DocRole) => {
     if (!isTauri()) {
       toast.show("文件选择仅在桌面应用内可用", "info");
       return;
     }
     const picked = await pickBidFiles();
-    if (picked.length) doImport(picked);
+    if (picked.length) doImport(picked, docRole);
   };
+
+  // 重试沿用原角色：失败的招标文件重试后不能变成投标文件
+  const retryRoleOf = (d: DocumentDto): DocRole =>
+    d.docRole === "tender" || d.docRole === "tender_supplement" ? d.docRole : "bid";
 
   const toggle = (id: string) => {
     setChosen((prev) => {
@@ -270,63 +284,133 @@ export function CompareSetup() {
           </div>
         )}
 
-        {/* 文档卡片 */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-            gap: 12,
-          }}
-        >
-          {(documents ?? []).map((d) => (
-            <DocCard
-              key={d.id}
-              doc={d}
-              order={orderOf(d.id)}
-              chosen={chosen.has(d.id)}
-              onToggle={() => d.status === "parsed" && toggle(d.id)}
-              onPreview={() => nav(`/workspace/${wsId}/doc/${d.id}`)}
-              onRemove={() =>
-                removeDoc.mutate(d.id, {
-                  onError: (e) => toast.show("移除失败：" + errMsg(e), "error"),
-                })
-              }
-              onRetry={() =>
-                importDocs.mutate([d.filePath], {
-                  onError: (e) => toast.show("重试失败：" + errMsg(e), "error"),
-                })
-              }
-            />
-          ))}
+        {/* 投标文件组：参评勾选（2-10 份） */}
+        <div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: ink }}>投标文件</span>
+            <span style={{ fontSize: 11, color: mute }}>勾选 2-10 份参与交叉比对</span>
+          </div>
           <div
-            onClick={onPick}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onPick();
-              }
-            }}
             style={{
-              border: dragOver ? "1.5px dashed var(--accent, #4F58A8)" : `1.5px dashed ${border}`,
-              background: dragOver ? "rgba(79,88,168,0.07)" : "transparent",
-              borderRadius: 12,
-              minHeight: 92,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: dragOver ? "var(--accent, #4F58A8)" : mute,
-              fontSize: 12.5,
-              cursor: "pointer",
-              textAlign: "center",
-              padding: 12,
-              transition: "border-color 0.12s, background 0.12s, color 0.12s",
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+              gap: 12,
             }}
           >
-            ＋ 选择标书文件，或直接拖入窗口
-            <br />
+            {bidDocs.map((d) => (
+              <DocCard
+                key={d.id}
+                doc={d}
+                order={orderOf(d.id)}
+                chosen={chosen.has(d.id)}
+                onToggle={() => d.status === "parsed" && toggle(d.id)}
+                onPreview={() => nav(`/workspace/${wsId}/doc/${d.id}`)}
+                onRemove={() =>
+                  removeDoc.mutate(d.id, {
+                    onError: (e) => toast.show("移除失败：" + errMsg(e), "error"),
+                  })
+                }
+                onRetry={() =>
+                  importDocs.mutate(
+                    { paths: [d.filePath], docRole: retryRoleOf(d) },
+                    {
+                      onError: (e) => toast.show("重试失败：" + errMsg(e), "error"),
+                    },
+                  )
+                }
+              />
+            ))}
+            <div
+              onClick={() => onPick()}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onPick();
+                }
+              }}
+              style={{
+                border: dragOver ? "1.5px dashed var(--accent, #4F58A8)" : `1.5px dashed ${border}`,
+                background: dragOver ? "rgba(79,88,168,0.07)" : "transparent",
+                borderRadius: 12,
+                minHeight: 92,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: dragOver ? "var(--accent, #4F58A8)" : mute,
+                fontSize: 12.5,
+                cursor: "pointer",
+                textAlign: "center",
+                padding: 12,
+                transition: "border-color 0.12s, background 0.12s, color 0.12s",
+              }}
+            >
+              ＋ 选择标书文件，或直接拖入窗口
+              <br />
+            </div>
           </div>
+        </div>
+
+        {/* 招标文件组：对减语料（W3），不可勾选、不占参评名额 */}
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: ink }}>招标文件（含补遗/答疑）</span>
+            <span style={{ flex: 1 }} />
+            <Button kind="ghost" size="sm" onClick={() => onPick("tender")}>
+              ＋ 导入招标文件
+            </Button>
+            <Button kind="ghost" size="sm" onClick={() => onPick("tender_supplement")}>
+              ＋ 导入补遗/答疑
+            </Button>
+          </div>
+          {tenderDocs.length === 0 ? (
+            <div
+              style={{
+                border: `1.5px dashed ${border}`,
+                borderRadius: 12,
+                padding: "14px 16px",
+                fontSize: 12,
+                color: mute,
+                lineHeight: 1.7,
+              }}
+            >
+              尚未导入招标文件。导入本项目的招标文件与补遗/答疑后，可识别投标文件对招标条款的合法应答，
+              避免其被误判为相互抄袭；招标文件不参与投标文件间的交叉比对，也不占参评名额。
+            </div>
+          ) : (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                gap: 12,
+              }}
+            >
+              {tenderDocs.map((d) => (
+                <DocCard
+                  key={d.id}
+                  doc={d}
+                  order={-1}
+                  chosen={false}
+                  onToggle={() => {}}
+                  onPreview={() => nav(`/workspace/${wsId}/doc/${d.id}`)}
+                  onRemove={() =>
+                    removeDoc.mutate(d.id, {
+                      onError: (e) => toast.show("移除失败：" + errMsg(e), "error"),
+                    })
+                  }
+                  onRetry={() =>
+                    importDocs.mutate(
+                      { paths: [d.filePath], docRole: retryRoleOf(d) },
+                      {
+                        onError: (e) => toast.show("重试失败：" + errMsg(e), "error"),
+                      },
+                    )
+                  }
+                />
+              ))}
+            </div>
+          )}
         </div>
 
         {/* 检测设置 */}
@@ -440,6 +524,8 @@ function DocCard({
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
   const cardBg = dark ? "#1E1E25" : C.white;
   const border = chosen ? accent : dark ? "rgba(255,255,255,0.07)" : C.line;
+  // 招标类文档不可勾选参评（父级 onToggle 已为 no-op，这里同步收掉可点击的视觉暗示）
+  const selectable = doc.status === "parsed" && doc.docRole === "bid";
 
   return (
     <div
@@ -457,7 +543,7 @@ function DocCard({
         border: `1.5px solid ${border}`,
         borderRadius: 12,
         padding: "12px 14px",
-        cursor: doc.status === "parsed" ? "pointer" : "default",
+        cursor: selectable ? "pointer" : "default",
         opacity: doc.status === "failed" ? 0.75 : 1,
         display: "flex",
         flexDirection: "column",
@@ -544,6 +630,17 @@ function DocCard({
         </span>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: mute }}>
+        {/* 角色徽标：招标/补遗不参评，给出与投标卡片一眼可辨的标识 */}
+        {doc.docRole === "tender" && (
+          <Pill fg="#7A5AB8" bg="rgba(122,90,184,0.13)" size={10}>
+            招标文件
+          </Pill>
+        )}
+        {doc.docRole === "tender_supplement" && (
+          <Pill fg="#7A5AB8" bg="rgba(122,90,184,0.13)" size={10}>
+            补遗/答疑
+          </Pill>
+        )}
         {doc.status === "parsed" && (
           <>
             <span>{doc.pageCount ?? "?"} 页</span>

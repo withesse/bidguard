@@ -5,6 +5,7 @@ pub mod compare_repo;
 pub mod document_repo;
 pub mod embedding_repo;
 pub mod fact_repo;
+pub mod image_repo;
 pub mod job_repo;
 pub mod settings_repo;
 pub mod template_repo;

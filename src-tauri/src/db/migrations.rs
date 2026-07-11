@@ -16,6 +16,9 @@ const MIGRATIONS: &[&str] = &[
     CLUSTER_MEMBERS_INDEX_V10,
     DOC_TRUNCATION_NOTICE_V11,
     LICENSE_USAGE_V12,
+    EVASION_JSON_V13,
+    DOC_ROLE_V14,
+    DOCUMENT_IMAGES_V15,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -341,6 +344,44 @@ CREATE INDEX idx_license_usage_job ON license_usage(job_id);
 CREATE INDEX idx_license_usage_state ON license_usage(state);
 ";
 
+// V13：documents 增 evasion_json（W2 入口对抗层的文档级规避统计：隐形码点/同形字折叠/
+// 混合脚本各类计数 + 受影响块数 + 最大单块浓度；块级分布在 chunk_features.extra_json）。
+// 可空向后兼容：老工作区行为 NULL；新版导入无发现也保持 NULL（列非空即「有发现」）。
+// 注：执行方案迁移台账原预分配 V12 给本列，但 license MVP 先行合入占用了 V12
+// （license_usage 表，已发布只增不改），故顺延为 V13；台账后续编号（doc_role 等）相应顺移。
+const EVASION_JSON_V13: &str = "
+ALTER TABLE documents ADD COLUMN evasion_json TEXT;
+";
+
+// V14：documents 增 doc_role（'bid' 投标 | 'tender' 招标文件 | 'tender_supplement' 补遗/答疑）。
+// W3 合法共享剥离层的事实基础：招标文件被误选参评会与各家对其条款的合法应答形成整片假雷同，
+// 后续对减/k-共现查证也都依赖「哪些文档是招标文件」。旧行靠 DEFAULT 'bid' 向后兼容。
+// 注：执行方案迁移台账原预分配 V13 给本列，因 license_usage 占用 V12 整体顺延一位（见 V13 注释）。
+const DOC_ROLE_V14: &str = "
+ALTER TABLE documents ADD COLUMN doc_role TEXT NOT NULL DEFAULT 'bid';
+";
+
+// V15：内嵌图片同源指纹表（W1-4 取证）。每行是一张文档内位图（docx word/media 或
+// PDF 页对象），比对期两两跨文档碰撞：sha256 相等为硬命中（跨容器稳定的精确指纹），
+// dhash 汉明距离小为近似命中。dhash 存 64 位 dHash 的位型（以 i64 存储，比对只做异或
+// 计数不做算术，符号无关）；整页扫描图 dhash 为 NULL——只做 exact 不做 near，防「都是
+// 空白页/同制式表格」误报。document_id 外键 ON DELETE CASCADE + 索引：删文档级联清理
+// 图片行，与 V10 级联外键须有索引同理。旧文档无行 → 图片信号自然缺席，向后兼容。
+const DOCUMENT_IMAGES_V15: &str = "
+CREATE TABLE document_images (
+  id          TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  idx         INTEGER NOT NULL,
+  source      TEXT NOT NULL,     -- docx | pdf
+  page        INTEGER,           -- PDF 页码（1 起）；docx 为 NULL
+  width       INTEGER NOT NULL,
+  height      INTEGER NOT NULL,
+  sha256      TEXT NOT NULL,
+  dhash       INTEGER            -- 64 位 dHash 位型；整页图为 NULL（只做 exact）
+);
+CREATE INDEX idx_document_images_doc ON document_images(document_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +416,149 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM source_templates WHERE enabled = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(tpl, 3, "应内置 3 条默认模板");
+    }
+
+    #[test]
+    fn evasion_json_migration_applies_to_old_db_and_is_idempotent() {
+        // 老库（V12：license MVP 版本的数据文件）升级：run() 只补 V13，
+        // documents.evasion_json 可写；重跑幂等
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..12] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 12).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+             status, evasion_json, created_at, updated_at)
+             VALUES ('d1', 'w1', 'f', 'p', 'h', 'txt', 'parsed', '{\"zeroWidth\":3}', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let ev: Option<String> = conn
+            .query_row("SELECT evasion_json FROM documents WHERE id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ev.as_deref(), Some("{\"zeroWidth\":3}"));
+
+        // 幂等：重跑不报错、版本不变
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn doc_role_migration_backfills_bid_and_is_idempotent() {
+        // 老库（V13：doc_role 列出现之前）升级：既有文档行全部回填 'bid'（DEFAULT 生效），
+        // 新角色可写入且同 hash 双角色可并存；重跑幂等
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..13] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 13).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+             status, created_at, updated_at)
+             VALUES ('d1', 'w1', 'f', 'p', 'h', 'txt', 'parsed', 't', 't')",
+            [],
+        )
+        .unwrap();
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        let role: String = conn
+            .query_row("SELECT doc_role FROM documents WHERE id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(role, "bid", "既有行升级后应回填默认角色 bid");
+
+        // 同 hash 双角色并存（去重收窄为同角色后允许的形态）
+        conn.execute(
+            "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+             status, doc_role, created_at, updated_at)
+             VALUES ('d2', 'w1', 'f', 'p', 'h', 'txt', 'parsed', 'tender', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let tender: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE file_hash = 'h' AND doc_role = 'tender'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tender, 1);
+
+        // 幂等：重跑不报错、版本不变
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn document_images_migration_cascades_and_is_idempotent() {
+        // 老库（V14：document_images 表出现之前）升级：补 V15，表可写；删文档级联清空图片行
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap(); // 级联删除需显式开启
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..14] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 14).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+             status, created_at, updated_at)
+             VALUES ('d1', 'w1', 'f', 'p', 'h', 'pdf', 'parsed', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document_images (id, document_id, idx, source, page, width, height, sha256, dhash)
+             VALUES ('i1', 'd1', 0, 'pdf', 3, 800, 600, 'abc', 123), ('i2', 'd1', 1, 'pdf', NULL, 800, 600, 'def', NULL)",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_images WHERE document_id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        // 删文档 → 图片行级联清空
+        conn.execute("DELETE FROM documents WHERE id = 'd1'", []).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM document_images", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "删文档后 document_images 应级联清空");
+
+        // 幂等：重跑不报错、版本不变
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
     }
 
     #[test]

@@ -12,6 +12,7 @@ import type {
   ClusterSummaryDto,
   CompareRequest,
   CompareSummaryDto,
+  DocRole,
   DocumentDto,
   DocumentPreviewDto,
   JobDto,
@@ -36,8 +37,9 @@ export const deleteWorkspace = (workspaceId: string) =>
   call<void>("delete_workspace", { workspaceId });
 
 // —— 文档 ——
-export const importDocuments = (workspaceId: string, paths: string[]) =>
-  call<JobDto>("import_documents", { workspaceId, paths });
+/** docRole 缺省按投标文件（bid）导入；招标文件/补遗答疑传 tender / tender_supplement。 */
+export const importDocuments = (workspaceId: string, paths: string[], docRole?: DocRole) =>
+  call<JobDto>("import_documents", { workspaceId, paths, docRole: docRole ?? null });
 export const listDocuments = (workspaceId: string) =>
   call<DocumentDto[]>("list_documents", { workspaceId });
 export const getDocumentPreview = (documentId: string) =>

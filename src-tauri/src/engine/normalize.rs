@@ -1,6 +1,13 @@
 // 文本标准化（设计文档 §8.3）：NFKC、全半角、空白、标点、中文数字归一。
 // 目标是让「每月十日前支付」与「每月 10 日前 支付」归一到同一形态，
 // 降低无意义差异对相似度与 hash 命中的干扰。
+//
+// W2 入口对抗层（执行方案 §4 条目 1/2）：NFKC 不删除零宽/双向控制符，1-3 个隐形码点
+// 即可让 exact_hash / normalized_hash / MinHash / embedding 全部失配（Bad Characters,
+// IEEE S&P 2022）。故 NFKC 之后显式剥离隐形码点并做跨脚本同形字折叠，逐类计数——
+// 正常标书不含这些码点，非零计数本身就是高置信规避证据（供围标 evasion 信号消费）。
+use crate::engine::confusables;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
@@ -21,10 +28,138 @@ impl Default for NormalizeOptions {
     }
 }
 
+/// 隐形码点剥离 + 同形字折叠 + 混合脚本红旗的逐类统计（W2 入口对抗层）。
+/// 字段口径同时用于块级分布（chunk_features.extra_json）与文档级聚合
+/// （documents.evasion_json），serde camelCase 与前端 DTO 惯例一致。
+/// 全零即「无发现」——干净文本不产生任何统计负担。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvisibleStats {
+    /// 零宽字符：U+200B–U+200D、U+200E/200F、U+FEFF。
+    pub zero_width: u32,
+    /// 双向控制符：U+202A–U+202E、U+2066–U+2069。
+    pub bidi: u32,
+    /// Tags 块：U+E0000–U+E007F。
+    pub tags: u32,
+    /// 变体选择符：U+FE00–U+FE0F、U+E0100–U+E01EF。
+    pub variation: u32,
+    /// 跨脚本同形字折叠命中数（confusables::fold）。
+    pub confusable_folds: u32,
+    /// 同词内混合脚本红旗数（confusables::scan_mixed_script）。
+    pub mixed_script_words: u32,
+    /// 混合脚本采样词（证据下钻用；块内去重、有上限，见 confusables::SAMPLE_MAX）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mixed_script_samples: Vec<String>,
+}
+
+impl InvisibleStats {
+    /// 被剥离的隐形码点总数。
+    pub fn stripped_total(&self) -> u32 {
+        self.zero_width + self.bidi + self.tags + self.variation
+    }
+
+    /// 改写类命中总数（剥离 + 折叠），用于「单块浓度」——混合脚本红旗是
+    /// 检测信号不改写文本，不计入浓度分母口径。
+    pub fn perturbation_total(&self) -> u32 {
+        self.stripped_total() + self.confusable_folds
+    }
+
+    /// 无任何发现（块级不落 extra_json、文档级不写 evasion_json 的判据）。
+    pub fn is_clean(&self) -> bool {
+        self.perturbation_total() == 0 && self.mixed_script_words == 0
+    }
+}
+
+/// 隐形码点分类（W2-1 剥离集合）。范围取自执行方案拍板值：Bad Characters 攻击的
+/// 全部注入面 + 方向控制符 + Tags 隐写块 + 变体选择符。emoji ZWJ 序列 / 真实 RTL
+/// 文段会被误剥离，但标书语料基本不含，且 chunks.text 保留原始字节可回查。
+enum InvisibleClass {
+    ZeroWidth,
+    Bidi,
+    Tags,
+    Variation,
+}
+
+fn invisible_class(c: char) -> Option<InvisibleClass> {
+    match c as u32 {
+        0x200B..=0x200F | 0xFEFF => Some(InvisibleClass::ZeroWidth),
+        0x202A..=0x202E | 0x2066..=0x2069 => Some(InvisibleClass::Bidi),
+        0xE0000..=0xE007F => Some(InvisibleClass::Tags),
+        0xFE00..=0xFE0F | 0xE0100..=0xE01EF => Some(InvisibleClass::Variation),
+        _ => None,
+    }
+}
+
+/// 单遍剥离隐形码点并逐类计数。调用方已确认文本含隐形码点（见 normalize_with_stats
+/// 的预扫快路径），故直接重建字符串。
+fn strip_invisible(s: &str, stats: &mut InvisibleStats) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match invisible_class(c) {
+            Some(InvisibleClass::ZeroWidth) => stats.zero_width += 1,
+            Some(InvisibleClass::Bidi) => stats.bidi += 1,
+            Some(InvisibleClass::Tags) => stats.tags += 1,
+            Some(InvisibleClass::Variation) => stats.variation += 1,
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 /// 归一化文本：NFKC（全角→半角）→ 中文数字+单位转阿拉伯 → 大小写/标点/空白处理。
+/// 丢弃统计的薄包装；需要规避统计的调用方（chunker）用 normalize_with_stats。
+// 生产入口 chunker 已改走 normalize_with_stats，本包装当前仅测试在用；保留为稳定
+// 简单 API——M2 的渲染-OCR 交叉验证（W2-4）比对双方文本时将直接使用。
+#[allow(dead_code)]
 pub fn normalize(text: &str, opts: &NormalizeOptions) -> String {
-    let s: String = text.nfkc().collect();
-    let s = normalize_cn_numbers(&s);
+    normalize_with_stats(text, opts).0
+}
+
+/// 带规避统计的归一化 = 前置清洗（sanitize_with_stats）+ 后半程（normalize_sanitized）。
+/// 拆成两段的原因见各自注释；只要终态的调用方用本函数即可，行为与拆分前完全一致。
+pub fn normalize_with_stats(text: &str, opts: &NormalizeOptions) -> (String, InvisibleStats) {
+    let (s, stats) = sanitize_with_stats(text);
+    (normalize_sanitized(&s, opts), stats)
+}
+
+/// 前置清洗（W2 入口对抗层）：NFKC → 隐形码点剥离 → 混合脚本扫描 → 同形字折叠。
+/// 顺序约束：剥离在扫描/折叠之前（零宽插入不能拆散同形词的字符 run）；
+/// 扫描在折叠之前（折叠会把西里尔改写成拉丁，先扫后折才能留下红旗证据）。
+///
+/// 单独暴露给分词方（chunker 分块 / import_service 模板）：token_json 也是特征列，
+/// 必须基于清洗后文本（执行方案 §4 W2-1「全部特征基于清洗后文本」）——tokens 若直接
+/// 来自原文，词内零宽/同形注入会把词拆碎/变形，lexical 通道（tfidf 余弦、共有词交集、
+/// 模板余弦）在哈希一致性恢复后仍被击穿。但分词也不能吃归一化终态：cn_numbers 改写
+/// 数词、去标点/空白粘连词边界，都会偏离既有分词口径，故以本中间产物为分词输入。
+pub fn sanitize_with_stats(text: &str) -> (String, InvisibleStats) {
+    let mut stats = InvisibleStats::default();
+    let mut s: String = text.nfkc().collect();
+    // 预扫快路径：隐形码点与希腊/西里尔字符在正常标书中都不出现，先一遍探测再决定
+    // 是否走剥离/折叠重建，让干净文本只多付一次线性扫描（验收：10 万字增耗 <5%）。
+    let mut has_invisible = false;
+    let mut has_foreign = false;
+    for c in s.chars() {
+        if invisible_class(c).is_some() {
+            has_invisible = true;
+        } else if confusables::is_cyrillic(c) || confusables::is_greek(c) {
+            has_foreign = true;
+        }
+    }
+    if has_invisible {
+        s = strip_invisible(&s, &mut stats);
+    }
+    if has_foreign {
+        confusables::scan_mixed_script(&s, &mut stats);
+        s = confusables::fold(&s, &mut stats);
+    }
+    (s, stats)
+}
+
+/// 归一化后半程：中文数字归一 → 大小写/标点/空白处理。
+/// 输入必须是 sanitize_with_stats 的产物——chunker 先取中间产物喂分词、再走本函数
+/// 得 normalized_text，两步复用同一次 NFKC/剥离/折叠，避免重复清洗。
+pub fn normalize_sanitized(sanitized: &str, opts: &NormalizeOptions) -> String {
+    let s = normalize_cn_numbers(sanitized);
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     for (i, &c) in chars.iter().enumerate() {
@@ -456,5 +591,84 @@ mod tests {
     fn hashes_are_stable() {
         assert_eq!(sha256_hex(b"abc").len(), 64);
         assert_eq!(sha256_hex(b"abc"), sha256_hex(b"abc"));
+    }
+
+    #[test]
+    fn invisible_codepoints_stripped_hash_matches_clean_text() {
+        // 验收用例：同段文本插入 3 个隐形字符（U+200B/U+202E/U+FE0F）后
+        // normalized_hash 与干净文本完全一致，InvisibleStats 逐类计数正确
+        let opts = NormalizeOptions::default();
+        let clean = "投标报价为人民币12800000元整，包含全部软硬件费用。";
+        let dirty = "投标报价\u{200B}为人民币128\u{202E}00000元整，包含全部软硬件费\u{FE0F}用。";
+        let (n_dirty, stats) = normalize_with_stats(dirty, &opts);
+        assert_eq!(n_dirty, normalize(clean, &opts));
+        assert_eq!(
+            sha256_hex(n_dirty.as_bytes()),
+            sha256_hex(normalize(clean, &opts).as_bytes())
+        );
+        assert_eq!(stats.zero_width, 1);
+        assert_eq!(stats.bidi, 1);
+        assert_eq!(stats.variation, 1);
+        assert_eq!(stats.tags, 0);
+        assert_eq!(stats.stripped_total(), 3);
+        assert!(!stats.is_clean());
+    }
+
+    #[test]
+    fn all_invisible_classes_counted() {
+        let s = "a\u{200B}b\u{200C}c\u{200D}d\u{FEFF}e\u{200E}f\u{200F}g\
+                 \u{202A}h\u{2066}i\u{E0001}j\u{FE00}k\u{E0100}l";
+        let (n, st) = normalize_with_stats(s, &NormalizeOptions::default());
+        assert_eq!(n, "abcdefghijkl");
+        assert_eq!(st.zero_width, 6, "200B-200D + FEFF + 200E/200F");
+        assert_eq!(st.bidi, 2, "202A + 2066");
+        assert_eq!(st.tags, 1, "E0001");
+        assert_eq!(st.variation, 2, "FE00 + E0100");
+        assert_eq!(st.stripped_total(), 11);
+    }
+
+    #[test]
+    fn sanitize_intermediate_contract() {
+        // 分词输入口径契约：NFKC 归一 + 剥离隐形码点 + 折叠同形字，但保留大小写/
+        // 标点/中文数词原貌（cn_numbers 与大小写/标点处理属后半程 normalize_sanitized）。
+        // 契约破坏会让 token_json 与模板分词的口径漂移，见 sanitize_with_stats 注释。
+        let (s, st) = sanitize_with_stats("Ｐage\u{200B}系统 一百八十天（P\u{0430}ge 编号）。");
+        assert_eq!(s, "Page系统 一百八十天(Page 编号)。");
+        assert_eq!(st.zero_width, 1);
+        assert_eq!(st.confusable_folds, 1);
+        // 与终态归一的组合关系：normalize_with_stats = sanitize + normalize_sanitized
+        let opts = NormalizeOptions::default();
+        let (full, _) = normalize_with_stats("Ｐage\u{200B}系统 一百八十天（P\u{0430}ge 编号）。", &opts);
+        assert_eq!(full, normalize_sanitized(&s, &opts));
+    }
+
+    #[test]
+    fn clean_text_produces_clean_stats() {
+        let (_, st) = normalize_with_stats(
+            "正常标书文本 normal bid text 123，金额1,000,000元。",
+            &NormalizeOptions::default(),
+        );
+        assert!(st.is_clean());
+        assert_eq!(st, InvisibleStats::default());
+    }
+
+    #[test]
+    fn normalize_throughput_sane_on_100k_chars() {
+        // 验收意图：10 万字文本 normalize 增耗 <5%。改版后无旧实现可对比，
+        // 以宽松绝对上限拦截数量级退化（预扫快路径失效会直接撞线），
+        // 口径与 compare_service 的 60s 性能测试同风格。
+        let para = "本项目采用分层解耦的微服务总体架构设计，投标报价为人民币12800000元整。";
+        let text = para.repeat(100_000 / para.chars().count() + 1);
+        assert!(text.chars().count() >= 100_000);
+        let t0 = std::time::Instant::now();
+        let (_, st) = normalize_with_stats(&text, &NormalizeOptions::default());
+        let elapsed = t0.elapsed();
+        assert!(st.is_clean());
+        assert!(
+            elapsed.as_millis() < 2000,
+            "10 万字归一化应远快于 2s（debug 档宽松上限），实际 {:?}",
+            elapsed
+        );
+        eprintln!("[perf] 10 万字 normalize_with_stats 耗时 {elapsed:?}");
     }
 }

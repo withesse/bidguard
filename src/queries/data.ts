@@ -15,6 +15,7 @@ import { toast } from "../components/Toast";
 import type {
   ClusterFilter,
   CompareRequest,
+  DocRole,
   JobDto,
   NewTemplateDto,
   TemplateDto,
@@ -242,7 +243,9 @@ export function useDeleteWorkspace() {
 export function useImportDocuments(workspaceId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (paths: string[]) => api.importDocuments(workspaceId, paths),
+    // docRole 缺省 bid（投标）；招标文件/补遗答疑由招标组导入按钮传入
+    mutationFn: ({ paths, docRole }: { paths: string[]; docRole?: DocRole }) =>
+      api.importDocuments(workspaceId, paths, docRole),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["documents", workspaceId] });
       void qc.invalidateQueries({ queryKey: ["jobs"] });

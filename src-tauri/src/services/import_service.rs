@@ -1,7 +1,7 @@
 // 文档导入：校验 → sha256 哈希 → 去重（批内 / 工作区内 / 跨工作区缓存）→ 解析 →
 // 结构化分块（三档粒度 + 标题路径 + 模板标记 + 特征）→ 批量事务入库。
 // 解析失败只标记该文档 failed，不中断整个任务；取消时未入库的文档不留半成品。
-use crate::db::repo::{chunk_repo, document_repo, template_repo, workspace_repo};
+use crate::db::repo::{chunk_repo, document_repo, image_repo, template_repo, workspace_repo};
 use crate::db::repo::chunk_repo::NewChunk;
 use crate::engine::chunker::{self, ChunkerOptions};
 use crate::engine::parse;
@@ -31,6 +31,9 @@ pub struct ImportOptions {
     /// OCR 档位 key（PP-OCRv6 tiny/small/medium）。
     pub ocr_model: String,
     pub language: String, // auto | zh | en
+    /// PDF 渲染-OCR 抽样交叉验证（W2-4）。本里程碑只预置键并计入 options_hash，
+    /// 交叉验证行为在 M2 实现（执行方案全局裁决 3：options_hash 只 bump 一次 v5→v6）。
+    pub pdf_cross_check: bool,
 }
 
 impl Default for ImportOptions {
@@ -54,6 +57,7 @@ impl ImportOptions {
             ocr_docx_images: cfg.parser.ocr_docx_images,
             ocr_model: cfg.parser.ocr_model.clone(),
             language: cfg.compare.language.clone(),
+            pdf_cross_check: cfg.parser.pdf_cross_check,
         }
     }
 
@@ -61,9 +65,23 @@ impl ImportOptions {
     /// templates_digest 是启用中查重源模板集的摘要——模板集是分块的真实输入（决定 is_template
     /// 标记），必须并入指纹：否则工作区 A 导入后增删模板、工作区 B 导入同一文件命中旧缓存，
     /// 会复用过期的 is_template 标记 → 新增模板不生效(误报)、停用模板仍剔除(漏报)。
+    /// v5→v6 一次合并三件事（执行方案全局裁决 3「只 bump 一次」）：W2 归一化流水线变更
+    /// （隐形码点剥离 + 同形字折叠改变 normalized_text/tokens）+ pdf_cross_check 预置键 +
+    /// 取证指纹版本预置键（fpv，见 report::FINGERPRINT_SCHEMA_VERSION——M1 扩展 Fingerprint
+    /// 时只把值 1→2，不再动版本前缀），旧缓存的分块/统计/指纹不可复用，必须整体失效重建；
+    /// embedding 缓存按 normalized_hash 寻址，随之自然失效。
     pub fn options_hash(&self, templates_digest: &str) -> String {
+        self.options_hash_with_fpv(
+            templates_digest,
+            crate::engine::report::FINGERPRINT_SCHEMA_VERSION,
+        )
+    }
+
+    /// fpv 单独入参：常量在单测里无法「变化」，参数化让「fpv 变则 hash 变」可直接断言。
+    /// 生产路径只经 options_hash 走 FINGERPRINT_SCHEMA_VERSION。
+    fn options_hash_with_fpv(&self, templates_digest: &str, fpv: u32) -> String {
         let s = format!(
-            "v5|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|lang={}|tpl={}",
+            "v6|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|xchk={}|fpv={}|lang={}|tpl={}",
             self.min_paragraph_chars,
             self.normalize.ignore_case,
             self.normalize.ignore_punctuation,
@@ -73,6 +91,8 @@ impl ImportOptions {
             self.remove_header_footer,
             self.ocr_docx_images,
             self.ocr_model,
+            self.pdf_cross_check,
+            fpv,
             self.language,
             templates_digest,
         );
@@ -93,6 +113,10 @@ pub fn run_import(
     workspace_id: &str,
     paths: &[String],
     opts: &ImportOptions,
+    // 本批文件的文档角色（'bid' | 'tender' | 'tender_supplement'，command 层已校验取值）。
+    // 请求级参数而非 ImportOptions：角色不影响解析产物，绝不能进 options_hash——
+    // 否则同一文件换角色导入会错过跨工作区分块缓存。
+    doc_role: &str,
 ) -> AppResult<()> {
     if paths.is_empty() {
         return Err(AppError::new(AppErrorCode::InvalidConfig, "未选择任何文件"));
@@ -114,7 +138,13 @@ pub fn run_import(
         let templates_digest = crate::engine::normalize::sha256_hex(digest_src.as_bytes());
         let templates: Vec<(String, Vec<String>)> = raw
             .into_iter()
-            .map(|(id, t)| (id, tokenize(&jieba, &t)))
+            .map(|(id, t)| {
+                // 模板分词与分块分词（chunker::make）走同一 sanitize 口径（NFKC+隐形
+                // 剥离+同形折叠），否则模板余弦两边词面不一致，is_template 匹配失准；
+                // 模板是用户维护的查重源，其规避统计无证据意义，丢弃。
+                let (clean, _) = crate::engine::normalize::sanitize_with_stats(&t);
+                (id, tokenize(&jieba, &clean))
+            })
             .filter(|(_, t)| !t.is_empty())
             .collect();
         let opts_out = ChunkerOptions {
@@ -168,20 +198,21 @@ pub fn run_import(
         let file_hash = hash_file(path, ctx)?;
 
         let dup_in_batch = !seen_hashes.insert(file_hash.clone());
-        // 连接即取即还：progress() 自己也要取连接，持有期间调用会饿死小连接池
+        // 连接即取即还：progress() 自己也要取连接，持有期间调用会饿死小连接池。
+        // 去重按同角色收窄：同一文件可以以 bid / tender 两种角色各存一份
         let dup_in_ws = {
             let conn = ctx.db.get()?;
-            document_repo::find_by_hash(&conn, workspace_id, &file_hash)?.is_some()
+            document_repo::find_by_hash(&conn, workspace_id, &file_hash, doc_role)?.is_some()
         };
         if dup_in_batch || dup_in_ws {
             skipped += 1;
             ctx.progress("hash", i + 1, total, format!("{file_name} 已存在，跳过"));
             continue;
         }
-        // 重试路径：同 hash 的失败残留行先清掉，避免重试成功后失败行与新行并存
+        // 重试路径：同 hash 同角色的失败残留行先清掉，避免重试成功后失败行与新行并存
         {
             let conn = ctx.db.get()?;
-            document_repo::remove_failed_by_hash(&conn, workspace_id, &file_hash)?;
+            document_repo::remove_failed_by_hash(&conn, workspace_id, &file_hash, doc_role)?;
         }
         work.push(WorkItem {
             path: p.clone(),
@@ -200,7 +231,8 @@ pub fn run_import(
     let results: Vec<AppResult<()>> = work
         .par_iter()
         .map(|item| {
-            let r = import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash);
+            let r =
+                import_one(ctx, &jieba, workspace_id, item, &chunker_opts, opts, &options_hash, doc_role);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             ctx.progress("parse", n, parse_total, format!("已解析 {n} / {parse_total}"));
             r
@@ -237,10 +269,13 @@ fn import_one(
     chunker_opts: &ChunkerOptions,
     opts: &ImportOptions,
     options_hash: &str,
+    doc_role: &str,
 ) -> AppResult<()> {
     ctx.check()?;
 
-    // 跨工作区缓存：同内容、同解析配置的文件已解析过 → 复制分块与特征，跳过解析
+    // 跨工作区缓存：同内容、同解析配置的文件已解析过 → 复制分块与特征，跳过解析。
+    // 缓存匹配按 hash+options、与角色无关（角色不影响分块产物）；新行的 doc_role
+    // 取本次请求的角色，不继承缓存源——同一文件以另一角色复用缓存时角色必须是新的
     {
         let conn = ctx.db.get()?;
         if let Some(src) = document_repo::find_parsed_by_hash(&conn, &item.file_hash, options_hash)? {
@@ -255,6 +290,7 @@ fn import_one(
                 &item.file_hash,
                 &item.file_type,
                 options_hash,
+                doc_role,
             )?;
             drop(conn);
             let mut conn = ctx.db.get()?;
@@ -278,6 +314,7 @@ fn import_one(
             &item.file_hash,
             &item.file_type,
             options_hash,
+            doc_role,
         )?
     };
 
@@ -318,6 +355,7 @@ fn import_one(
             let char_count = pb.legacy_text.chars().count();
             let fingerprint_json = serde_json::to_string(&pb.fingerprint)
                 .unwrap_or_else(|_| "{}".to_string());
+            let evasion_json = aggregate_evasion(&chunks);
             // 写入持锁串行（大文档事务可达数秒，不能与他文档并发写）
             let _w = ctx.write_lock();
             let mut conn = ctx.db.get()?;
@@ -331,6 +369,8 @@ fn import_one(
                 &fingerprint_json,
                 pb.ocr_layout_json.as_deref(),
                 pb.truncation_notice.as_deref(),
+                evasion_json.as_deref(),
+                &pb.image_hashes,
             ) {
                 // 入库失败时把文档标失败（可见可重试），不留 'parsing' 孤儿
                 let _ = document_repo::mark_failed(&conn, &doc.id, "解析结果入库失败");
@@ -339,6 +379,61 @@ fn import_one(
             Ok(())
         }
     }
+}
+
+/// 文档级规避统计聚合（写 documents.evasion_json）：各类计数 + 受影响块数 + 最大单块浓度。
+/// 只聚合段落级分块：三档粒度相互包含（sentence ⊂ paragraph ⊂ section），跨档求和会把
+/// 同一处扰动计三次；段落级覆盖全部正文/表格行/标题，且是前端下钻的定位单位
+/// （低于 min_chars 的碎段只进 section 累计文本，其扰动不计入文档级——这些文本
+/// 同样几乎不参与比对，可接受）。无任何发现返回 None（列保持 NULL，与老工作区行为一致）。
+fn aggregate_evasion(chunks: &[NewChunk]) -> Option<String> {
+    /// 文档级 evasion_json 结构：InvisibleStats 字段展平 + 分布口径。
+    /// 只做总数不做浓度分布证明力弱（执行方案风险条目），故必须落块级分布。
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DocEvasion {
+        #[serde(flatten)]
+        stats: crate::engine::normalize::InvisibleStats,
+        /// 有任一发现的段落级分块数。
+        affected_chunks: u32,
+        /// 最大单块浓度：改写类命中数（剥离+折叠）/ 块字符数——扰动聚集度证据。
+        max_chunk_concentration: f64,
+    }
+
+    // 文档级采样词多于块级上限，够呈现层列举即可
+    const DOC_SAMPLE_MAX: usize = 10;
+    let mut agg = crate::engine::normalize::InvisibleStats::default();
+    let mut affected = 0u32;
+    let mut max_concentration = 0f64;
+    for c in chunks.iter().filter(|c| c.chunk_level == "paragraph") {
+        let Some(e) = &c.evasion else { continue };
+        agg.zero_width += e.zero_width;
+        agg.bidi += e.bidi;
+        agg.tags += e.tags;
+        agg.variation += e.variation;
+        agg.confusable_folds += e.confusable_folds;
+        agg.mixed_script_words += e.mixed_script_words;
+        for s in &e.mixed_script_samples {
+            if agg.mixed_script_samples.len() < DOC_SAMPLE_MAX
+                && !agg.mixed_script_samples.contains(s)
+            {
+                agg.mixed_script_samples.push(s.clone());
+            }
+        }
+        affected += 1;
+        let conc =
+            f64::from(e.perturbation_total()) / c.text.chars().count().max(1) as f64;
+        max_concentration = max_concentration.max(conc);
+    }
+    if affected == 0 {
+        return None;
+    }
+    serde_json::to_string(&DocEvasion {
+        stats: agg,
+        affected_chunks: affected,
+        max_chunk_concentration: max_concentration,
+    })
+    .ok()
 }
 
 /// 「分块写入 + 文档置 parsed」单事务：要么全有要么全无。
@@ -353,9 +448,12 @@ fn persist_parsed(
     fingerprint_json: &str,
     ocr_layout_json: Option<&str>,
     truncation_notice: Option<&str>,
+    evasion_json: Option<&str>,
+    image_hashes: &[parse::ImageHash],
 ) -> AppResult<()> {
     let tx = conn.transaction()?;
     chunk_repo::insert_all(&tx, doc_id, chunks)?;
+    image_repo::insert_images(&tx, doc_id, image_hashes)?;
     document_repo::mark_parsed(
         &tx,
         doc_id,
@@ -365,6 +463,7 @@ fn persist_parsed(
         fingerprint_json,
         ocr_layout_json,
         truncation_notice,
+        evasion_json,
     )?;
     tx.commit()?;
     Ok(())
@@ -378,6 +477,9 @@ fn persist_cached(
 ) -> AppResult<()> {
     let tx = conn.transaction()?;
     chunk_repo::copy_all(&tx, &src.id, doc_id)?;
+    // 图片同源指纹随缓存一并复制（复用路径若丢行，同一文件「重新导入也拿不到图片信号」，
+    // 与 evasion 同为执行方案工程审查 HIGH 的缓存吞指纹问题）
+    image_repo::copy_images(&tx, &src.id, doc_id)?;
     // OCR 版面随缓存一并复制（扫描件复用解析时文本层不丢）
     let src_layout = document_repo::get_ocr_layout(&tx, &src.id)?;
     document_repo::mark_parsed(
@@ -389,6 +491,9 @@ fn persist_cached(
         src.fingerprint_json.as_deref().unwrap_or("{}"),
         src_layout.as_deref(),
         src.truncation_notice.as_deref(),
+        // 规避统计随缓存一并复制：复用路径若丢字段，同一文件「重新导入也拿不到
+        // 统计」（执行方案工程审查 HIGH 的缓存吞指纹问题，evasion 同理）
+        src.evasion_json.as_deref(),
     )?;
     tx.commit()?;
     Ok(())
@@ -491,7 +596,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(CollectSink::default()),
         );
-        run_import(&ctx, jieba, &ws, &paths, &Default::default()).unwrap();
+        run_import(&ctx, jieba, &ws, &paths, &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
@@ -508,7 +613,8 @@ mod tests {
         let (pool, ws, _dir) = setup();
         let conn = pool.get().unwrap();
         // 手造一个卡在 parsing 的孤儿文档（模拟上次被杀）
-        document_repo::create_parsing(&conn, &ws, "orphan.docx", "/x", "h", "docx", "oh").unwrap();
+        document_repo::create_parsing(&conn, &ws, "orphan.docx", "/x", "h", "docx", "oh", "bid")
+            .unwrap();
         assert_eq!(document_repo::mark_stale_parsing_as_failed(&conn).unwrap(), 1);
         let docs = document_repo::list(&conn, &ws).unwrap();
         assert_eq!(docs[0].status, "failed");
@@ -559,7 +665,7 @@ mod tests {
         let c = write(&dir, "c.txt", "本项目采用分层解耦的微服务总体架构设计。\n平台具备横向扩展能力，支持读写分离与多级缓存机制。");
 
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba.clone(), &ws, &[a.clone(), b, c], &Default::default()).unwrap();
+        run_import(&ctx, jieba.clone(), &ws, &[a.clone(), b, c], &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
@@ -571,9 +677,200 @@ mod tests {
         // 再次导入同一文件 → 工作区内去重，不新增
         drop(conn);
         let (ctx2, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx2, jieba.clone(), &ws, &[a], &Default::default()).unwrap();
+        run_import(&ctx2, jieba.clone(), &ws, &[a], &Default::default(), "bid").unwrap();
         let conn = pool.get().unwrap();
         assert_eq!(document_repo::list(&conn, &ws).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tender_import_lists_by_role_with_chunks() {
+        // 验收 (1)：docRole='tender' 导入后 list_by_role 查回且 chunk_count>0；
+        // bid 角色查询不包含招标文件（参评可选集与对减语料互不渗透）
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let f = write(&dir, "tender.txt", "招标文件：投标人须具备电子与智能化工程专业承包一级资质并提供近三年同类业绩证明。");
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba, &ws, &[f], &Default::default(), "tender").unwrap();
+
+        let conn = pool.get().unwrap();
+        let tenders =
+            document_repo::list_by_role(&conn, &ws, &["tender", "tender_supplement"]).unwrap();
+        assert_eq!(tenders.len(), 1);
+        assert_eq!(tenders[0].doc_role, "tender");
+        assert_eq!(tenders[0].status, "parsed");
+        assert!(tenders[0].chunk_count > 0, "招标文件同样要有分块（对减指纹库的语料）");
+        assert!(document_repo::list_by_role(&conn, &ws, &["bid"]).unwrap().is_empty());
+        assert!(document_repo::list_by_role(&conn, &ws, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_file_imports_as_bid_and_tender_separately() {
+        // 验收 (2)：同一文件先后以 bid/tender 导入产生两行（去重收窄为同角色）；
+        // 同角色重复导入仍去重；第二个角色走跨工作区缓存复用路径（hash+options 匹配与角色无关），
+        // 但新行的角色必须是本次请求的角色
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let f = write(&dir, "dual.txt", "本项目采用分层解耦的微服务总体架构设计，支持横向扩展与读写分离机制。");
+
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba.clone(), &ws, std::slice::from_ref(&f), &Default::default(), "bid").unwrap();
+        let (ctx2, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx2, jieba.clone(), &ws, std::slice::from_ref(&f), &Default::default(), "tender").unwrap();
+
+        {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            assert_eq!(docs.len(), 2, "同一文件双角色应各存一份");
+            let roles: Vec<&str> = docs.iter().map(|d| d.doc_role.as_str()).collect();
+            assert!(roles.contains(&"bid") && roles.contains(&"tender"));
+            assert_eq!(docs[0].file_hash, docs[1].file_hash);
+            let tender = docs.iter().find(|d| d.doc_role == "tender").unwrap();
+            assert_eq!(tender.parse_method.as_deref(), Some("cache"), "同 hash 同配置应复用分块缓存");
+            assert!(tender.chunk_count > 0);
+        }
+
+        // 同角色重复导入 → 去重跳过，不新增
+        let (ctx3, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx3, jieba, &ws, &[f], &Default::default(), "tender").unwrap();
+        let conn = pool.get().unwrap();
+        assert_eq!(document_repo::list(&conn, &ws).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn options_hash_covers_pdf_cross_check() {
+        // v6 起 pdf_cross_check 计入配置指纹：改开关后跨工作区缓存不得误复用
+        let a = ImportOptions::default();
+        let b = ImportOptions { pdf_cross_check: false, ..ImportOptions::default() };
+        assert!(a.pdf_cross_check, "默认开启");
+        assert_ne!(a.options_hash("t"), b.options_hash("t"));
+    }
+
+    #[test]
+    fn options_hash_covers_fingerprint_schema_version() {
+        // v6 预置取证指纹版本键：M1 扩展 Fingerprint（rsid/PDF 血缘等）时只把 fpv 1→2，
+        // 旧缓存随之失效，不再动版本前缀——否则 persist_cached 会按同 hash 命中旧行、
+        // 复制缺新字段的旧 fingerprint_json（执行方案全局裁决 3「只 bump 一次」）
+        let o = ImportOptions::default();
+        assert_ne!(o.options_hash_with_fpv("t", 1), o.options_hash_with_fpv("t", 2), "fpv 变则 hash 变");
+        assert_eq!(
+            o.options_hash("t"),
+            o.options_hash_with_fpv("t", crate::engine::report::FINGERPRINT_SCHEMA_VERSION),
+            "生产路径经当前 schema 版本"
+        );
+    }
+
+    #[test]
+    fn template_matching_survives_evasion_in_template_text() {
+        // 模板分词与分块分词同一 sanitize 口径（W2-1）：模板正文被贴入零宽/同形字时，
+        // 导入干净的雷同段落仍须命中 is_template——两边口径不一致会让样板剔除失效
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let clean_tpl = "我方承诺提供7×24小时技术支持服务，质保期内免费维护，确保系统稳定运行";
+        // 词内零宽 + 同形字（西里尔 а 转义写死，字面量混拉丁会让测试失真）
+        let dirty_tpl = "我方承诺提供7×24小时技术支\u{200B}持服务，质保\u{200B}期内免费维护，\
+                         确保系统稳定运行";
+        {
+            let conn = pool.get().unwrap();
+            template_repo::save(&conn, None, "服务承诺", dirty_tpl, None).unwrap();
+        }
+        let f = write(&dir, "bid.txt", &format!("{clean_tpl}。\n本项目采用独有的边缘计算架构与自研调度算法平台。"));
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba, &ws, &[f], &Default::default(), "bid").unwrap();
+
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        assert_eq!(docs[0].status, "parsed");
+        let rows = chunk_repo::load_for_compare(&conn, &docs[0].id, "paragraph").unwrap();
+        let tpl_chunk = rows.iter().find(|c| c.text.contains("7×24")).expect("承诺段应有分块");
+        assert!(tpl_chunk.is_template, "扰动模板经 sanitize 后仍应命中干净雷同段");
+        let normal = rows.iter().find(|c| c.text.contains("边缘计算")).unwrap();
+        assert!(!normal.is_template, "非样板段不受影响");
+    }
+
+    #[test]
+    fn evasion_stats_aggregate_to_document_and_survive_cache_copy() {
+        // 集成验收：导入含零宽/同形字扰动的 docx → documents.evasion_json 非空且计数正确；
+        // chunk_features.extra_json 可定位受扰动块；跨工作区缓存复用路径必须一并复制
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        // 第一段：2 个零宽 + 词内混排 Дeposit（Д 无拉丁骨架，只计红旗）+ 同形字
+        // Pагe（西里尔 аге 用转义写死，字面量混入拉丁字符会让折叠计数失真）
+        let f = write_min_docx(&dir, "evasive.docx", &[
+            "本项目采用分层\u{200B}解耦的微服务总体架构\u{200B}设计方案\
+             （Дeposit 条款，P\u{0430}\u{0433}\u{0435} 编号）。",
+            "平台具备横向扩展能力，支持读写分离与多级缓存机制。",
+        ]);
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba.clone(), &ws, std::slice::from_ref(&f), &Default::default(), "bid").unwrap();
+
+        let evasion = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, &ws).unwrap();
+            assert_eq!(docs.len(), 1);
+            let ev = docs[0].evasion_json.clone().expect("扰动文档应有 evasion_json");
+            let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+            assert_eq!(v["zeroWidth"], 2);
+            assert_eq!(v["mixedScriptWords"], 2, "Дeposit 与 Pагe 各计一面红旗");
+            assert_eq!(v["confusableFolds"], 3, "Pагe 的 аге 折叠计数");
+            assert_eq!(v["affectedChunks"], 1, "两个段落级块只有一个受扰动");
+            assert!(v["maxChunkConcentration"].as_f64().unwrap() > 0.0);
+            assert!(v["mixedScriptSamples"].to_string().contains("Дeposit"), "采样词可下钻");
+            // 块级分布可定位到受扰动块（extra_json 只写有发现的块）
+            let hit: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN chunk_features f ON f.chunk_id = c.id
+                     WHERE c.document_id = ?1 AND c.chunk_level = 'paragraph'
+                       AND f.extra_json LIKE '%zeroWidth%'",
+                    [&docs[0].id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hit, 1, "受扰动的段落级块恰好一个");
+            let clean: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM chunks c JOIN chunk_features f ON f.chunk_id = c.id
+                     WHERE c.document_id = ?1 AND f.extra_json IS NULL",
+                    [&docs[0].id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(clean > 0, "干净块不写 extra_json");
+            ev
+        };
+
+        // 跨工作区缓存复用：evasion_json 必须随分块一并复制（缓存吞统计=重导入也拿不到）
+        let ws2 = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "另一工作区").unwrap().id
+        };
+        let (ctx2, _) = ctx_for(&pool, &ws2, false);
+        run_import(&ctx2, jieba, &ws2, &[f], &Default::default(), "bid").unwrap();
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws2).unwrap();
+        assert_eq!(docs[0].parse_method.as_deref(), Some("cache"));
+        assert_eq!(docs[0].evasion_json.as_deref(), Some(evasion.as_str()));
+        let copied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks c JOIN chunk_features f ON f.chunk_id = c.id
+                 WHERE c.document_id = ?1 AND f.extra_json LIKE '%zeroWidth%'",
+                [&docs[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(copied >= 1, "块级 extra_json 随缓存复制");
+    }
+
+    #[test]
+    fn clean_document_keeps_null_evasion_json() {
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let f = write(&dir, "clean.txt", "本项目采用分层解耦的微服务总体架构设计，支持横向扩展与读写分离机制。");
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba, &ws, &[f], &Default::default(), "bid").unwrap();
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        assert_eq!(docs[0].status, "parsed");
+        assert!(docs[0].evasion_json.is_none(), "无发现保持 NULL（与老工作区行为一致）");
     }
 
     #[test]
@@ -583,14 +880,14 @@ mod tests {
         let f = write(&dir, "shared.txt", "系统采用事件驱动与消息队列实现各子系统之间的异步协同与削峰填谷处理。");
 
         let (ctx, _) = ctx_for(&pool, &ws1, false);
-        run_import(&ctx, jieba.clone(), &ws1, std::slice::from_ref(&f), &Default::default()).unwrap();
+        run_import(&ctx, jieba.clone(), &ws1, std::slice::from_ref(&f), &Default::default(), "bid").unwrap();
 
         let ws2 = {
             let conn = pool.get().unwrap();
             workspace_repo::create(&conn, "另一工作区").unwrap().id
         };
         let (ctx2, _) = ctx_for(&pool, &ws2, false);
-        run_import(&ctx2, jieba, &ws2, &[f], &Default::default()).unwrap();
+        run_import(&ctx2, jieba, &ws2, &[f], &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws2).unwrap();
@@ -608,7 +905,7 @@ mod tests {
         let good = write(&dir, "good.txt", "本项目严格遵循国家信息安全等级保护三级标准与相关行业规范要求。");
 
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba, &ws, &[bad, good], &Default::default()).unwrap();
+        run_import(&ctx, jieba, &ws, &[bad, good], &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
@@ -631,7 +928,7 @@ mod tests {
         );
         let f = write_docx_body(&dir, "bid.docx", body);
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba, &ws, &[f], &Default::default()).unwrap();
+        run_import(&ctx, jieba, &ws, &[f], &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
@@ -674,7 +971,7 @@ mod tests {
             ws_id = ws.id.clone();
             let f = write(&dir, "p.txt", "本项目采用分层解耦的微服务总体架构设计，支持横向扩展与读写分离机制。");
             let (ctx, _) = ctx_for(&pool, &ws.id, false);
-            run_import(&ctx, jieba, &ws.id, &[f], &Default::default()).unwrap();
+            run_import(&ctx, jieba, &ws.id, &[f], &Default::default(), "bid").unwrap();
         } // pool 整体 drop = 应用关闭
 
         let pool2 = crate::db::open(&dir).unwrap();
@@ -702,7 +999,7 @@ mod tests {
         let (pool, ws, _dir) = setup();
         let jieba = Arc::new(Jieba::new());
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba, &ws, std::slice::from_ref(&pdf), &Default::default()).unwrap();
+        run_import(&ctx, jieba, &ws, std::slice::from_ref(&pdf), &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
@@ -731,7 +1028,7 @@ mod tests {
         let jieba = Arc::new(Jieba::new());
         let f = write(&dir, "投标书.doc", "x");
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        let err = run_import(&ctx, jieba, &ws, &[f], &Default::default()).unwrap_err();
+        let err = run_import(&ctx, jieba, &ws, &[f], &Default::default(), "bid").unwrap_err();
         assert_eq!(err.code, AppErrorCode::UnsupportedFileType);
         assert!(err.message.contains("另存为"), "应给出可执行的出路：{}", err.message);
     }
@@ -744,7 +1041,7 @@ mod tests {
         let bad = write(&dir, "bid.docx", "这不是一个 zip 文件");
 
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default()).unwrap();
+        run_import(&ctx, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default(), "bid").unwrap();
         {
             let conn = pool.get().unwrap();
             let docs = document_repo::list(&conn, &ws).unwrap();
@@ -754,7 +1051,7 @@ mod tests {
 
         // 同一文件重试：不应被去重跳过，旧失败行应被清掉（仍失败但是新一次尝试）
         let (ctx2, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx2, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default()).unwrap();
+        run_import(&ctx2, jieba.clone(), &ws, std::slice::from_ref(&bad), &Default::default(), "bid").unwrap();
         let first_retry_id = {
             let conn = pool.get().unwrap();
             let docs = document_repo::list(&conn, &ws).unwrap();
@@ -768,7 +1065,7 @@ mod tests {
             "修复后的内容：本项目采用分层解耦的微服务总体架构设计方案。",
         ]);
         let (ctx3, _) = ctx_for(&pool, &ws, false);
-        run_import(&ctx3, jieba, &ws, &[fixed], &Default::default()).unwrap();
+        run_import(&ctx3, jieba, &ws, &[fixed], &Default::default(), "bid").unwrap();
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, &ws).unwrap();
         // 修复后内容变了 → hash 不同，旧失败行（旧 hash）不再被本次清理；
@@ -783,7 +1080,7 @@ mod tests {
         let jieba = Arc::new(Jieba::new());
         let f = write(&dir, "x.txt", "本工程建设周期为一百八十个日历日，完成全部交付与验收工作。");
         let (ctx, _) = ctx_for(&pool, &ws, true);
-        let err = run_import(&ctx, jieba, &ws, &[f], &Default::default()).unwrap_err();
+        let err = run_import(&ctx, jieba, &ws, &[f], &Default::default(), "bid").unwrap_err();
         assert_eq!(err.code, AppErrorCode::JobCancelled);
         let conn = pool.get().unwrap();
         assert!(document_repo::list(&conn, &ws).unwrap().is_empty(), "取消不应残留文档");
@@ -795,12 +1092,12 @@ mod tests {
         let jieba = Arc::new(Jieba::new());
 
         let (ctx, _) = ctx_for(&pool, &ws, false);
-        let err = run_import(&ctx, jieba.clone(), &ws, &["/不存在/x.txt".into()], &Default::default()).unwrap_err();
+        let err = run_import(&ctx, jieba.clone(), &ws, &["/不存在/x.txt".into()], &Default::default(), "bid").unwrap_err();
         assert_eq!(err.code, AppErrorCode::FileNotFound);
 
         let exe = write(&dir, "evil.exe", "MZ");
         let (ctx2, _) = ctx_for(&pool, &ws, false);
-        let err = run_import(&ctx2, jieba, &ws, &[exe], &Default::default()).unwrap_err();
+        let err = run_import(&ctx2, jieba, &ws, &[exe], &Default::default(), "bid").unwrap_err();
         assert_eq!(err.code, AppErrorCode::UnsupportedFileType);
     }
 }

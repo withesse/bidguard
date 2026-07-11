@@ -6,6 +6,7 @@ pub mod candidate;
 pub mod chunker;
 pub mod clustering;
 pub mod collusion;
+pub mod confusables;
 pub mod corpus;
 pub mod diff;
 pub mod embed;

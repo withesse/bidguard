@@ -68,6 +68,10 @@ pub fn assemble(
         docs_meta.push((d.page_count.unwrap_or(0), d.char_count.unwrap_or(0), d.parse_method));
     }
     fingerprint::cross_flags(&mut doc_infos);
+    // 与报告页同一套风险标记口径：rsid 交集/PDF 血缘也要出现在导出的指纹表
+    // （命中对结构此处不消费，围标信号取自落库的 collusion_json）
+    let _ = fingerprint::rsid_pairs(&mut doc_infos, &Default::default());
+    let _ = fingerprint::lineage_pairs(&mut doc_infos);
     let documents: Vec<ExportDoc> = doc_infos
         .iter()
         .zip(&docs_meta)
@@ -294,7 +298,7 @@ mod tests {
             )
         };
         let ictx = mk_ctx("import");
-        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid").unwrap();
         let ids: Vec<String> = {
             let conn = pool.get().unwrap();
             crate::db::repo::document_repo::list(&conn, &ws)

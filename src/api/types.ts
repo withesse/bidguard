@@ -11,6 +11,9 @@ export interface WorkspaceDto {
   latestJobStatus: string | null;
 }
 
+/** 文档角色：bid 投标（默认）| tender 招标文件 | tender_supplement 补遗/答疑。 */
+export type DocRole = "bid" | "tender" | "tender_supplement";
+
 export interface DocumentDto {
   id: string;
   workspaceId: string;
@@ -29,6 +32,8 @@ export interface DocumentDto {
   updatedAt: string;
   /** 解析期「内容不完整」告知语（扫描件超页 / docx XML 截断）；前端以警示条展示。 */
   truncationNotice: string | null;
+  /** 文档角色；招标类（tender/tender_supplement）不可勾选参评、不占参评名额。 */
+  docRole: DocRole | string;
 }
 
 export interface JobDto {

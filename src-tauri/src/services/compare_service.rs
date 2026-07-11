@@ -3,7 +3,7 @@
 // 并查集聚类 → 八类分类 + 分级 diff → 单事务落库 → 矩阵/围标/共有词/章节热力聚合。
 // 取消或失败时清掉本任务的全部半成品。
 use crate::db::repo::compare_repo::{self, NewCluster, NewDiff, NewEdge, NewMember};
-use crate::db::repo::{chunk_repo, document_repo, embedding_repo, job_repo};
+use crate::db::repo::{chunk_repo, document_repo, embedding_repo, image_repo, job_repo};
 use crate::db::repo::document_repo::DocumentRow;
 use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
@@ -291,6 +291,9 @@ fn run_inner(
     let (m, peak) = matrix::doc_matrix(docs.len(), &comparable, &raw);
     let sections = section_stats(&comparable, &best);
     let shared = shared_terms_of(&comparable);
+    // 共同错误指纹（词典外词/异常标点/错误引用）：跑在已有内存分块上，产出 kind="sharedErrors"
+    // 的 SharedTerm，与罕见词共用 shared_terms_json 通道。招标文件笔误豁免待 M4 接线，当前恒 None。
+    let shared_errors = shared_error_fingerprints(jieba, &comparable, None);
 
     let mut doc_infos: Vec<DocInfo> = docs
         .iter()
@@ -309,6 +312,31 @@ fn run_inner(
         })
         .collect();
     fingerprint::cross_flags(&mut doc_infos);
+    // rsid 交集同源命中：豁免集合待 M4 招标文件对减接线，当前恒空
+    let exempt_rsids: HashSet<String> = HashSet::new();
+    let rsid_hits = fingerprint::rsid_pairs(&mut doc_infos, &exempt_rsids);
+    // PDF 血缘命中：trailer ID/XMP GUID（硬）、字体子集标签（中）；弱命中并入 metadata 标记
+    let lineage_hits = fingerprint::lineage_pairs(&mut doc_infos);
+    // 内嵌图片同源命中：加载参评文档图片指纹（与 docs 同序），两两跨文档碰撞
+    // （sha256 精确 / dHash 近似）。豁免集合待 M4 招标文件对减接线，当前恒空。
+    let doc_images: Vec<Vec<collusion::ImageFp>> = {
+        let conn = ctx.db.get()?;
+        docs.iter()
+            .map(|d| {
+                image_repo::list_images(&conn, &d.id).map(|imgs| {
+                    imgs.into_iter()
+                        .map(|r| collusion::ImageFp {
+                            sha256: r.sha256,
+                            dhash: r.dhash,
+                            page: r.page,
+                        })
+                        .collect()
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?
+    };
+    let exempt_hashes: HashSet<String> = HashSet::new();
+    let image_hits = collusion::image_pairs(&doc_images, &exempt_hashes);
 
     // 围标判定复用旧引擎的信号加权（输入适配为 report::Cluster）
     let r_clusters: Vec<RCluster> = raw
@@ -334,8 +362,17 @@ fn run_inner(
     let r_shared: Vec<SharedTerm> = shared.clone();
     // 报价梯度信号：金额接近但不同 + 多处条款雷同（典型陪标价特征）
     let price_pairs = price_proximity(&comparable, docs.len(), &raw);
-    let collusion =
-        collusion::assess_with(peak, &r_clusters, &doc_infos, &r_shared, &price_pairs);
+    let collusion = collusion::assess_with(collusion::CollusionInputs {
+        peak,
+        clusters: &r_clusters,
+        docs: &doc_infos,
+        shared_terms: &r_shared,
+        price_pairs: &price_pairs,
+        rsid_hits: &rsid_hits,
+        lineage_hits: &lineage_hits,
+        image_hits: &image_hits,
+        shared_errors: &shared_errors,
+    });
 
     let mut summary = CompareSummary {
         document_count: docs.len(),
@@ -365,6 +402,9 @@ fn run_inner(
         "matrix": m,
         "peak": peak,
     });
+    // 罕见词 + 共同错误指纹并入同一 shared_terms_json 通道（错误条目 kind="sharedErrors"）
+    let mut shared_out = shared;
+    shared_out.extend(shared_errors);
     {
         let conn = ctx.db.get()?;
         job_repo::set_compare_results(
@@ -373,7 +413,7 @@ fn run_inner(
             &serde_json::to_string(&summary).unwrap_or_default(),
             &matrix_json.to_string(),
             &serde_json::to_string(&collusion).unwrap_or_default(),
-            &serde_json::to_string(&shared).unwrap_or_default(),
+            &serde_json::to_string(&shared_out).unwrap_or_default(),
             &serde_json::to_string(&sections).unwrap_or_default(),
         )?;
     }
@@ -834,6 +874,7 @@ fn shared_terms_of(chunks: &[CmpChunk]) -> Vec<SharedTerm> {
         .map(|(term, docs)| SharedTerm {
             term: term.to_string(),
             docs: docs.into_iter().collect(),
+            ..Default::default()
         })
         .collect();
     out.sort_by(|a, b| {
@@ -841,6 +882,243 @@ fn shared_terms_of(chunks: &[CmpChunk]) -> Vec<SharedTerm> {
             .len()
             .cmp(&a.docs.len())
             .then(b.term.chars().count().cmp(&a.term.chars().count()))
+    });
+    out.truncate(30);
+    out
+}
+
+/// 招标文件豁免（M4 招标对减接线预留）：招标文件本身的笔误/词元各家照抄不算串标
+/// （调研 §13 反向豁免——错误内容一致的证明力恰恰依赖「不是各家都抄同一份母本」）。
+/// `tokens` 供词典外词豁免，`normalized_text` 供异常标点/引用错误指纹的子串豁免。
+/// 当前 run_compare 恒传 None；W3/M4 招标文件角色落地后由其解析产物填充。
+pub struct TenderExemption {
+    pub tokens: HashSet<String>,
+    pub normalized_text: String,
+}
+
+/// 单字是否落在基本 CJK 统一表意区（标书正文足够，不含扩展区）。
+fn is_han(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
+}
+fn all_han(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_han)
+}
+
+/// 稀有度归一分 ∈ (0,1]：共有文档数越少、块频越低越罕见（最罕见=仅 2 文档且块频 2 → 1.0）。
+/// ⚠️ 未经语料校准：仅供 collusion 连续特征加权，非定性依据。
+fn error_rarity(doc_count: usize, block_df: usize) -> f32 {
+    let d = (2.0 / doc_count.max(2) as f32).min(1.0);
+    let b = (2.0 / block_df.max(2) as f32).min(1.0);
+    d * b
+}
+
+/// 异常标点检测：在 chunk 原始文本上返回 (错误串, 前后各 2 字上下文)。三类可定位模式——
+/// 叠标点（。。/，，）、全半角混用（。. / ，,）、中文间夹半角空格。上下文用于跨文档同指纹比对
+/// 与人工核对。括号不配对无可定位的错误串+上下文指纹，本条不纳入（避免无锚点误报）。
+fn punctuation_errors(text: &str) -> Vec<(String, String)> {
+    const DUP: [char; 7] = ['。', '，', '、', '；', '：', '？', '！'];
+    let half_of = |c: char| -> Option<char> {
+        match c {
+            '。' => Some('.'),
+            '，' => Some(','),
+            '；' => Some(';'),
+            '：' => Some(':'),
+            '？' => Some('?'),
+            '！' => Some('!'),
+            _ => None,
+        }
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let ctx_of = |s: usize, e: usize| -> String {
+        let lo = s.saturating_sub(2);
+        let hi = (e + 2).min(n);
+        chars[lo..hi].iter().collect()
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < n {
+        let a = chars[i];
+        let b = chars[i + 1];
+        if a == b && DUP.contains(&a) {
+            out.push((format!("{a}{b}"), ctx_of(i, i + 2)));
+            i += 1;
+            continue;
+        }
+        let mix = half_of(a) == Some(b) || half_of(b) == Some(a);
+        if mix {
+            out.push((format!("{a}{b}"), ctx_of(i, i + 2)));
+            i += 1;
+            continue;
+        }
+        if b == ' ' && i + 2 < n && is_han(a) && is_han(chars[i + 2]) {
+            out.push((format!("{a} {}", chars[i + 2]), ctx_of(i, i + 3)));
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 抽取「第X章/第X节/第X条/附表X/X.Y节」等章节引用串（供跨文档悬空引用比对）。
+fn reference_targets(text: &str) -> Vec<String> {
+    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let res = RES.get_or_init(|| {
+        vec![
+            regex::Regex::new(r"第[0-9一二三四五六七八九十百零]+[章节条款]").unwrap(),
+            regex::Regex::new(r"附表[0-9一二三四五六七八九十]+").unwrap(),
+            regex::Regex::new(r"[0-9]+(?:\.[0-9]+)+\s*节").unwrap(),
+        ]
+    });
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for re in res {
+        for m in re.find_iter(text) {
+            let s = m.as_str().to_string();
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// 共同错误指纹：三类检测器跑在已有内存分块（CmpChunk 的 text/tokens/entities/section_path）
+/// 上，零额外 IO。统一产出 SharedTerm{kind="sharedErrors", rarity, context}，与罕见词共用
+/// jobs.shared_terms_json 通道。共用同一处罕见错误比共用正确词证明力高一个量级
+/// （调研 §5/§13：identical wrong answers），但词典外 ≠ 错别字（行业新词/专有名词/型号亦在词典外），
+/// 故只作「疑似」提示、detail 附上下文供人工判断，不直接定性。
+/// - (a) 词典外词：token ≥2 字、全中文、jieba.has_word()==false、非实体、块频 ≤3、≥2 文档共有；
+/// - (b) 异常标点：叠标点/全半角混用/中文间夹半角空格，指纹=错误串+前后 2 字，跨文档同指纹；
+/// - (c) 引用错误：抽章节引用，目标不在本文档标题树、却在 ≥2 份文档以相同字串出现
+///   （无标题层级的 PDF/纯文本按 doc 标题树为空降级跳过，避免标题树稀疏导致全量误报）。
+///
+/// exempt：招标文件豁免（当前恒 None，M4 接线）。结果按稀有度降序，上限 30 条。
+fn shared_error_fingerprints(
+    jieba: &Jieba,
+    chunks: &[CmpChunk],
+    exempt: Option<&TenderExemption>,
+) -> Vec<SharedTerm> {
+    const OOD_BLOCK_DF_MAX: usize = 3;
+    let mut out: Vec<SharedTerm> = Vec::new();
+
+    // —— (a) 词典外词 ——
+    {
+        let mut docs_of: HashMap<&str, BTreeSet<usize>> = HashMap::new();
+        let mut chunk_df: HashMap<&str, usize> = HashMap::new();
+        for c in chunks {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for t in &c.tokens {
+                if t.chars().count() < 2 || !all_han(t) {
+                    continue;
+                }
+                if jieba.has_word(t) {
+                    continue; // 词典内词：正常词，不视为疑似错误
+                }
+                if c.entities.iter().any(|e| e.value.contains(t.as_str())) {
+                    continue; // 金额/日期/百分比/工期等实体不算错词
+                }
+                if exempt.map(|ex| ex.tokens.contains(t.as_str())).unwrap_or(false) {
+                    continue; // 招标文件原生词/笔误各家照抄，豁免
+                }
+                docs_of.entry(t.as_str()).or_default().insert(c.doc);
+                if seen.insert(t.as_str()) {
+                    *chunk_df.entry(t.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        for (term, docs) in &docs_of {
+            let df = chunk_df.get(term).copied().unwrap_or(0);
+            if docs.len() >= 2 && df <= OOD_BLOCK_DF_MAX {
+                out.push(SharedTerm {
+                    term: (*term).to_string(),
+                    docs: docs.iter().copied().collect(),
+                    kind: Some("sharedErrors".into()),
+                    rarity: Some(error_rarity(docs.len(), df)),
+                    context: None,
+                });
+            }
+        }
+    }
+
+    // —— (b) 异常标点 —— 以「错误串+上下文」为跨文档同指纹的聚合键
+    {
+        let mut agg: HashMap<String, (String, BTreeSet<usize>, usize)> = HashMap::new();
+        for c in chunks {
+            let mut seen: HashSet<String> = HashSet::new();
+            for (err, ctx) in punctuation_errors(&c.text) {
+                if exempt.map(|ex| ex.normalized_text.contains(&ctx)).unwrap_or(false) {
+                    continue;
+                }
+                let e = agg.entry(ctx.clone()).or_insert_with(|| (err, BTreeSet::new(), 0));
+                e.1.insert(c.doc);
+                if seen.insert(ctx) {
+                    e.2 += 1;
+                }
+            }
+        }
+        for (ctx, (term, docs, df)) in agg {
+            if docs.len() >= 2 {
+                out.push(SharedTerm {
+                    term,
+                    docs: docs.iter().copied().collect(),
+                    kind: Some("sharedErrors".into()),
+                    rarity: Some(error_rarity(docs.len(), df)),
+                    context: Some(ctx),
+                });
+            }
+        }
+    }
+
+    // —— (c) 引用错误（悬空章节引用的跨文档共现）——
+    {
+        let mut titles: HashMap<usize, HashSet<String>> = HashMap::new();
+        for c in chunks {
+            let set = titles.entry(c.doc).or_default();
+            for t in &c.section_path {
+                set.insert(t.clone());
+            }
+        }
+        let mut agg: HashMap<String, (BTreeSet<usize>, usize)> = HashMap::new();
+        for c in chunks {
+            let doc_titles = match titles.get(&c.doc) {
+                Some(s) if !s.is_empty() => s, // 降级：无标题层级的文档不做引用错误检测
+                _ => continue,
+            };
+            let mut seen: HashSet<String> = HashSet::new();
+            for r in reference_targets(&c.text) {
+                if doc_titles.iter().any(|t| t.contains(&r)) {
+                    continue; // 引用目标在本文档标题树中 → 正常引用
+                }
+                if exempt.map(|ex| ex.normalized_text.contains(&r)).unwrap_or(false) {
+                    continue;
+                }
+                let e = agg.entry(r.clone()).or_insert_with(|| (BTreeSet::new(), 0));
+                e.0.insert(c.doc);
+                if seen.insert(r) {
+                    e.1 += 1;
+                }
+            }
+        }
+        for (r, (docs, df)) in agg {
+            if docs.len() >= 2 {
+                out.push(SharedTerm {
+                    term: r.clone(),
+                    docs: docs.iter().copied().collect(),
+                    kind: Some("sharedErrors".into()),
+                    rarity: Some(error_rarity(docs.len(), df)),
+                    context: Some(format!("悬空引用「{r}」在本文档标题树中无对应目标")),
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.rarity
+            .partial_cmp(&a.rarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.docs.len().cmp(&a.docs.len()))
     });
     out.truncate(30);
     out
@@ -906,7 +1184,7 @@ mod tests {
             })
             .collect();
         let ictx = ctx_for(pool, ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), ws, &paths, &Default::default(), "bid").unwrap();
 
         let conn = pool.get().unwrap();
         let docs = document_repo::list(&conn, ws).unwrap();
@@ -980,7 +1258,7 @@ mod tests {
 
         let t0 = Instant::now();
         let ictx = ctx_for(&pool, &ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid").unwrap();
         let t_import = t0.elapsed();
 
         let docs = {
@@ -1141,7 +1419,7 @@ mod tests {
             })
             .collect();
         let ictx = ctx_for(&pool, &ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid").unwrap();
         let ids: Vec<String> = {
             let conn = pool.get().unwrap();
             document_repo::list(&conn, &ws)
@@ -1281,7 +1559,7 @@ mod tests {
 
         let jieba = Arc::new(Jieba::new());
         let ictx = ctx_for(&pool, &ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), &ws, &[docx, xlsx], &Default::default())
+        import_service::run_import(&ictx, jieba.clone(), &ws, &[docx, xlsx], &Default::default(), "bid")
             .unwrap();
         let docs = {
             let conn = pool.get().unwrap();
@@ -1427,6 +1705,248 @@ mod tests {
         );
     }
 
+    /// 手造取证夹具 docx：正文 + settings.xml(rsids) + core.xml(created) + app.xml(Template)。
+    fn write_forensic_docx(
+        dir: &std::path::Path,
+        name: &str,
+        body_text: &str,
+        rsids_inner: &str, // 空串 = 不写 settings.xml（WPS 无 rsids 场景）
+        created: &str,
+        template: &str,
+    ) -> String {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let o = SimpleFileOptions::default();
+        zw.start_file("[Content_Types].xml", o).unwrap();
+        zw.write_all(r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", o).unwrap();
+        zw.write_all(format!(r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{body_text}</w:t></w:r></w:p></w:body></w:document>"#).as_bytes()).unwrap();
+        if !rsids_inner.is_empty() {
+            zw.start_file("word/settings.xml", o).unwrap();
+            zw.write_all(format!(r#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:rsids>{rsids_inner}</w:rsids></w:settings>"#).as_bytes()).unwrap();
+        }
+        zw.start_file("docProps/core.xml", o).unwrap();
+        zw.write_all(format!(r#"<?xml version="1.0"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"><dc:creator>{name}的编制人</dc:creator><dcterms:created>{created}</dcterms:created></cp:coreProperties>"#).as_bytes()).unwrap();
+        zw.start_file("docProps/app.xml", o).unwrap();
+        zw.write_all(format!(r#"<?xml version="1.0"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Microsoft Office Word</Application><Template>{template}</Template></Properties>"#).as_bytes()).unwrap();
+        zw.finish().unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// M1 W1-1/W1-2 端到端：rsid 交集 + 模板/创建邻近/包结构进 collusion_json。
+    #[test]
+    fn forensic_docx_signals_flow_into_collusion() {
+        let pool = open_in_memory().unwrap();
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_forensic_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // —— 正向：rsidRoot 相同 + 共享 3 个 rsid + 同模板 + created 相差 5 分钟 ——
+        let shared_rsids = r#"<w:rsidRoot w:val="00AA0001"/><w:rsid w:val="00AA0001"/><w:rsid w:val="00AA0002"/><w:rsid w:val="00AA0003"/>"#;
+        let a = write_forensic_docx(
+            &dir, "a.docx",
+            "甲公司的技术方案聚焦于城市轨道交通信号系统的设计集成与实施。",
+            shared_rsids, "2024-05-01T10:00:00Z", "投标文件模板.dotx",
+        );
+        let b = write_forensic_docx(
+            &dir, "b.docx",
+            "乙公司主营医院信息化平台建设与临床数据运营支撑服务体系。",
+            shared_rsids, "2024-05-01T10:05:00Z", "投标文件模板.dotx",
+        );
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &[a, b], &Default::default(), "bid").unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba.clone(), Arc::new(Mutex::new(None)), &ws, &cfg_with(ids, 0.5)).unwrap();
+        let collusion: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        let rsid = collusion.signals.iter().find(|s| s.kind == "rsid").expect("应有 rsid 信号");
+        assert!((rsid.weight - 0.35).abs() < 1e-6, "rsidRoot 相同 → 满权重 0.35");
+        assert!(rsid.detail.contains("另存为"), "免责语：{}", rsid.detail);
+        assert!(rsid.detail.contains("未命中不代表清白"));
+        let meta = collusion.signals.iter().find(|s| s.kind == "metadata").expect("应有 metadata 信号");
+        assert!(meta.detail.contains("模板相同"), "detail 应枚举命中项：{}", meta.detail);
+        assert!(meta.detail.contains("创建时间邻近"), "{}", meta.detail);
+        assert!(meta.detail.contains("包结构一致"), "同一打包管线：{}", meta.detail);
+
+        // —— 负向（WPS 场景）：无 rsids 节点 + 默认模板 + created 相差 2 天 → 两信号均缺席 ——
+        let ws2 = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w2").unwrap().id
+        };
+        let c = write_forensic_docx(
+            &dir, "c.docx",
+            "丙公司专注智慧农业物联网传感终端的研发生产与销售推广。",
+            "", "2024-05-01T10:00:00Z", "Normal.dotm",
+        );
+        let d = write_forensic_docx(
+            &dir, "d.docx",
+            "丁公司提供水利工程勘察设计与流域生态治理的整体咨询。",
+            "", "2024-05-03T10:00:00Z", "Normal.dotm",
+        );
+        let ictx2 = ctx_for(&pool, &ws2, "import", false);
+        import_service::run_import(&ictx2, jieba.clone(), &ws2, &[c, d], &Default::default(), "bid").unwrap();
+        let ids2: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws2).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        let cctx2 = ctx_for(&pool, &ws2, "compare", false);
+        run_compare(&cctx2, jieba, Arc::new(Mutex::new(None)), &ws2, &cfg_with(ids2, 0.5)).unwrap();
+        let collusion2: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx2.job_id).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        assert!(
+            collusion2.signals.iter().all(|s| s.kind != "rsid"),
+            "无 rsids 节点：信号缺席而非报错"
+        );
+        for s in &collusion2.signals {
+            assert!(
+                !s.detail.contains("检查通过") && !s.detail.contains("清白证明"),
+                "不得输出背书式表述：{}",
+                s.detail
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 8 条竖带结构化灰度图的 PNG / JPEG 两版字节（同图重压 → 不同字节、dHash 近似）。
+    fn banded_png_jpeg() -> (Vec<u8>, Vec<u8>) {
+        let bands = [10u8, 200, 40, 160, 90, 230, 20, 250];
+        let img = image::RgbImage::from_fn(220, 180, |x, _| {
+            image::Rgb([bands[(x * 8 / 220).min(7) as usize]; 3])
+        });
+        let enc = |fmt| {
+            let mut b = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img.clone()).write_to(&mut b, fmt).unwrap();
+            b.into_inner()
+        };
+        (enc(image::ImageFormat::Png), enc(image::ImageFormat::Jpeg))
+    }
+
+    /// 手造带一张 word/media 图片的最小 docx（正文 + 单图）。
+    fn write_docx_with_image(
+        dir: &std::path::Path,
+        name: &str,
+        body_text: &str,
+        media_name: &str,
+        bytes: &[u8],
+    ) -> String {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let o = SimpleFileOptions::default();
+        zw.start_file("[Content_Types].xml", o).unwrap();
+        zw.write_all(r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", o).unwrap();
+        zw.write_all(format!(r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{body_text}</w:t></w:r></w:p></w:body></w:document>"#).as_bytes()).unwrap();
+        zw.start_file(format!("word/media/{media_name}"), o).unwrap();
+        zw.write_all(bytes).unwrap();
+        zw.finish().unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// W1-4 端到端：两份 docx 内嵌同一张图的 PNG/JPEG 两版（不同字节）→ imageReuse 信号入库；
+    /// 换成两张无关图则信号缺席（防误报）。
+    #[test]
+    fn embedded_image_reuse_flows_into_collusion() {
+        let pool = open_in_memory().unwrap();
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_imgreuse_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, jpg) = banded_png_jpeg();
+
+        // —— 正向：两文档共用同一张图（PNG vs JPEG 重压，不同字节）——
+        let a = write_docx_with_image(
+            &dir, "a.docx",
+            "甲公司的技术方案聚焦于城市轨道交通信号系统的设计集成与实施。",
+            "pic.png", &png,
+        );
+        let b = write_docx_with_image(
+            &dir, "b.docx",
+            "乙公司主营医院信息化平台建设与临床数据运营支撑服务体系。",
+            "pic.jpg", &jpg,
+        );
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &[a, b], &Default::default(), "bid").unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba.clone(), Arc::new(Mutex::new(None)), &ws, &cfg_with(ids, 0.5)).unwrap();
+        let collusion: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        let img = collusion.signals.iter().find(|s| s.kind == "imageReuse").expect("应有 imageReuse 信号");
+        assert!(img.weight > 0.0);
+        assert!(img.detail.contains("请核对"), "detail 应提示核对：{}", img.detail);
+        assert!(img.detail.contains("未命中不代表清白"));
+        assert!(!img.detail.contains("检查通过") && !img.detail.contains("清白证明"));
+
+        // —— 负向：两张无关图（纯色 vs 竖带）→ imageReuse 缺席 ——
+        let solid = {
+            let img = image::RgbImage::from_pixel(220, 180, image::Rgb([128, 128, 128]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let ws2 = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w2").unwrap().id
+        };
+        let c = write_docx_with_image(
+            &dir, "c.docx",
+            "丙公司专注智慧农业物联网传感终端的研发生产与销售推广。",
+            "band.png", &png,
+        );
+        let d = write_docx_with_image(
+            &dir, "d.docx",
+            "丁公司提供水利工程勘察设计与流域生态治理的整体咨询。",
+            "solid.png", &solid,
+        );
+        let ictx2 = ctx_for(&pool, &ws2, "import", false);
+        import_service::run_import(&ictx2, jieba.clone(), &ws2, &[c, d], &Default::default(), "bid").unwrap();
+        let ids2: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws2).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        let cctx2 = ctx_for(&pool, &ws2, "compare", false);
+        run_compare(&cctx2, jieba, Arc::new(Mutex::new(None)), &ws2, &cfg_with(ids2, 0.5)).unwrap();
+        let collusion2: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx2.job_id).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        assert!(
+            collusion2.signals.iter().all(|s| s.kind != "imageReuse"),
+            "无关图不应产生 imageReuse 信号"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fact_conflict_marks_cluster_and_persists_facts() {
         let pool = open_in_memory().unwrap();
@@ -1447,7 +1967,7 @@ mod tests {
             paths.push(p.to_string_lossy().into_owned());
         }
         let ictx = ctx_for(&pool, &ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid").unwrap();
         let ids: Vec<String> = {
             let conn = pool.get().unwrap();
             document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
@@ -1496,7 +2016,7 @@ mod tests {
             paths.push(p.to_string_lossy().into_owned());
         }
         let ictx = ctx_for(&pool, &ws, "import", false);
-        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default()).unwrap();
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid").unwrap();
         let ids: Vec<String> = {
             let conn = pool.get().unwrap();
             document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
@@ -1516,5 +2036,135 @@ mod tests {
             .unwrap();
         assert_eq!((edges, clusters), (0, 0), "取消不应残留半成品");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // —— M1 共同错误指纹：shared_error_fingerprints 三类检测器（内存分块，零 IO）——
+
+    fn ecmp(
+        doc: usize,
+        text: &str,
+        tokens: &[&str],
+        section_path: Vec<String>,
+        entities: Vec<crate::engine::features::Entity>,
+    ) -> CmpChunk {
+        CmpChunk {
+            id: String::new(),
+            doc,
+            rel_pos: 0.0,
+            page: None,
+            text: text.to_string(),
+            exact_hash: String::new(),
+            normalized_hash: String::new(),
+            section_path,
+            section_kind: "other".into(),
+            is_template: false,
+            is_table_row: false,
+            char_count: text.chars().count(),
+            tokens: tokens.iter().map(|s| s.to_string()).collect(),
+            ngrams: HashSet::new(),
+            minhash: vec![],
+            entities,
+            tfidf: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn shared_out_of_dict_error_word_detected_and_exempted() {
+        let jieba = Jieba::new();
+        assert!(!jieba.has_word("施工枝术"), "夹具须为词典外虚构错词");
+        let chunks = vec![
+            ecmp(0, "本方案的施工枝术路线", &["方案", "施工枝术", "路线"], vec![], vec![]),
+            ecmp(1, "我司施工枝术能力成熟", &["施工枝术", "能力"], vec![], vec![]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        let hit = errs.iter().find(|t| t.term == "施工枝术").expect("应检出共享虚构错词");
+        assert_eq!(hit.kind.as_deref(), Some("sharedErrors"));
+        assert!(hit.rarity.unwrap_or(0.0) > 0.0, "rarity 应 > 0，实际 {:?}", hit.rarity);
+        assert_eq!(hit.docs, vec![0, 1]);
+        // 豁免：错词在招标文件 tokens 中 → 条目消失（M4 接线路径可测）
+        let ex = TenderExemption {
+            tokens: HashSet::from(["施工枝术".to_string()]),
+            normalized_text: String::new(),
+        };
+        let errs2 = shared_error_fingerprints(&jieba, &chunks, Some(&ex));
+        assert!(errs2.iter().all(|t| t.term != "施工枝术"), "豁免后错词条目应消失");
+    }
+
+    #[test]
+    fn dictionary_word_and_entity_not_flagged() {
+        let jieba = Jieba::new();
+        // 「微服务」在词典内 → 不算错；金额实体值即使词典外也不算错
+        let ent = crate::engine::features::Entity { kind: "amount".into(), value: "一千两百万元".into() };
+        let chunks = vec![
+            ecmp(0, "采用微服务一千两百万元", &["微服务", "一千两百万元"], vec![], vec![ent.clone()]),
+            ecmp(1, "同样微服务一千两百万元", &["微服务", "一千两百万元"], vec![], vec![ent]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        assert!(errs.iter().all(|t| t.term != "一千两百万元"), "实体值不应判错");
+        // 「微服务」是否词典内取决于 jieba；若词典外仍会被判——仅断言实体豁免这一确定路径
+    }
+
+    #[test]
+    fn shared_abnormal_punctuation_detected_with_context() {
+        let jieba = Jieba::new();
+        let chunks = vec![
+            ecmp(0, "本期工作完成。。后续安排", &[], vec![], vec![]),
+            ecmp(1, "本期工作完成。。后续安排", &[], vec![], vec![]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        let hit = errs.iter().find(|t| t.term.contains("。。")).expect("应检出叠标点共用错误");
+        assert_eq!(hit.kind.as_deref(), Some("sharedErrors"));
+        let ctx = hit.context.as_deref().unwrap_or("");
+        assert!(ctx.contains("完成") && ctx.contains("后续"), "context 应含前后文，实际「{ctx}」");
+        assert_eq!(hit.docs, vec![0, 1]);
+    }
+
+    #[test]
+    fn abnormal_punctuation_needs_two_docs() {
+        let jieba = Jieba::new();
+        // 叠标点只出现在单份文档 → 不构成共用错误
+        let chunks = vec![
+            ecmp(0, "本期工作完成。。后续安排", &[], vec![], vec![]),
+            ecmp(1, "本期工作顺利结束正常安排", &[], vec![], vec![]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        assert!(errs.iter().all(|t| !t.term.contains("。。")), "单份文档的错误不算共用");
+    }
+
+    #[test]
+    fn high_freq_phrase_not_flagged_as_error() {
+        let jieba = Jieba::new();
+        let phrase = "按合同执行";
+        // 词典外短语出现在 4 个块（块频 4 > 3）→ 高频短语负例，不判错
+        let chunks = vec![
+            ecmp(0, "甲款按合同执行", &["甲款", phrase], vec![], vec![]),
+            ecmp(0, "乙款按合同执行", &["乙款", phrase], vec![], vec![]),
+            ecmp(1, "丙款按合同执行", &["丙款", phrase], vec![], vec![]),
+            ecmp(1, "丁款按合同执行", &["丁款", phrase], vec![], vec![]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        assert!(errs.iter().all(|t| t.term != phrase), "块频 4 的高频短语不应判错");
+    }
+
+    #[test]
+    fn shared_dangling_reference_detected_and_flat_tree_degrades() {
+        let jieba = Jieba::new();
+        let titles = vec!["第1章 概述".to_string(), "第2章 方案".to_string(), "第3章 计划".to_string()];
+        // 两份文档都引用「第9章」，各自标题树只到第3章 → 悬空引用跨文档共现
+        let chunks = vec![
+            ecmp(0, "详见第9章的实施说明", &[], titles.clone(), vec![]),
+            ecmp(1, "参照第9章执行验收", &[], titles.clone(), vec![]),
+        ];
+        let errs = shared_error_fingerprints(&jieba, &chunks, None);
+        assert!(errs.iter().any(|t| t.term == "第9章"), "应检出跨文档悬空引用「第9章」");
+        // 降级：标题树为空（PDF/纯文本无层级）→ 不检出，避免标题树稀疏导致全量误报
+        let flat = vec![
+            ecmp(0, "详见第9章的实施说明", &[], vec![], vec![]),
+            ecmp(1, "参照第9章执行验收", &[], vec![], vec![]),
+        ];
+        assert!(
+            shared_error_fingerprints(&jieba, &flat, None).iter().all(|t| t.term != "第9章"),
+            "无标题树的文档应降级跳过引用错误检测"
+        );
     }
 }

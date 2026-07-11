@@ -22,6 +22,20 @@ pub struct Block {
     pub is_list_item: bool,
 }
 
+/// 一张内嵌位图的同源指纹（导入期提取，落 document_images）。source="docx" 为
+/// word/media/ 位图（page=None）；source="pdf" 为 pdfium 页对象位图（page=页码，1 起）。
+/// sha256 = sha256(宽 LE + 高 LE + RGB8 像素字节)，跨容器格式稳定；dhash 为 64 位
+/// 感知哈希，None 表示整页扫描图（图面积/页面积>0.8）——只做 exact 不做 near，
+/// 防「都是空白页/同制式表格」互撞误报。
+pub struct ImageHash {
+    pub source: &'static str, // docx | pdf
+    pub page: Option<u32>,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: String,
+    pub dhash: Option<u64>,
+}
+
 pub struct ParsedBlocks {
     pub blocks: Vec<Block>,
     pub pages: u32,
@@ -37,6 +51,9 @@ pub struct ParsedBlocks {
     /// 警示条展示，但【不进 blocks/分块】——若作为正文参与比对，多份总页数相同的
     /// 截断扫描件其提示文本逐字节相同，会被聚成假 same 雷同条款并触发假围标信号。
     pub truncation_notice: Option<String>,
+    /// 内嵌图片同源指纹（导入期提取，落 document_images）：docx word/media 位图 +
+    /// PDF 页对象位图。非 docx/pdf 或提取器不可用（pdfium 缺）时为空。
+    pub image_hashes: Vec<ImageHash>,
 }
 
 /// 新 API：结构化段块 + 取消旗标（OCR/栅格化等长阶段逐页检查）。
@@ -127,6 +144,7 @@ fn parse_spreadsheet(path: &Path) -> Result<ParsedBlocks, String> {
         legacy_text: legacy,
         ocr_layout_json: None,
         truncation_notice: None,
+        image_hashes: Vec::new(),
     })
 }
 
@@ -168,6 +186,7 @@ fn parse_txt(path: &Path) -> Result<ParsedBlocks, String> {
         legacy_text: text,
         ocr_layout_json: None,
         truncation_notice: None,
+        image_hashes: Vec::new(),
     })
 }
 
@@ -335,16 +354,21 @@ fn parse_pdf(
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
 ) -> Result<ParsedBlocks, String> {
     // 1) pdfium 文本（最鲁棒）；2) pdf-extract 回落；3) 扫描件 → OCR
-    if let Some(pd) = parse_pdf_pdfium(path, cancel) {
-        return Ok(pd);
-    }
-    if cancel.load(Ordering::SeqCst) {
+    let mut pb = if let Some(pd) = parse_pdf_pdfium(path, cancel) {
+        pd
+    } else if cancel.load(Ordering::SeqCst) {
         return Err(CANCELLED.into());
+    } else if let Ok(pd) = parse_pdf_extract(path) {
+        pd
+    } else {
+        parse_pdf_ocr(path, cancel, ocr_model)?
+    };
+    // 内嵌图片同源指纹：与文本抽取路径正交，统一在此提取（pdfium 不可用则空、与 OCR 同降级）。
+    // 已取消则不再额外解码图片，尽快返回。
+    if !cancel.load(Ordering::SeqCst) {
+        pb.image_hashes = collect_image_hashes_pdf(path, cancel);
     }
-    if let Ok(pd) = parse_pdf_extract(path) {
-        return Ok(pd);
-    }
-    parse_pdf_ocr(path, cancel, ocr_model)
+    Ok(pb)
 }
 
 /// 扫描件路径：pdfium 栅格化每页 → oar-ocr 识别 → 按页拼接文本 + 行级版面。
@@ -405,6 +429,8 @@ fn parse_pdf_ocr(
         legacy_text,
         ocr_layout_json,
         truncation_notice,
+        // parse_pdf 在分发后统一填充图片指纹（与文本抽取路径正交）
+        image_hashes: Vec::new(),
     })
 }
 
@@ -470,6 +496,7 @@ fn parse_pdf_extract(path: &Path) -> Result<ParsedBlocks, String> {
         legacy_text: text,
         ocr_layout_json: None,
         truncation_notice: None,
+        image_hashes: Vec::new(), // parse_pdf 分发后统一填充
     })
 }
 
@@ -512,6 +539,7 @@ fn parse_pdf_pdfium(path: &Path, cancel: &AtomicBool) -> Option<ParsedBlocks> {
         legacy_text,
         ocr_layout_json: None,
         truncation_notice: None,
+        image_hashes: Vec::new(), // parse_pdf 分发后统一填充
     })
 }
 
@@ -553,7 +581,10 @@ fn pdfium_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 读 PDF Info 字典作为元数据指纹（作者/Producer/创建/修改时间）。
+/// 读 PDF Info 字典作为元数据指纹（作者/Producer/创建/修改时间），
+/// 并提取血缘取证字段：trailer /ID、XMP GUID（DocumentID/InstanceID/DerivedFrom/
+/// CreatorTool）、逐页 BaseFont 与子集标签。损坏/加密 PDF 保持「load 失败 → 空指纹」
+/// 的既有容错语义；各字段取不到即留空，绝不 panic。
 fn pdf_fingerprint(path: &Path) -> Fingerprint {
     let mut fp = Fingerprint::default();
     let doc = match lopdf::Document::load(path) {
@@ -580,7 +611,157 @@ fn pdf_fingerprint(path: &Path) -> Fingerprint {
         fp.created = get(b"CreationDate");
         fp.modified = get(b"ModDate");
     }
+    fill_pdf_trailer_id(&doc, &mut fp);
+    fill_xmp(&doc, &mut fp);
+    fill_pdf_fonts(&doc, &mut fp);
     fp
+}
+
+/// trailer /ID：两个字节串的数组，hex 存首半/次半。
+/// 首半在创建时生成、之后每次保存保持不变——是「同一母文件」的血缘键。
+fn fill_pdf_trailer_id(doc: &lopdf::Document, fp: &mut Fingerprint) {
+    let Ok(obj) = doc.trailer.get(b"ID") else { return };
+    // /ID 一般为直接数组，个别生成器写成间接引用
+    let arr = match obj.as_array() {
+        Ok(a) => a,
+        Err(_) => {
+            let Some(a) = obj
+                .as_reference()
+                .ok()
+                .and_then(|id| doc.get_object(id).ok())
+                .and_then(|o| o.as_array().ok())
+            else {
+                return;
+            };
+            a
+        }
+    };
+    let hex_of = |o: &lopdf::Object| {
+        o.as_str().ok().filter(|b| !b.is_empty()).map(hex_lower)
+    };
+    fp.pdf_id_first = arr.first().and_then(hex_of);
+    fp.pdf_id_second = arr.get(1).and_then(hex_of);
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// 定位 catalog /Metadata 的 XMP 流并宽松解析。XMP 通常未压缩；
+/// 带 Filter 的流用 decompressed_content 兜底，失败则按原始字节解析。
+fn fill_xmp(doc: &lopdf::Document, fp: &mut Fingerprint) {
+    let Some(bytes) = xmp_stream_bytes(doc) else { return };
+    parse_xmp(&bytes, fp);
+}
+
+fn xmp_stream_bytes(doc: &lopdf::Document) -> Option<Vec<u8>> {
+    let meta = doc.catalog().ok()?.get(b"Metadata").ok()?;
+    let stream = match meta {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok()?.as_stream().ok()?,
+        o => o.as_stream().ok()?,
+    };
+    match stream.decompressed_content() {
+        Ok(b) if !b.is_empty() => Some(b),
+        _ => Some(stream.content.clone()), // 无 Filter/解压失败 → 原始字节兜底
+    }
+}
+
+/// 宽松解析 XMP（自由格式 XML，Word/WPS/永中等写法各异）：
+/// 同时接受「元素文本」与「rdf:Description 属性」两种形态；
+/// xmpMM:DerivedFrom 的 stRef:documentID 同样两种形态都收。
+/// 任何解析错误直接停止（已收到的字段保留），禁止 panic。
+fn parse_xmp(xml: &[u8], fp: &mut Fingerprint) {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut cur: Vec<u8> = Vec::new(); // 当前元素 local name（小写）
+    let mut in_derived = false; // 在 <xmpMM:DerivedFrom> 内：documentID 归 derived_from
+    fn set(slot: &mut Option<String>, val: &str) {
+        let v = val.trim();
+        if slot.is_none() && !v.is_empty() {
+            *slot = Some(v.to_string());
+        }
+    }
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.local_name().into_inner().to_ascii_lowercase();
+                let elem_is_derived = name == b"derivedfrom";
+                // 属性形态：<rdf:Description xmpMM:DocumentID="…" xmp:CreatorTool="…"/>
+                // 与 <xmpMM:DerivedFrom stRef:documentID="…"/>
+                for a in e.attributes().flatten() {
+                    let key = a.key.local_name().into_inner().to_ascii_lowercase();
+                    let Ok(val) = a.unescape_value() else { continue };
+                    match key.as_slice() {
+                        b"documentid" if elem_is_derived => set(&mut fp.xmp_derived_from, &val),
+                        b"documentid" => set(&mut fp.xmp_document_id, &val),
+                        b"instanceid" if !elem_is_derived => set(&mut fp.xmp_instance_id, &val),
+                        b"creatortool" => set(&mut fp.creator_tool, &val),
+                        _ => {}
+                    }
+                }
+                if elem_is_derived {
+                    in_derived = true;
+                }
+                cur = name;
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().into_inner().eq_ignore_ascii_case(b"derivedfrom") {
+                    in_derived = false;
+                }
+                cur.clear();
+            }
+            Ok(Event::Text(t)) => {
+                let Ok(val) = t.unescape() else { continue };
+                match cur.as_slice() {
+                    b"documentid" if in_derived => set(&mut fp.xmp_derived_from, &val),
+                    b"documentid" => set(&mut fp.xmp_document_id, &val),
+                    b"instanceid" if !in_derived => set(&mut fp.xmp_instance_id, &val),
+                    b"creatortool" => set(&mut fp.creator_tool, &val),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break, // 宽松：坏 XML 保留已解析字段
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// PDF 字体全集上限：正常标书几十个，异常文件截断防膨胀。
+const MAX_PDF_FONTS: usize = 256;
+
+/// 逐页收集 /Resources /Font 的 BaseFont 名（去重排序），
+/// 并抽取 ^[A-Z]{6}\+ 子集标签字体（前缀多数生成器随机 → 同一次生成环境的指纹）。
+fn fill_pdf_fonts(doc: &lopdf::Document, fp: &mut Fingerprint) {
+    use std::collections::BTreeSet;
+    let mut fonts: BTreeSet<String> = BTreeSet::new();
+    'pages: for (_, page_id) in doc.get_pages() {
+        let Ok(page_fonts) = doc.get_page_fonts(page_id) else { continue };
+        for (_, font) in page_fonts {
+            if let Ok(name) = font.get(b"BaseFont").and_then(|o| o.as_name()) {
+                let s = String::from_utf8_lossy(name).trim().to_string();
+                if !s.is_empty() {
+                    fonts.insert(s);
+                }
+                if fonts.len() >= MAX_PDF_FONTS {
+                    break 'pages;
+                }
+            }
+        }
+    }
+    fp.font_subset_tags = fonts.iter().filter(|n| is_subset_tagged(n)).cloned().collect();
+    fp.pdf_fonts = fonts.into_iter().collect();
+}
+
+/// BaseFont 是否带子集标签（形如 "ABCDEF+SimSun"：6 个大写字母 + '+' + 非空字体名）。
+fn is_subset_tagged(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() > 7 && b[6] == b'+' && b[..6].iter().all(|c| c.is_ascii_uppercase())
 }
 
 /// PDF 字符串可能是 UTF-16BE(带 BOM) 或 PDFDocEncoding，宽松解码。
@@ -628,6 +809,13 @@ fn parse_docx(
     if let Some(app) = read_zip(&mut zip, "docProps/app.xml") {
         pages = fill_app(&app, &mut fp);
     }
+    // rsid 修订会话标识：取证级同源信号（WPS 等生成的 docx 可能无此节点 → 字段留空）
+    if let Some(settings) = read_zip(&mut zip, "word/settings.xml") {
+        fill_rsids(&settings, &mut fp);
+    }
+    // zip 条目序列指纹：中央目录顺序的条目名哈希——同一生成工具/同一打包管线产物稳定一致
+    fp.zip_entry_fp = Some(zip_entry_fingerprint(&zip));
+    fp.zip_entry_count = Some(zip.len() as u32);
     if pages == 0 {
         pages = ((legacy_text.chars().count() / 1500) as u32).max(1);
     }
@@ -635,6 +823,8 @@ fn parse_docx(
     let truncation_notice = xml_truncated.then(|| {
         "文档正文 XML 解析中途出错，仅提取到部分内容，其余段落可能缺失，请人工复核。".to_string()
     });
+    // 内嵌图片同源指纹（与 OCR 无关，恒提取）：word/media 位图 → sha256 + dHash
+    let image_hashes = collect_image_hashes_docx(&mut zip, cancel);
     Ok(ParsedBlocks {
         blocks,
         pages,
@@ -643,6 +833,7 @@ fn parse_docx(
         legacy_text,
         ocr_layout_json: None,
         truncation_notice,
+        image_hashes,
     })
 }
 
@@ -719,6 +910,149 @@ fn collect_docx_images<R: Read + std::io::Seek>(
         imgs.push(img.to_rgb8());
     }
     imgs
+}
+
+// —— 内嵌图片同源检测（W1-4）：提取位图 → sha256 精确指纹 + 64 位 dHash 近似指纹 ——
+/// 单文档图片指纹条数上限（独立于 OCR 的 MAX_DOCX_IMAGES）：两两碰撞是 N²，200 已足够
+/// 覆盖典型标书的资质/公章/现场照片，且解码耗时可控。
+const MAX_IMAGE_HASHES: usize = 200;
+/// 短边阈值：跳过图标/项目符号/分隔线等装饰小图（与 OCR 口径一致）。
+const MIN_IMAGE_HASH_PX: u32 = 80;
+/// 整页图判定：图对象面积 / 页面积 > 此比例视为「整页扫描图」，只做 exact 不做 near，
+/// 防「都是空白页/同制式表格」被 dHash 判成同源。拍板值，未经校准。
+const FULL_PAGE_AREA_RATIO: f64 = 0.8;
+
+/// 从 word/media/ 收集内嵌位图并计算同源指纹。复用 collect_docx_images 的遍历骨架，
+/// 但独立限额（MAX_IMAGE_HASHES）、按像素内容去重（同一 logo 只留一条）。docx 无「整页」
+/// 概念，dHash 恒有值。
+fn collect_image_hashes_docx<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    cancel: &AtomicBool,
+) -> Vec<ImageHash> {
+    use std::collections::HashSet;
+    let names: Vec<String> = zip
+        .file_names()
+        .filter(|n| {
+            let l = n.to_ascii_lowercase();
+            l.starts_with("word/media/")
+                && [".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"]
+                    .iter()
+                    .any(|e| l.ends_with(e))
+        })
+        .map(String::from)
+        .collect();
+    let mut out: Vec<ImageHash> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for name in names {
+        if cancel.load(Ordering::SeqCst) || out.len() >= MAX_IMAGE_HASHES {
+            break;
+        }
+        let Some(bytes) = read_zip(zip, &name) else { continue };
+        // emf/wmf 矢量图、损坏图解码失败 → 跳过（无可比对像素）
+        let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        let rgb = img.to_rgb8();
+        let (w, h) = (rgb.width(), rgb.height());
+        if w < MIN_IMAGE_HASH_PX || h < MIN_IMAGE_HASH_PX {
+            continue;
+        }
+        let sha256 = image_sha256(&rgb);
+        // 内容去重：同一张图（每页页眉 logo）只记一次，避免撑爆限额与虚增命中对
+        if !seen.insert(sha256.clone()) {
+            continue;
+        }
+        out.push(ImageHash {
+            source: "docx",
+            page: None,
+            width: w,
+            height: h,
+            sha256,
+            dhash: Some(dhash64(&rgb)),
+        });
+    }
+    out
+}
+
+/// 遍历 PDF 各页的图片对象（pdfium）计算同源指纹。pdfium 不可用/文件损坏则返回空
+/// （与 OCR 同降级语义）。逐图 try + cancel 检查；整页图（面积占比 > FULL_PAGE_AREA_RATIO）
+/// 的 dHash 记 None（只做 exact）。
+fn collect_image_hashes_pdf(path: &Path, cancel: &AtomicBool) -> Vec<ImageHash> {
+    use std::collections::HashSet;
+    let Some(pdfium) = bind_pdfium() else { return Vec::new() };
+    let Some(pstr) = path.to_str() else { return Vec::new() };
+    let Ok(doc) = pdfium.load_pdf_from_file(pstr, None) else { return Vec::new() };
+    let mut out: Vec<ImageHash> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    'pages: for (pi, page) in doc.pages().iter().enumerate() {
+        if out.len() >= MAX_IMAGE_HASHES {
+            break;
+        }
+        let page_area = f64::from(page.width().value.max(0.0)) * f64::from(page.height().value.max(0.0));
+        for obj in page.objects().iter() {
+            if cancel.load(Ordering::SeqCst) || out.len() >= MAX_IMAGE_HASHES {
+                break 'pages;
+            }
+            let PdfPageObject::Image(ref img_obj) = obj else { continue };
+            // get_raw_image 内部按位图格式（BGRA/BGR/Gray）安全转换并返回 Result，不 panic；
+            // 个别损坏图对象失败则跳过该图
+            let Ok(dynimg) = img_obj.get_raw_image() else { continue };
+            let rgb = dynimg.to_rgb8();
+            let (w, h) = (rgb.width(), rgb.height());
+            if w < MIN_IMAGE_HASH_PX || h < MIN_IMAGE_HASH_PX {
+                continue;
+            }
+            // 整页图判定：对象在页面上的占面比（点² 口径）
+            let full_page = img_obj
+                .bounds()
+                .ok()
+                .map(|b| {
+                    let obj_area =
+                        f64::from(b.width().value.abs()) * f64::from(b.height().value.abs());
+                    page_area > 0.0 && obj_area / page_area > FULL_PAGE_AREA_RATIO
+                })
+                .unwrap_or(false);
+            let sha256 = image_sha256(&rgb);
+            if !seen.insert(sha256.clone()) {
+                continue; // 同页对象引用同一图 / 跨页重复 logo → 只记一次
+            }
+            out.push(ImageHash {
+                source: "pdf",
+                page: Some(pi as u32 + 1),
+                width: w,
+                height: h,
+                sha256,
+                dhash: (!full_page).then(|| dhash64(&rgb)),
+            });
+        }
+    }
+    out
+}
+
+/// 精确指纹：sha256(宽 LE ‖ 高 LE ‖ RGB8 像素字节)。带上尺寸避免不同尺寸的纯色图
+/// 撞哈希；用像素而非文件字节，令同一图的不同容器编码（PNG/JPEG 无损重存）指纹一致。
+fn image_sha256(rgb: &image::RgbImage) -> String {
+    let mut buf = Vec::with_capacity(8 + rgb.as_raw().len());
+    buf.extend_from_slice(&rgb.width().to_le_bytes());
+    buf.extend_from_slice(&rgb.height().to_le_bytes());
+    buf.extend_from_slice(rgb.as_raw());
+    crate::engine::normalize::sha256_hex(&buf)
+}
+
+/// 64 位 dHash（difference hash）：灰度 → 缩放到 9×8 → 每行 8 对相邻像素取横向梯度符号。
+/// 对缩放/轻度压缩/重编码稳健，两图汉明距离小即视觉近似。自实现（不引 img_hash crate）。
+fn dhash64(rgb: &image::RgbImage) -> u64 {
+    use image::imageops::{grayscale, resize, FilterType};
+    let gray = grayscale(rgb);
+    // 9 列 × 8 行：每行相邻两列比较得 8 位，共 64 位
+    let small = resize(&gray, 9, 8, FilterType::Triangle);
+    let mut bits = 0u64;
+    for row in 0..8u32 {
+        for col in 0..8u32 {
+            let left = small.get_pixel(col, row)[0];
+            let right = small.get_pixel(col + 1, row)[0];
+            bits = (bits << 1) | u64::from(left > right);
+        }
+    }
+    bits
 }
 
 fn read_zip<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
@@ -897,7 +1231,7 @@ fn fill_core(xml: &[u8], fp: &mut Fingerprint) {
     }
 }
 
-/// 解析 docProps/app.xml：应用、总编辑时长、页数。返回页数（0 表示未知）。
+/// 解析 docProps/app.xml：应用、总编辑时长、页数、模板名。返回页数（0 表示未知）。
 fn fill_app(xml: &[u8], fp: &mut Fingerprint) -> u32 {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
@@ -913,6 +1247,9 @@ fn fill_app(xml: &[u8], fp: &mut Fingerprint) -> u32 {
                     b"Application" => fp.app = Some(val),
                     b"TotalTime" => fp.total_edit_minutes = val.trim().parse::<i64>().ok(),
                     b"Pages" => pages = val.trim().parse::<u32>().unwrap_or(0),
+                    b"Template" if !val.trim().is_empty() => {
+                        fp.template_name = Some(val.trim().to_string())
+                    }
                     _ => {}
                 }
             }
@@ -923,6 +1260,71 @@ fn fill_app(xml: &[u8], fp: &mut Fingerprint) -> u32 {
         buf.clear();
     }
     pages
+}
+
+/// rsid 提取上限：settings.xml 的 <w:rsids> 正常几十到几百个，异常大文件截断防膨胀。
+const MAX_RSIDS: usize = 2048;
+
+/// 解析 word/settings.xml：提取 <w:rsids> 下全部 w:rsid 的 w:val 与 w:rsidRoot。
+/// 去重、大写归一（Word 输出大小写不一）、上限 MAX_RSIDS；rsidRoot 同时并入 rsids
+/// 集合（交集计数不因「root 单列」而漏算）。节点缺失（如 WPS 产物）时字段留空不报错。
+fn fill_rsids(xml: &[u8], fp: &mut Fingerprint) {
+    use std::collections::HashSet;
+    /// 取 w:val 属性值：trim + 大写归一，空值视为无。
+    fn rsid_val(e: &quick_xml::events::BytesStart) -> Option<String> {
+        e.attributes()
+            .flatten()
+            .find_map(|a| {
+                (a.key.local_name().into_inner() == b"val")
+                    .then(|| String::from_utf8_lossy(&a.value).trim().to_ascii_uppercase())
+            })
+            .filter(|v| !v.is_empty())
+    }
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut in_rsids = false;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
+    loop {
+        // w:rsid/w:rsidRoot 均为自闭合空元素：Start 与 Empty 两种事件都要接
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                match e.local_name().into_inner() {
+                    b"rsids" => in_rsids = true,
+                    n @ (b"rsid" | b"rsidRoot") if in_rsids && ordered.len() < MAX_RSIDS => {
+                        if let Some(val) = rsid_val(&e) {
+                            if n == b"rsidRoot" {
+                                root = Some(val.clone());
+                            }
+                            if seen.insert(val.clone()) {
+                                ordered.push(val);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().into_inner() == b"rsids" {
+                    in_rsids = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    fp.rsids = ordered;
+    fp.rsid_root = root;
+}
+
+/// zip 条目序列指纹：按中央目录顺序连接条目名后 sha256。
+/// 条目顺序与命名由生成工具决定——同一工具/同一打包管线产物稳定一致，改内容不改结构。
+fn zip_entry_fingerprint<R: Read + std::io::Seek>(zip: &zip::ZipArchive<R>) -> String {
+    let names: Vec<&str> = (0..zip.len()).filter_map(|i| zip.name_for_index(i)).collect();
+    crate::engine::normalize::sha256_hex(names.join("\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -1190,6 +1592,342 @@ mod tests {
         zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap()
     }
 
+    /// 手造 docx：正文 + 任意附加 zip 部件（settings.xml / docProps 等取证夹具用）。
+    fn write_docx_with_parts(
+        dir: &Path,
+        name: &str,
+        body_xml: &str,
+        parts: &[(&str, String)],
+    ) -> String {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let p = dir.join(name);
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let o = SimpleFileOptions::default();
+        zw.start_file("[Content_Types].xml", o).unwrap();
+        zw.write_all(r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", o).unwrap();
+        let xml = format!(r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body_xml}</w:body></w:document>"#);
+        zw.write_all(xml.as_bytes()).unwrap();
+        for (fname, content) in parts {
+            zw.start_file(*fname, o).unwrap();
+            zw.write_all(content.as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// 手造带血缘取证特征的最小 PDF：trailer /ID、XMP Metadata 流、页面字体。
+    /// 用 lopdf 现有创建 API 生成（免手写 xref 偏移）。
+    fn write_lineage_pdf(
+        dir: &Path,
+        name: &str,
+        id_first: &[u8],
+        xmp: Option<&str>,
+        base_fonts: &[&str],
+    ) -> PathBuf {
+        use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut font_dict = lopdf::Dictionary::new();
+        for (i, bf) in base_fonts.iter().enumerate() {
+            let fid = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => Object::Name(bf.as_bytes().to_vec()),
+            });
+            font_dict.set(format!("F{}", i + 1), fid);
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => font_dict },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let mut catalog = dictionary! { "Type" => "Catalog", "Pages" => pages_id };
+        if let Some(x) = xmp {
+            let mid = doc.add_object(
+                Stream::new(
+                    dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+                    x.as_bytes().to_vec(),
+                )
+                .with_compression(false),
+            );
+            catalog.set("Metadata", mid);
+        }
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        doc.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::String(id_first.to_vec(), StringFormat::Hexadecimal),
+                Object::String(b"\x22\x22".to_vec(), StringFormat::Hexadecimal),
+            ]),
+        );
+        let p = dir.join(name);
+        doc.save(&p).unwrap();
+        p
+    }
+
+    const XMP_ELEMENT_FORM: &str = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:stRef="http://ns.adobe.com/xap/1.0/sType/ResourceRef#">
+   <xmp:CreatorTool>WPS 文字</xmp:CreatorTool>
+   <xmpMM:DocumentID>uuid:AAAA-BBBB-CCCC</xmpMM:DocumentID>
+   <xmpMM:InstanceID>uuid:1111-2222</xmpMM:InstanceID>
+   <xmpMM:DerivedFrom stRef:instanceID="uuid:MOTHER-INST" stRef:documentID="uuid:MOTHER-GUID"/>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+
+    #[test]
+    fn pdf_lineage_fields_extracted() {
+        let dir = std::env::temp_dir().join(format!("bg_pdflin_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_lineage_pdf(
+            &dir,
+            "lineage.pdf",
+            b"\xAB\xCD\x12\x34",
+            Some(XMP_ELEMENT_FORM),
+            &["ABCDEF+SimSun", "Arial", "GHIJKL+KaiTi_GB2312"],
+        );
+        let fp = pdf_fingerprint(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(fp.pdf_id_first.as_deref(), Some("abcd1234"), "trailer /ID 首半 hex");
+        assert_eq!(fp.pdf_id_second.as_deref(), Some("2222"));
+        assert_eq!(fp.xmp_document_id.as_deref(), Some("uuid:AAAA-BBBB-CCCC"));
+        assert_eq!(fp.xmp_instance_id.as_deref(), Some("uuid:1111-2222"), "DerivedFrom 的 stRef:instanceID 不得覆盖");
+        assert_eq!(fp.xmp_derived_from.as_deref(), Some("uuid:MOTHER-GUID"));
+        assert_eq!(fp.creator_tool.as_deref(), Some("WPS 文字"));
+        assert_eq!(
+            fp.pdf_fonts,
+            vec!["ABCDEF+SimSun", "Arial", "GHIJKL+KaiTi_GB2312"],
+            "BaseFont 全集去重排序"
+        );
+        assert_eq!(
+            fp.font_subset_tags,
+            vec!["ABCDEF+SimSun", "GHIJKL+KaiTi_GB2312"],
+            "^[A-Z]{{6}}\\+ 子集标签字体"
+        );
+    }
+
+    #[test]
+    fn xmp_attribute_form_and_absence_are_lenient() {
+        // 国产/Adobe 工具常把 XMP 写成 rdf:Description 属性形态
+        let mut fp = Fingerprint::default();
+        parse_xmp(
+            br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="r"><rdf:Description xmpMM:DocumentID="xmp.did:FIXED-1" xmp:CreatorTool="Microsoft Word 2016"/></rdf:RDF></x:xmpmeta>"#,
+            &mut fp,
+        );
+        assert_eq!(fp.xmp_document_id.as_deref(), Some("xmp.did:FIXED-1"));
+        assert_eq!(fp.creator_tool.as_deref(), Some("Microsoft Word 2016"));
+        assert!(fp.xmp_derived_from.is_none());
+        // 坏 XML / 无关内容：取不到就留空，禁止 panic
+        let mut empty = Fingerprint::default();
+        parse_xmp(b"\x00\x01 not xml at all <<", &mut empty);
+        assert!(empty.xmp_document_id.is_none());
+        // 无 XMP 流的 PDF：字段留空
+        let dir = std::env::temp_dir().join(format!("bg_noxmp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_lineage_pdf(&dir, "noxmp.pdf", b"\x01", None, &[]);
+        let fp2 = pdf_fingerprint(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fp2.xmp_document_id.is_none());
+        assert!(fp2.pdf_fonts.is_empty());
+        assert_eq!(fp2.pdf_id_first.as_deref(), Some("01"));
+    }
+
+    #[test]
+    fn subset_tag_detection() {
+        assert!(is_subset_tagged("ABCDEF+SimSun"));
+        assert!(!is_subset_tagged("Arial"));
+        assert!(!is_subset_tagged("abcdef+SimSun"), "小写前缀不是子集标签");
+        assert!(!is_subset_tagged("ABCDE+SimSun"), "5 字母不是子集标签");
+        assert!(!is_subset_tagged("ABCDEF+"), "空字体名不算");
+        assert!(!is_subset_tagged("ABCDEFG+X"), "第 7 位必须是 +");
+    }
+
+    #[test]
+    fn corrupt_and_encrypted_pdf_yield_empty_fingerprint_without_panic() {
+        let dir = std::env::temp_dir().join(format!("bg_badpdf_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 损坏：非 PDF 字节 → load 失败 → 空指纹（既有容错语义）
+        let bad = dir.join("broken.pdf");
+        std::fs::write(&bad, "这不是 PDF 文件，只是伪装了扩展名。").unwrap();
+        let fp = pdf_fingerprint(&bad);
+        assert!(fp.author.is_none() && fp.pdf_id_first.is_none() && fp.xmp_document_id.is_none());
+        assert!(fp.pdf_fonts.is_empty() && fp.font_subset_tags.is_empty());
+        // 「加密」：trailer 带 /Encrypt 的文件 → 提取过程绝不 panic（字段能取多少算多少）
+        let enc_path = {
+            let p = write_lineage_pdf(&dir, "enc_src.pdf", b"\x0f", None, &["ABCDEF+SimSun"]);
+            let mut doc = lopdf::Document::load(&p).unwrap();
+            let enc_id = doc.add_object(lopdf::dictionary! { "Filter" => "Standard", "V" => 1, "R" => 2 });
+            doc.trailer.set("Encrypt", enc_id);
+            let out = dir.join("encrypted.pdf");
+            doc.save(&out).unwrap();
+            out
+        };
+        let _ = pdf_fingerprint(&enc_path); // 断言不 panic
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_pdfs_same_trailer_id_hit_pdf_lineage_signal() {
+        // 验收：两份 trailer /ID 首半相同的 PDF → kind="pdfLineage" 满权重；
+        // 仅共享字体子集标签 → 中档；均无 → 无该信号
+        use crate::engine::collusion::{assess_with, CollusionInputs};
+        use crate::engine::fingerprint::lineage_pairs;
+        use crate::engine::report::DocInfo;
+        let dir = std::env::temp_dir().join(format!("bg_linsig_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc_of = |p: &Path| DocInfo {
+            id: "d".into(),
+            name: "n".into(),
+            doc_type: "pdf".into(),
+            pages: 1,
+            char_count: 100,
+            fingerprint: pdf_fingerprint(p),
+            parse_error: None,
+        };
+        // 同一母文件：trailer /ID 首半相同（字体互不相同）
+        let a = write_lineage_pdf(&dir, "a.pdf", b"\x99\x88", None, &["AAAAAA+SimSun"]);
+        let b = write_lineage_pdf(&dir, "b.pdf", b"\x99\x88", None, &["BBBBBB+SimHei"]);
+        let mut hard_docs = vec![doc_of(&a), doc_of(&b)];
+        let hits = lineage_pairs(&mut hard_docs);
+        let c = assess_with(CollusionInputs { lineage_hits: &hits, ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "pdfLineage").expect("应有 pdfLineage 信号");
+        assert!((s.weight - 0.35).abs() < 1e-6, "硬命中满权重 0.35，实际 {}", s.weight);
+        assert!(s.detail.contains("未命中不代表清白"));
+        assert!(hard_docs[0].fingerprint.risk_flags.iter().any(|f| f.contains("同一母文件")));
+
+        // 仅共享字体子集标签：ID 首半不同
+        let m1 = write_lineage_pdf(&dir, "m1.pdf", b"\x01", None, &["CCCCCC+KaiTi", "Arial"]);
+        let m2 = write_lineage_pdf(&dir, "m2.pdf", b"\x02", None, &["CCCCCC+KaiTi"]);
+        let mut mid_docs = vec![doc_of(&m1), doc_of(&m2)];
+        let mid_hits = lineage_pairs(&mut mid_docs);
+        let cm = assess_with(CollusionInputs { lineage_hits: &mid_hits, ..Default::default() });
+        let sm = cm.signals.iter().find(|s| s.kind == "pdfLineage").expect("中命中也应有信号");
+        assert!((sm.weight - 0.35 * 0.55).abs() < 1e-6, "仅中命中 x=0.55，实际 {}", sm.weight);
+
+        // 均无命中：无该信号
+        let n1 = write_lineage_pdf(&dir, "n1.pdf", b"\x03", None, &["DDDDDD+FangSong"]);
+        let n2 = write_lineage_pdf(&dir, "n2.pdf", b"\x04", None, &["EEEEEE+FangSong"]);
+        let mut none_docs = vec![doc_of(&n1), doc_of(&n2)];
+        let none_hits = lineage_pairs(&mut none_docs);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(none_hits.is_empty());
+        let cn = assess_with(CollusionInputs { lineage_hits: &none_hits, ..Default::default() });
+        assert!(!cn.signals.iter().any(|s| s.kind == "pdfLineage"));
+    }
+
+    fn settings_xml(inner: &str) -> String {
+        format!(r#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/><w:rsids>{inner}</w:rsids></w:settings>"#)
+    }
+
+    #[test]
+    fn docx_rsids_template_and_zip_fp_extracted() {
+        let dir = std::env::temp_dir().join(format!("bg_rsid_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // rsid 大小写混写 + 重复：应大写归一并去重；rsidRoot 单列且并入集合
+        let settings = settings_xml(
+            r#"<w:rsidRoot w:val="00ab12cd"/><w:rsid w:val="00ab12cd"/><w:rsid w:val="00FF00aa"/><w:rsid w:val="00ff00aa"/><w:rsid w:val="00123456"/>"#,
+        );
+        let app = r#"<?xml version="1.0"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Microsoft Office Word</Application><Template>投标文件模板.dotx</Template><Pages>3</Pages></Properties>"#.to_string();
+        let p = write_docx_with_parts(
+            &dir,
+            "rsid.docx",
+            "<w:p><w:r><w:t>本项目采用分层解耦的微服务架构设计方案。</w:t></w:r></w:p>",
+            &[("word/settings.xml", settings), ("docProps/app.xml", app)],
+        );
+        let parsed = parse_file_blocks(Path::new(&p), &no_cancel()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let fp = &parsed.fingerprint;
+        assert_eq!(
+            fp.rsids,
+            vec!["00AB12CD", "00FF00AA", "00123456"],
+            "去重 + 大写归一，root 并入集合"
+        );
+        assert_eq!(fp.rsid_root.as_deref(), Some("00AB12CD"));
+        assert_eq!(fp.template_name.as_deref(), Some("投标文件模板.dotx"));
+        assert_eq!(parsed.pages, 3);
+        let zfp = fp.zip_entry_fp.as_deref().expect("docx 均应有 zip 条目指纹");
+        assert_eq!(zfp.len(), 64, "sha256 hex");
+        assert_eq!(fp.zip_entry_count, Some(4), "4 个 zip 条目");
+    }
+
+    #[test]
+    fn docx_without_settings_has_no_rsids_and_no_error() {
+        // WPS 等生成的 docx 可能无 settings.xml / rsids 节点：字段留空，解析不报错
+        let dir = std::env::temp_dir().join(format!("bg_norsid_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_docx_with_parts(
+            &dir,
+            "plain.docx",
+            "<w:p><w:r><w:t>无修订标识的文档正文内容。</w:t></w:r></w:p>",
+            &[],
+        );
+        let parsed = parse_file_blocks(Path::new(&p), &no_cancel()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(parsed.fingerprint.rsids.is_empty());
+        assert!(parsed.fingerprint.rsid_root.is_none());
+        assert!(parsed.fingerprint.template_name.is_none());
+        assert!(parsed.fingerprint.zip_entry_fp.is_some(), "zip 指纹与 rsids 无关，始终计算");
+    }
+
+    #[test]
+    fn docx_rsids_capped_at_limit() {
+        let dir = std::env::temp_dir().join(format!("bg_rsidcap_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let many: String = (0..(MAX_RSIDS + 50))
+            .map(|i| format!(r#"<w:rsid w:val="{i:08X}"/>"#))
+            .collect();
+        let p = write_docx_with_parts(
+            &dir,
+            "cap.docx",
+            "<w:p><w:r><w:t>大量修订标识的异常文档。</w:t></w:r></w:p>",
+            &[("word/settings.xml", settings_xml(&many))],
+        );
+        let parsed = parse_file_blocks(Path::new(&p), &no_cancel()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(parsed.fingerprint.rsids.len(), MAX_RSIDS, "超限截断防膨胀");
+    }
+
+    #[test]
+    fn zip_entry_fp_stable_for_same_pipeline_differs_on_structure() {
+        let dir = std::env::temp_dir().join(format!("bg_zfp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body_a = "<w:p><w:r><w:t>甲公司的技术方案正文。</w:t></w:r></w:p>";
+        let body_b = "<w:p><w:r><w:t>乙公司完全不同的施工组织设计。</w:t></w:r></w:p>";
+        let a = write_docx_with_parts(&dir, "a.docx", body_a, &[]);
+        let b = write_docx_with_parts(&dir, "b.docx", body_b, &[]);
+        // 同一「打包管线」（条目序列一致）：内容不同也应有相同 zip 指纹
+        let c = write_docx_with_parts(
+            &dir,
+            "c.docx",
+            body_a,
+            &[("word/settings.xml", settings_xml(""))],
+        );
+        let fp_of = |p: &str| {
+            parse_file_blocks(Path::new(p), &no_cancel()).unwrap().fingerprint.zip_entry_fp.unwrap()
+        };
+        let (fa, fb, fc) = (fp_of(&a), fp_of(&b), fp_of(&c));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(fa, fb, "条目序列相同 → 指纹一致（与正文内容无关）");
+        assert_ne!(fa, fc, "多一个条目 → 指纹不同");
+    }
+
     #[test]
     fn docx_image_collection_filters_and_dedups() {
         let dir = std::env::temp_dir().join(format!("bg_img_{}", uuid::Uuid::new_v4()));
@@ -1211,6 +1949,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(imgs.len(), 1, "去重 + 小图过滤后应只剩 1 张");
         assert_eq!(imgs[0].dimensions(), (200, 120));
+    }
+
+    // —— W1-4 内嵌图片同源：位图指纹提取 + dHash 稳定性 ——
+
+    /// 8 条竖带（亮度非单调）的结构化灰度图：dHash 位型有结构（非全 0），大块结构
+    /// 在 JPEG 有损压缩后稳定，适合验证「重压缩仍近似」。
+    fn banded_img(w: u32, h: u32) -> image::RgbImage {
+        let bands = [10u8, 200, 40, 160, 90, 230, 20, 250];
+        image::RgbImage::from_fn(w, h, |x, _y| {
+            let v = bands[(x * 8 / w).min(7) as usize];
+            image::Rgb([v, v, v])
+        })
+    }
+
+    /// 确定性伪随机噪声图（LCG）：两个不同种子产生视觉无关的图，dHash 应相距很远。
+    fn noise_img(w: u32, h: u32, seed: u64) -> image::RgbImage {
+        let mut s = seed;
+        image::RgbImage::from_fn(w, h, |_x, _y| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let v = (s >> 33) as u8;
+            image::Rgb([v, v, v])
+        })
+    }
+
+    fn encode(img: &image::RgbImage, fmt: image::ImageFormat) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img.clone())
+            .write_to(&mut buf, fmt)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    fn hamming(a: u64, b: u64) -> u32 {
+        (a ^ b).count_ones()
+    }
+
+    #[test]
+    fn dhash_stable_across_jpeg_recompression_but_far_from_noise() {
+        let base = banded_img(200, 160);
+        // 同一张图的 PNG（无损）与 JPEG（有损重压）解码后像素不同 → sha256 不同，
+        // 但 dHash 汉明距离应 ≤10（视觉同源）
+        let png = image::load_from_memory(&encode(&base, image::ImageFormat::Png))
+            .unwrap()
+            .to_rgb8();
+        let jpg = image::load_from_memory(&encode(&base, image::ImageFormat::Jpeg))
+            .unwrap()
+            .to_rgb8();
+        assert_ne!(image_sha256(&png), image_sha256(&jpg), "有损重压后精确指纹应不同");
+        assert!(
+            hamming(dhash64(&png), dhash64(&jpg)) <= 10,
+            "重压缩后 dHash 应仍近似（≤10），实际 {}",
+            hamming(dhash64(&png), dhash64(&jpg))
+        );
+        // 两张无关噪声图 dHash 相距很远（>10）→ 不会被判近似
+        let n1 = noise_img(200, 160, 1);
+        let n2 = noise_img(200, 160, 999);
+        assert!(
+            hamming(dhash64(&n1), dhash64(&n2)) > 10,
+            "随机噪声图 dHash 应相距很远，实际 {}",
+            hamming(dhash64(&n1), dhash64(&n2))
+        );
+    }
+
+    #[test]
+    fn docx_image_hashes_extracted_dedup_and_filtered() {
+        let dir = std::env::temp_dir().join(format!("bg_imghash_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = banded_img(200, 160);
+        let png = encode(&base, image::ImageFormat::Png);
+        let jpg = encode(&base, image::ImageFormat::Jpeg); // 同图重压 → 不同字节/像素
+        let p = write_docx_with_media(
+            &dir,
+            "imghash.docx",
+            "<w:p><w:r><w:t>正文</w:t></w:r></w:p>",
+            &[
+                ("image1.png", png.clone()),
+                ("image2.png", png.clone()),          // 同像素 → sha256 去重
+                ("image3.jpg", jpg.clone()),          // 同图有损版 → 保留（sha 不同）
+                ("image4.png", solid_png(40, 40, 0)), // 短边 <80 → 剔除
+            ],
+        );
+        let mut zip = open_zip(&p);
+        let hashes = collect_image_hashes_docx(&mut zip, &no_cancel());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(hashes.len(), 2, "去重 + 小图过滤后应剩 2 张（PNG + JPEG 版）");
+        assert!(hashes.iter().all(|h| h.source == "docx" && h.page.is_none()));
+        assert!(hashes.iter().all(|h| h.dhash.is_some()), "docx 图恒有 dHash");
+        assert!(
+            hamming(hashes[0].dhash.unwrap(), hashes[1].dhash.unwrap()) <= 10,
+            "同图 PNG/JPEG 两版 dHash 应近似"
+        );
+    }
+
+    #[test]
+    fn pdf_image_object_extracted_with_page_and_dhash() {
+        // pdfium 造一页含内嵌图（非整页）的 PDF → collect_image_hashes_pdf 应取到 1 张 pdf 图，
+        // 带页码、非整页故有 dHash。当前平台无 libpdfium 时优雅跳过（与其他 pdfium 测试同）。
+        let Some(pdfium) = bind_pdfium() else {
+            eprintln!("跳过 pdf 图片提取测试：当前平台无可用 libpdfium");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("bg_pdfimg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dynimg = image::DynamicImage::ImageRgb8(banded_img(300, 240));
+        let bytes = {
+            let mut doc = pdfium.create_new_pdf().unwrap();
+            {
+                let mut page = doc
+                    .pages_mut()
+                    .create_page_at_index(PdfPagePaperSize::a4(), 0)
+                    .unwrap();
+                // A4≈595×842pt；图 200×160pt 置于 (50,50) → 占面比 ≈0.06 «0.8，非整页
+                page.objects_mut()
+                    .create_image_object(
+                        PdfPoints::new(50.0),
+                        PdfPoints::new(50.0),
+                        &dynimg,
+                        Some(PdfPoints::new(200.0)),
+                        Some(PdfPoints::new(160.0)),
+                    )
+                    .unwrap();
+            }
+            doc.save_to_bytes().unwrap()
+        };
+        // pdfium 的线程安全 marshall 锁不可重入：造夹具用的 Pdfium 必须先释放，
+        // 否则 collect_image_hashes_pdf 内的第二次 Pdfium::new 会死锁。
+        // 生产路径同理——parse_pdf 先 drop 掉 Pdfium 再调本函数，故不受影响。
+        drop(pdfium);
+        let p = dir.join("img.pdf");
+        std::fs::write(&p, bytes).unwrap();
+        let hashes = collect_image_hashes_pdf(&p, &no_cancel());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(hashes.len(), 1, "应提取到 1 张 PDF 内嵌图");
+        assert_eq!(hashes[0].source, "pdf");
+        assert_eq!(hashes[0].page, Some(1), "页码 1 起");
+        assert!(hashes[0].dhash.is_some(), "非整页图应有 dHash");
+        assert!(hashes[0].width >= MIN_IMAGE_HASH_PX && hashes[0].height >= MIN_IMAGE_HASH_PX);
     }
 
     #[test]

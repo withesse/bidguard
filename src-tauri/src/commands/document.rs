@@ -12,16 +12,26 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 
+/// 文档角色合法取值（documents.doc_role）：投标（默认）/ 招标文件 / 补遗答疑。
+const DOC_ROLES: &[&str] = &["bid", "tender", "tender_supplement"];
+
 /// 启动导入任务：立即返回 pending JobRow，进度走 document:import:* 全局事件。
+/// doc_role 为请求级参数（前端 camelCase docRole），缺省按投标文件 'bid' 导入。
 #[tauri::command]
 pub async fn import_documents(
     workspace_id: String,
     paths: Vec<String>,
+    doc_role: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<JobRow> {
     if paths.is_empty() {
         return Err(AppError::new(AppErrorCode::InvalidConfig, "未选择任何文件"));
+    }
+    let doc_role = doc_role.unwrap_or_else(|| "bid".to_string());
+    if !DOC_ROLES.contains(&doc_role.as_str()) {
+        return Err(AppError::new(AppErrorCode::InvalidConfig, "文档角色不合法")
+            .with_detail(format!("docRole={doc_role}，须为 {DOC_ROLES:?} 之一")));
     }
     // 工作区必须存在（同时把 NotFound 提前到任务创建前）
     workspace_repo::get(&*conn(&state)?, &workspace_id)?;
@@ -30,7 +40,7 @@ pub async fn import_documents(
 
     let jieba = state.jieba();
     let sink = Arc::new(TauriEventSink::new(app));
-    let config_json = serde_json::json!({ "paths": &paths }).to_string();
+    let config_json = serde_json::json!({ "paths": &paths, "docRole": &doc_role }).to_string();
     let ws = workspace_id.clone();
     state.jobs.spawn(
         &state.db,
@@ -39,7 +49,7 @@ pub async fn import_documents(
         "import",
         Some("导入文档"),
         &config_json,
-        move |ctx| import_service::run_import(ctx, jieba, &ws, &paths, &opts),
+        move |ctx| import_service::run_import(ctx, jieba, &ws, &paths, &opts, &doc_role),
     )
 }
 

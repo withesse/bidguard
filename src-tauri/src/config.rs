@@ -60,6 +60,10 @@ pub struct ParserDefaults {
     /// 扫描件/图片 OCR 档位（PP-OCRv6 tiny/small/medium）。
     pub ocr_model: String,
     pub min_paragraph_length: usize,
+    /// PDF 渲染-OCR 抽样交叉验证（字体重映射/坐标乱序检出，W2-4）。
+    /// 本版本仅预置配置键并计入导入配置指纹——执行方案全局裁决 1 要求 options_hash
+    /// 只 bump 一次（v5→v6），键先带默认值入哈希，交叉验证行为在 M2 实现。
+    pub pdf_cross_check: bool,
 }
 
 impl Default for ParserDefaults {
@@ -71,6 +75,7 @@ impl Default for ParserDefaults {
             ocr_docx_images: true,
             ocr_model: "v6-small".into(),
             min_paragraph_length: 10,
+            pdf_cross_check: true,
         }
     }
 }
@@ -165,6 +170,7 @@ mod tests {
         assert!(!c.compare.enable_semantic);
         assert!(c.compare.enable_fact_conflict);
         assert_eq!(c.parser.min_paragraph_length, 10);
+        assert!(c.parser.pdf_cross_check, "W2-4 预置键默认开启（行为 M2 实现）");
         assert_eq!(c.export.default_format, "html");
         assert!(!c.security.allow_cloud_model);
     }

@@ -59,6 +59,9 @@ pub async fn start_compare(
             return Err(AppError::new(AppErrorCode::InvalidConfig, "基准文档必须在参评文档中"));
         }
     }
+    // 角色守卫：招标文件/补遗混入参评会与各家对其条款的合法应答形成整片假雷同（W3）。
+    // 与其余校验一样在授权闸门之前——无效请求绝不扣次
+    ensure_participants_are_bid(&*conn(&state)?, &ids)?;
 
     let cfg_all = effective_config(&state, &workspace_id)?;
     let d = cfg_all.compare;
@@ -131,6 +134,21 @@ pub async fn start_compare(
             Err(e)
         }
     }
+}
+
+/// 参评文档必须全部为投标文件（doc_role='bid'）。报错带上文件名，
+/// 用户能直接在 UI 里定位改选（前端招标组虽不可勾选，深链接/旧缓存仍可能带进来）。
+fn ensure_participants_are_bid(conn: &rusqlite::Connection, ids: &[String]) -> AppResult<()> {
+    for id in ids {
+        let d = document_repo::get(conn, id)?;
+        if d.doc_role != "bid" {
+            return Err(AppError::new(
+                AppErrorCode::InvalidConfig,
+                format!("「{}」是招标文件（含补遗/答疑），不能作为投标文件参与交叉比对", d.file_name),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 总览：任务行 + 参评文档（按位次）+ 五块聚合 JSON。
@@ -257,4 +275,51 @@ pub async fn get_pair_detail(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::open_in_memory;
+    use crate::db::repo::workspace_repo;
+
+    #[test]
+    fn start_compare_rejects_tender_documents() {
+        // 验收：documentIds 混入 tender 角色 → InvalidConfig 且报错带文件名；全 bid 放行。
+        // start_compare 是需要 AppState 的 tauri command，这里直接测其角色守卫
+        // ensure_participants_are_bid（守卫在授权闸门之前，无效请求不扣次）
+        let pool = open_in_memory().unwrap();
+        let conn = pool.get().unwrap();
+        let ws = workspace_repo::create(&conn, "角色守卫").unwrap();
+        let bid_a = document_repo::create_parsing(
+            &conn, &ws.id, "投标A.docx", "/a", "h-a", "docx", "oh", "bid",
+        )
+        .unwrap();
+        let bid_b = document_repo::create_parsing(
+            &conn, &ws.id, "投标B.docx", "/b", "h-b", "docx", "oh", "bid",
+        )
+        .unwrap();
+        let tender = document_repo::create_parsing(
+            &conn, &ws.id, "招标文件.docx", "/t", "h-t", "docx", "oh", "tender",
+        )
+        .unwrap();
+
+        let err = ensure_participants_are_bid(
+            &conn,
+            &[bid_a.id.clone(), bid_b.id.clone(), tender.id.clone()],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, AppErrorCode::InvalidConfig);
+        assert!(err.message.contains("招标文件.docx"), "报错应带文件名：{}", err.message);
+
+        // 补遗/答疑同样拒绝
+        let supp = document_repo::create_parsing(
+            &conn, &ws.id, "补遗01.pdf", "/s", "h-s", "pdf", "oh", "tender_supplement",
+        )
+        .unwrap();
+        let err = ensure_participants_are_bid(&conn, &[bid_a.id.clone(), supp.id]).unwrap_err();
+        assert_eq!(err.code, AppErrorCode::InvalidConfig);
+
+        ensure_participants_are_bid(&conn, &[bid_a.id, bid_b.id]).unwrap();
+    }
 }
