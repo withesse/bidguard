@@ -35,6 +35,10 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
       - name: 引擎单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      # 回归门禁（W6-5 快档）：无模型层跑合成语料，比 baseline_metrics.json（F1/召回/AUC）。
+      # 语料 hash 先行校验；任一指标越容差即失败并打印新旧全表。预算 <60s。
+      - name: 语料回归门禁（快档）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools corpus_regression -- --nocapture
 
   # 跨平台：Linux 编译检查；Windows 跑完整引擎测试（随包 pdfium.dll 为 x64，可真跑）。
   cross-check:

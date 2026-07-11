@@ -13,6 +13,11 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
+// dev-tools/测试专用：合成对抗语料生成器（供 bin/corpusgen.rs 与回归 harness 调用）。
+// 门控与 engine::corpusgen 一致，不进发布二进制。
+#[cfg(any(test, feature = "dev-tools"))]
+pub use engine::corpusgen;
+
 use tauri::Manager;
 
 /// 解析单个文件，返回页数与字数；用于导入前的早期校验。

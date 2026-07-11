@@ -139,6 +139,26 @@ pub fn extract_entities(normalized: &str) -> Vec<Entity> {
     out
 }
 
+/// 实体字节 span（起, 止, kind），按起点升序。复用 extract_entities 同一套正则与优先级，
+/// 供合成语料生成器：数字微调只落在 span 内、同义替换避让 span。仅 dev-tools/测试编译。
+#[cfg(any(test, feature = "dev-tools"))]
+pub fn entity_spans(normalized: &str) -> Vec<(usize, usize, &'static str)> {
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut out: Vec<(usize, usize, &'static str)> = Vec::new();
+    for (kind, re) in entity_regexes() {
+        for m in re.find_iter(normalized) {
+            let span = (m.start(), m.end());
+            if taken.iter().any(|&(s, e)| span.0 < e && s < span.1) {
+                continue; // 与更高优先级的命中重叠
+            }
+            taken.push(span);
+            out.push((span.0, span.1, *kind));
+        }
+    }
+    out.sort_by_key(|&(s, _, _)| s);
+    out
+}
+
 /// 金额串 → 规范数值串：去货币符/千分位/单位/整/空白，折算残留的 万/亿，输出无冗余小数的数值。
 /// 解析失败时回退清理后的原串（不丢信息）。
 fn canon_amount(s: &str) -> String {

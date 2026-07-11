@@ -1,0 +1,53 @@
+{
+  "lane": "fast",
+  "recallRate": 1.0,
+  "recallByLabel": {
+    "changed": 1.0,
+    "minor_change": 1.0,
+    "rewrite": 1.0,
+    "same": 1.0
+  },
+  "labels": {
+    "changed": {
+      "precision": 0.3551912568306011,
+      "recall": 0.37142857142857144,
+      "f1": 0.3631284916201118,
+      "support": 350
+    },
+    "minor_change": {
+      "precision": 0.6176470588235294,
+      "recall": 0.36,
+      "f1": 0.45487364620938625,
+      "support": 350
+    },
+    "rewrite": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "support": 350
+    },
+    "same": {
+      "precision": 0.8353221957040573,
+      "recall": 1.0,
+      "f1": 0.9102730819245773,
+      "support": 350
+    },
+    "unrelated": {
+      "precision": 0.45992115637319314,
+      "recall": 1.0,
+      "f1": 0.6300630063006301,
+      "support": 350
+    }
+  },
+  "macroF1": 0.47166764521094107,
+  "collusionAuc": 1.0,
+  "meanCollusionScore": 0.9799999594688416,
+  "meanIndependentScore": 0.4188888867696126,
+  "pairsCount": 1750,
+  "docsetsCount": 12,
+  "pairsHash": "ae38744f8c8aa29677c6fa77118f998ae956f69123a1795d9e6042654051214a",
+  "docsetsHash": "cbcfb7b112fd8dcd52288848e163dd1d8c413a67fdaead6729cf744885ebc322",
+  "gitRev": "b94be43",
+  "generatedAt": "2026-07-11",
+  "note": "无模型层：features→recall→score_pair→classify_cluster→assess_with（不含语义/rerank）"
+}

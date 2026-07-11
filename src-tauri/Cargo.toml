@@ -12,6 +12,17 @@ rust-version = "1.95"
 name = "bidguard_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# dev-tools：仅开发期编译的合成语料生成器/回归 harness，绝不进发布二进制。
+# Enables the synthetic-corpus generator (engine::corpusgen) and its `corpusgen` bin.
+dev-tools = []
+
+# 合成对抗语料生成器 CLI（M3 校准语料）：cargo run --bin corpusgen --features dev-tools
+[[bin]]
+name = "corpusgen"
+path = "src/bin/corpusgen.rs"
+required-features = ["dev-tools"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

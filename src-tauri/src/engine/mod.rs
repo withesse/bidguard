@@ -8,6 +8,9 @@ pub mod clustering;
 pub mod collusion;
 pub mod confusables;
 pub mod corpus;
+// 合成对抗语料生成器（M3）：仅测试/开发工具编译，不进发布二进制。
+#[cfg(any(test, feature = "dev-tools"))]
+pub mod corpusgen;
 pub mod diff;
 pub mod embed;
 pub mod fact;
