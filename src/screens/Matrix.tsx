@@ -56,8 +56,27 @@ interface MatrixView {
   conclusion: { pill: string; statement: string; desc: string };
   pairRows: PairRow[];
   insights: Insight[];
+  forensicSignals: { tag: string; fg: string; bg: string; detail: string; weight: number }[];
 }
 
+// 围标信号 kind → 洞察标签配色。取证四类走「取证/图片/错误」红/橙档，规避走最高红档；
+// 未知 kind 回落「相似」（旧格式 collusion_json 缺字段不报错）。
+const KIND_META: Record<string, { tag: string; fg: string; bg: string }> = {
+  metadata: { tag: "指纹", fg: C.danger, bg: C.dangerSoft },
+  cluster: { tag: "雷同", fg: C.warn, bg: C.warnSoft },
+  sharedTerms: { tag: "同源", fg: C.warn, bg: C.warnSoft },
+  facts: { tag: "报价", fg: C.warn, bg: C.warnSoft },
+  rsid: { tag: "取证", fg: C.danger, bg: C.dangerSoft },
+  pdfLineage: { tag: "取证", fg: C.danger, bg: C.dangerSoft },
+  imageReuse: { tag: "图片", fg: C.hi2, bg: C.hi2Soft },
+  sharedErrors: { tag: "错误", fg: C.hi4, bg: C.hi4Soft },
+  evasion: { tag: "规避特征", fg: C.danger, bg: C.dangerSoft },
+};
+const KIND_META_DEFAULT = { tag: "相似", fg: C.hi3, bg: C.brandSoft };
+// 取证指纹折叠区消费的信号 kind（rsid/PDF 血缘/图片同源/共同错误）。
+const FORENSIC_KINDS = ["rsid", "pdfLineage", "imageReuse", "sharedErrors"];
+const FORENSIC_DISCLAIMER =
+  "取证信号未命中不构成清白证明（另存为 / 元数据清洗可消除痕迹）；是否构成围标须由评标委员会依法认定。";
 
 function sev(pct: number): { c: string; label: string } {
   const b = simBand(pct);
@@ -123,17 +142,30 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
   const lv = LEVEL_META[level] ?? LEVEL_META.none;
   const signals = collusion?.signals ?? [];
 
+  // §1.5 措辞分级：confirmed 用红色「规避特征」+ 强措辞；仅 suspect（无 confirmed）软化为
+  // 「异常字符（可能来自复制粘贴）」，避免把复制粘贴零宽残留说成规避。判级取自各文档 evasionSummary
+  // （与 collusion evasion 信号同源 evasion_json，一致）——纯呈现分支，不改融合规则。
+  const anyEvasionConfirmed = sm.documents.some((d) => d.evasionSummary?.severity === "confirmed");
   const insights: Insight[] = signals.map((sig) => {
-    const meta =
-      sig.kind === "metadata"
-        ? { tag: "指纹", fg: C.danger, bg: C.dangerSoft }
-        : sig.kind === "cluster"
-          ? { tag: "雷同", fg: C.warn, bg: C.warnSoft }
-          : sig.kind === "sharedTerms"
-            ? { tag: "同源", fg: C.warn, bg: C.warnSoft }
-            : { tag: "相似", fg: C.hi3, bg: C.brandSoft };
+    if (sig.kind === "evasion" && !anyEvasionConfirmed) {
+      return {
+        tag: "异常字符",
+        fg: C.warn,
+        bg: C.warnSoft,
+        title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`,
+        body: "检测到异常字符（可能来自复制粘贴），建议人工留意；未达规避特征确认级，未必构成规避。",
+      };
+    }
+    const meta = KIND_META[sig.kind] ?? KIND_META_DEFAULT;
     return { ...meta, title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`, body: sig.detail };
   });
+  // 取证指纹折叠区：逐条列出 rsid/PDF 血缘/图片同源/共同错误信号（明细含天干对与免责纪律）。
+  const forensicSignals = signals
+    .filter((sig) => FORENSIC_KINDS.includes(sig.kind))
+    .map((sig) => {
+      const meta = KIND_META[sig.kind] ?? KIND_META_DEFAULT;
+      return { tag: meta.tag, fg: meta.fg, bg: meta.bg, detail: sig.detail, weight: sig.weight };
+    });
   const seen = new Set<string>();
   docs.forEach((dv, i) =>
     dv.fp?.riskFlags.forEach((f) => {
@@ -166,6 +198,7 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
     conclusion: { pill: lv.pill, statement, desc },
     pairRows,
     insights,
+    forensicSignals,
   };
 }
 
@@ -427,13 +460,26 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                         >
                           {d.note ? `解析失败：${d.note}` : d.full}
                         </div>
-                        {d.fp && (d.fp.author || d.fp.lastModifiedBy || d.fp.app) && (
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
-                            {d.fp.author && <FpChip k="作者" v={d.fp.author} mute={mute} />}
-                            {d.fp.lastModifiedBy && <FpChip k="改" v={d.fp.lastModifiedBy} mute={mute} />}
-                            {d.fp.app && <FpChip k="软件" v={d.fp.app} mute={mute} />}
-                          </div>
-                        )}
+                        {d.fp &&
+                          (d.fp.author ||
+                            d.fp.lastModifiedBy ||
+                            d.fp.app ||
+                            d.fp.templateName ||
+                            (d.fp.rsids?.length ?? 0) > 0 ||
+                            (d.fp.fontSubsetTags?.length ?? 0) > 0) && (
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
+                              {d.fp.author && <FpChip k="作者" v={d.fp.author} mute={mute} />}
+                              {d.fp.lastModifiedBy && <FpChip k="改" v={d.fp.lastModifiedBy} mute={mute} />}
+                              {d.fp.app && <FpChip k="软件" v={d.fp.app} mute={mute} />}
+                              {d.fp.templateName && <FpChip k="模板" v={d.fp.templateName} mute={mute} />}
+                              {(d.fp.rsids?.length ?? 0) > 0 && (
+                                <FpChip k="rsid" v={`×${d.fp.rsids!.length}`} mute={mute} />
+                              )}
+                              {(d.fp.fontSubsetTags?.length ?? 0) > 0 && (
+                                <FpChip k="字体" v={`×${d.fp.fontSubsetTags!.length}`} mute={mute} />
+                              )}
+                            </div>
+                          )}
                       </div>
                     </div>
                   ))}
@@ -462,6 +508,44 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                   ))}
                 </div>
               </div>
+
+              {/* 取证指纹折叠区：仅在有取证信号时渲染（§1.5 空态不渲染、不出现「检查通过」）。 */}
+              {v.forensicSignals.length > 0 && (
+                <details
+                  open
+                  style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 12, padding: 18 }}
+                >
+                  <summary style={{ fontSize: 13, fontWeight: 700, color: ink, cursor: "pointer" }}>
+                    取证指纹 · {v.forensicSignals.length} 项
+                  </summary>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+                    {v.forensicSignals.map((s, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          padding: 12,
+                          borderRadius: 8,
+                          background: dark ? "rgba(255,255,255,0.025)" : C.paper2,
+                          border: `1px solid ${border}`,
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <Pill bg={s.bg} fg={s.fg} size={10}>
+                            {s.tag}
+                          </Pill>
+                          <span style={{ fontSize: 11, color: mute, fontFamily: C.mono }}>
+                            权重 {(s.weight * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 11, color: mute, marginTop: 6, lineHeight: 1.6 }}>{s.detail}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 10.5, color: mute, marginTop: 12, lineHeight: 1.55, fontStyle: "italic" }}>
+                    {FORENSIC_DISCLAIMER}
+                  </div>
+                </details>
+              )}
             </div>
           </div>
         </div>

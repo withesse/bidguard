@@ -14,6 +14,25 @@ export interface WorkspaceDto {
 /** 文档角色：bid 投标（默认）| tender 招标文件 | tender_supplement 补遗/答疑。 */
 export type DocRole = "bid" | "tender" | "tender_supplement";
 
+/** 规避特征判级摘要（镜像 Rust engine::report::EvasionSummary，serde camelCase）。
+ *  §1.5：severity 仅驱动呈现，机器不下「规避/串通/清白」定性；仅 confirmed 打徽标/挂告警条。 */
+export interface EvasionSummaryDto {
+  zeroWidth: number;
+  bidi: number;
+  tags: number;
+  variation: number;
+  confusableFolds: number;
+  mixedScriptWords: number;
+  affectedChunks: number;
+  maxChunkConcentration: number;
+  pdfHiddenRatio: number;
+  pdfHiddenChars: number;
+  /** 渲染-OCR 交叉验证命中机器标识（fontRemap/coordShuffle）；null=未命中/未做，不作清白背书。 */
+  xcheckKind: string | null;
+  xcheckLabel: string | null;
+  severity: "none" | "suspect" | "confirmed" | string;
+}
+
 export interface DocumentDto {
   id: string;
   workspaceId: string;
@@ -32,6 +51,8 @@ export interface DocumentDto {
   updatedAt: string;
   /** 解析期「内容不完整」告知语（扫描件超页 / docx XML 截断）；前端以警示条展示。 */
   truncationNotice: string | null;
+  /** 规避特征判级摘要（M2 入口对抗层）；null=无发现或旧任务导入。仅 confirmed 触发文档卡徽标/告警条。 */
+  evasionSummary: EvasionSummaryDto | null;
   /** 文档角色；招标类（tender/tender_supplement）不可勾选参评、不占参评名额。 */
   docRole: DocRole | string;
 }

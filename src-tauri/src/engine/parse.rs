@@ -54,26 +54,38 @@ pub struct ParsedBlocks {
     /// 内嵌图片同源指纹（导入期提取，落 document_images）：docx word/media 位图 +
     /// PDF 页对象位图。非 docx/pdf 或提取器不可用（pdfium 缺）时为空。
     pub image_hashes: Vec<ImageHash>,
+    /// PDF 隐藏文字层审计（W2-3，与抽取方式正交，parse_pdf 分发后统一填充）：Tr=3/白字/
+    /// 出画布/极小字号计数 + OCR 双层页归类。非 PDF 路径或损坏 PDF 为 None。
+    pub pdf_audit: Option<crate::engine::pdf_audit::PdfHiddenStats>,
+    /// 渲染-OCR 抽样交叉验证结果（W2-4，仅 pdf_cross_check 开启且前两级有文字层时填充）：
+    /// 抽样页 + 逐页失配/顺序分 + verdict/skipped。命中即已回落 OCR（method=ocr-fallback）。
+    /// 未开启/扫描件/非 PDF 为 None。命中时并入 documents.evasion_json 的 xcheck 子对象。
+    pub xcheck: Option<crate::engine::pdf_xcheck::XCheckResult>,
 }
 
 /// 新 API：结构化段块 + 取消旗标（OCR/栅格化等长阶段逐页检查）。
 /// 取消时尽快返回 Err；调用方应先自查旗标再决定如何归类该错误。
+/// 导入前的轻量预览（parse_meta）与测试走此薄包装：pdf_cross_check=false，不做渲染-OCR
+/// 交叉验证（那是导入期的重活，会改变 method/文本）。
 pub fn parse_file_blocks(path: &Path, cancel: &AtomicBool) -> Result<ParsedBlocks, String> {
     parse_file_blocks_opt(
         path,
         cancel,
         false,
         crate::engine::ocr::resolve(crate::engine::ocr::DEFAULT_OCR_MODEL),
+        false,
     )
 }
 
 /// 带选项的解析。ocr_docx_images=true 时对 docx 内嵌图片做 OCR（截图式表格/资质里的文字）。
 /// ocr_model 选定扫描件/图片 OCR 的档位（PP-OCRv6 tiny/small/medium）。
+/// pdf_cross_check=true 时对文字版 PDF 跑渲染-OCR 抽样交叉验证（W2-4，命中回落 OCR）。
 pub fn parse_file_blocks_opt(
     path: &Path,
     cancel: &AtomicBool,
     ocr_docx_images: bool,
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+    pdf_cross_check: bool,
 ) -> Result<ParsedBlocks, String> {
     let ext = path
         .extension()
@@ -83,7 +95,7 @@ pub fn parse_file_blocks_opt(
     match ext.as_str() {
         "docx" => parse_docx(path, cancel, ocr_docx_images, ocr_model),
         "txt" | "md" => parse_txt(path),
-        "pdf" => parse_pdf(path, cancel, ocr_model),
+        "pdf" => parse_pdf(path, cancel, ocr_model, pdf_cross_check),
         "xlsx" | "xls" => parse_spreadsheet(path),
         other => Err(format!("暂不支持的文件类型: .{other}")),
     }
@@ -145,6 +157,8 @@ fn parse_spreadsheet(path: &Path) -> Result<ParsedBlocks, String> {
         ocr_layout_json: None,
         truncation_notice: None,
         image_hashes: Vec::new(),
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
@@ -187,6 +201,8 @@ fn parse_txt(path: &Path) -> Result<ParsedBlocks, String> {
         ocr_layout_json: None,
         truncation_notice: None,
         image_hashes: Vec::new(),
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
@@ -352,8 +368,12 @@ fn parse_pdf(
     path: &Path,
     cancel: &AtomicBool,
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+    pdf_cross_check: bool,
 ) -> Result<ParsedBlocks, String> {
-    // 1) pdfium 文本（最鲁棒）；2) pdf-extract 回落；3) 扫描件 → OCR
+    // 隐藏文字层审计：与抽取方式正交，三级回落前先跑（损坏/加密 PDF 返回 None 静默降级，
+    // 与 pdf_fingerprint 同容错语义，不阻塞导入）。
+    let audit = crate::engine::pdf_audit::audit(path);
+    // 1) pdfium 文本（最鲁棒）；2) pdf-extract 回落；3) 扫描件 → OCR（上限 OCR_MAX_PAGES）
     let mut pb = if let Some(pd) = parse_pdf_pdfium(path, cancel) {
         pd
     } else if cancel.load(Ordering::SeqCst) {
@@ -361,8 +381,20 @@ fn parse_pdf(
     } else if let Ok(pd) = parse_pdf_extract(path) {
         pd
     } else {
-        parse_pdf_ocr(path, cancel, ocr_model)?
+        parse_pdf_ocr(path, cancel, ocr_model, Some(OCR_MAX_PAGES))?
     };
+    pb.pdf_audit = audit;
+    // 渲染-OCR 抽样交叉验证（W2-4）：仅在前两级抽出文字层（pdfium/pdf-extract）后触发——
+    // 扫描件本就是 OCR 文本，无「渲染 vs 抽取」差集可验。命中即回落整文档 OCR；
+    // 关闭时记 skipped（供方法与局限章节如实说明「未执行」，非清白背书），零耗时。
+    if matches!(pb.method, "pdfium" | "pdf-extract") && !cancel.load(Ordering::SeqCst) {
+        if pdf_cross_check {
+            pb = run_pdf_cross_check(path, pb, cancel, ocr_model);
+        } else {
+            pb.xcheck =
+                Some(crate::engine::pdf_xcheck::XCheckResult::skipped("配置未开启渲染交叉验证"));
+        }
+    }
     // 内嵌图片同源指纹：与文本抽取路径正交，统一在此提取（pdfium 不可用则空、与 OCR 同降级）。
     // 已取消则不再额外解码图片，尽快返回。
     if !cancel.load(Ordering::SeqCst) {
@@ -371,14 +403,119 @@ fn parse_pdf(
     Ok(pb)
 }
 
+/// 渲染-OCR 抽样交叉验证（W2-4）：确定性抽样若干页 → 栅格化 → OCR → 与文字层逐页比对。
+/// 命中（字体重映射/坐标乱序）→ 整文档回落 OCR 并【解除 OCR_MAX_PAGES 上限】（取证需要，
+/// 非普通扫描件），method 记 ocr-fallback + 「文字层不可信」提示；未命中/跳过保留文字层。
+/// pdfium 不可绑定或 OCR 模型缺失时记 xcheck.skipped，不阻塞导入、不做清白背书。
+fn run_pdf_cross_check(
+    path: &Path,
+    mut pb: ParsedBlocks,
+    cancel: &AtomicBool,
+    ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+) -> ParsedBlocks {
+    use crate::engine::pdf_xcheck;
+    let total = pb.pages as usize;
+    if total == 0 {
+        pb.xcheck = Some(pdf_xcheck::XCheckResult::skipped("无页面"));
+        return pb;
+    }
+    // 可疑页优先顶替间隔页：pdf_audit 命中页按隐藏字符数降序（最可疑者先占间隔槽），0 基页索引。
+    let suspect: Vec<usize> = match &pb.pdf_audit {
+        Some(a) => {
+            let mut hits = a.hit_pages.clone();
+            hits.sort_by(|x, y| y.hidden_chars.cmp(&x.hidden_chars).then(x.page.cmp(&y.page)));
+            hits.iter().map(|p| p.page.saturating_sub(1) as usize).collect()
+        }
+        None => Vec::new(),
+    };
+    let sampled_idx = pdf_xcheck::sample_pages(total, &suspect, pdf_xcheck::SAMPLE_K);
+    if sampled_idx.is_empty() {
+        pb.xcheck = Some(pdf_xcheck::XCheckResult::skipped("无可抽样页"));
+        return pb;
+    }
+    let sampled_1based: Vec<u32> = sampled_idx.iter().map(|&i| i as u32 + 1).collect();
+    // 栅格化抽样页（pdfium 不可用则跳过）
+    let imgs = match rasterize_pages(path, &sampled_idx, cancel) {
+        Some(v) if v.len() == sampled_idx.len() => v,
+        _ => {
+            if cancel.load(Ordering::SeqCst) {
+                return pb; // 取消：不记 xcheck，交由上层归类取消
+            }
+            pb.xcheck = Some(pdf_xcheck::XCheckResult::skipped("pdfium 不可用或抽样页渲染失败"));
+            return pb;
+        }
+    };
+    // OCR 抽样页（模型缺失/识别失败/取消 → None）
+    let ocr_texts: Vec<String> = match crate::engine::ocr::ocr_images(imgs, cancel, ocr_model) {
+        Some(pages) => pages.into_iter().map(|p| p.text).collect(),
+        None => {
+            if cancel.load(Ordering::SeqCst) {
+                return pb;
+            }
+            pb.xcheck = Some(pdf_xcheck::XCheckResult::skipped("OCR 不可用（缺模型或识别失败）"));
+            return pb;
+        }
+    };
+    // 逐页比对：pdfium 路径块带页码可逐页取文字层；pdf-extract 路径块无页码退化为 shingle 包含率
+    let xr = if pb.method == "pdfium" {
+        let layer_pages: Vec<String> =
+            sampled_idx.iter().map(|&i| page_text_from_blocks(&pb.blocks, i as u32 + 1)).collect();
+        pdf_xcheck::evaluate_paged(&sampled_1based, &layer_pages, &ocr_texts)
+    } else {
+        pdf_xcheck::evaluate_shingle(&sampled_1based, &pb.legacy_text, &ocr_texts)
+    };
+    if !xr.is_hit() || cancel.load(Ordering::SeqCst) {
+        pb.xcheck = Some(xr); // 未命中：保留文字层，xcheck 供日志/方法与局限章节（不写 evasion）
+        return pb;
+    }
+    // 命中：整文档回落 OCR，解除 20 页上限（取证需要）。回落失败则保留文字层但仍记命中的
+    // xcheck，evasion 信号照常从 verdict 触发（降级但不静默）。
+    let notice = format!(
+        "本文档 PDF 文字层与渲染内容不一致（检测到{}），已改用 OCR 识别的文本参与比对，请人工复核。",
+        xr.hit_label()
+    );
+    match parse_pdf_ocr(path, cancel, ocr_model, None) {
+        Ok(mut ocr_pb) => {
+            ocr_pb.pdf_audit = pb.pdf_audit.take();
+            ocr_pb.method = "ocr-fallback";
+            // 回落提示优先于（可能不存在的）截断提示；解除上限后一般不会再截断
+            ocr_pb.truncation_notice = Some(match ocr_pb.truncation_notice {
+                Some(t) => format!("{notice}（{t}）"),
+                None => notice,
+            });
+            ocr_pb.xcheck = Some(xr);
+            ocr_pb
+        }
+        Err(_) => {
+            pb.xcheck = Some(xr);
+            pb
+        }
+    }
+}
+
+/// 从逐页块集拼接某页（1 起）的文字层文本（pdfium 路径块带页码）。
+fn page_text_from_blocks(blocks: &[Block], page: u32) -> String {
+    let mut out = String::new();
+    for b in blocks.iter().filter(|b| b.page == Some(page)) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&b.text);
+    }
+    out
+}
+
 /// 扫描件路径：pdfium 栅格化每页 → oar-ocr 识别 → 按页拼接文本 + 行级版面。
+/// max_pages=Some(n) 限制渲染前 n 页（普通扫描件控耗时）；None 解除上限（W2-4 交叉验证
+/// 命中回落时用——取证需要，超长规避文档后置页不能因 20 页上限退出比对）。
 fn parse_pdf_ocr(
     path: &Path,
     cancel: &AtomicBool,
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
+    max_pages: Option<usize>,
 ) -> Result<ParsedBlocks, String> {
-    let (imgs, total_pages) =
-        rasterize_pdf(path, cancel).ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
+    let (imgs, total_pages) = rasterize_pdf_capped(path, cancel, max_pages)
+        .ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
     if imgs.is_empty() {
         return Err("PDF 无可渲染页面".into());
     }
@@ -429,23 +566,84 @@ fn parse_pdf_ocr(
         legacy_text,
         ocr_layout_json,
         truncation_notice,
-        // parse_pdf 在分发后统一填充图片指纹（与文本抽取路径正交）
+        // parse_pdf 在分发后统一填充图片指纹与隐藏文字层审计（与文本抽取路径正交）
         image_hashes: Vec::new(),
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
 /// 扫描件 OCR 的最大渲染页数（控制耗时）。超出的页不参与查重，会在文本首插入醒目提示。
 const OCR_MAX_PAGES: usize = 20;
 
-/// 用 pdfium 把 PDF 各页渲染为 RgbImage（手动 BGRA→RGB，避开 image 特性耦合）。
-/// 返回 (渲染出的页图, 文档总页数)——总页数用于识别截断并如实上报页数。
+/// PDF 页栅格化的统一渲染配置（宽 1600、限高 2400）；xcheck 抽样页与全量扫描共用。
+fn pdf_render_config() -> PdfRenderConfig {
+    PdfRenderConfig::new().set_target_width(1600).set_maximum_height(2400)
+}
+
+/// pdfium 位图 → RgbImage（手动 BGRA→RGB，避开 image 特性耦合）。尺寸/字节数不合法返回 None。
+fn bitmap_to_rgb(bm: &pdfium_render::prelude::PdfBitmap) -> Option<image::RgbImage> {
+    let w = bm.width() as u32;
+    let h = bm.height() as u32;
+    let raw = bm.as_raw_bytes();
+    let need = (w as usize) * (h as usize) * 4;
+    if w == 0 || h == 0 || raw.len() < need {
+        return None;
+    }
+    let mut rgb = image::RgbImage::new(w, h);
+    for (i, px) in rgb.pixels_mut().enumerate() {
+        let o = i * 4;
+        *px = image::Rgb([raw[o + 2], raw[o + 1], raw[o]]); // BGRA → RGB
+    }
+    Some(rgb)
+}
+
+/// 用 pdfium 把 PDF 各页渲染为 RgbImage（上限 OCR_MAX_PAGES）。仅测试在用——生产路径
+/// parse_pdf_ocr 直接调 rasterize_pdf_capped 以参数化页上限（W2-4 回落传 None 解除上限）。
+#[cfg(test)]
 fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<(Vec<image::RgbImage>, usize)> {
+    rasterize_pdf_capped(path, cancel, Some(OCR_MAX_PAGES))
+}
+
+/// 按索引栅格化指定页（W2-4 交叉验证抽样，复用 rasterize 的渲染配置）。返回与 indices 逐一
+/// 对应的页图（越界索引跳过 → 长度可能短于 indices，调用方据此判断是否可用）；pdfium 不可
+/// 绑定返回 None（与全量栅格化同降级语义）。
+fn rasterize_pages(
+    path: &Path,
+    indices: &[usize],
+    cancel: &AtomicBool,
+) -> Option<Vec<image::RgbImage>> {
+    let pdfium = bind_pdfium()?;
+    let doc = pdfium.load_pdf_from_file(path.to_str()?, None).ok()?;
+    let pages = doc.pages();
+    let total = pages.len() as usize;
+    let cfg = pdf_render_config();
+    let mut out = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if idx >= total {
+            continue;
+        }
+        let Ok(page) = pages.get(idx as u16) else { continue };
+        let Ok(bm) = page.render_with_config(&cfg) else { continue };
+        let Some(rgb) = bitmap_to_rgb(&bm) else { continue };
+        out.push(rgb);
+    }
+    Some(out)
+}
+
+/// 栅格化按页上限参数化：max_pages=Some(n) 渲染前 n 页；None 渲染全部（取证回落）。
+fn rasterize_pdf_capped(
+    path: &Path,
+    cancel: &AtomicBool,
+    max_pages: Option<usize>,
+) -> Option<(Vec<image::RgbImage>, usize)> {
     let pdfium = bind_pdfium()?;
     let doc = pdfium.load_pdf_from_file(path.to_str()?, None).ok()?;
     let total_pages = doc.pages().len() as usize;
-    let cfg = PdfRenderConfig::new()
-        .set_target_width(1600)
-        .set_maximum_height(2400);
+    let cfg = pdf_render_config();
     let mut imgs = Vec::new();
     for page in doc.pages().iter() {
         if cancel.load(Ordering::Relaxed) {
@@ -455,21 +653,10 @@ fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<(Vec<image::RgbImag
             Ok(b) => b,
             Err(_) => continue,
         };
-        let w = bm.width() as u32;
-        let h = bm.height() as u32;
-        let raw = bm.as_raw_bytes();
-        let need = (w as usize) * (h as usize) * 4;
-        if w == 0 || h == 0 || raw.len() < need {
-            continue;
-        }
-        let mut rgb = image::RgbImage::new(w, h);
-        for (i, px) in rgb.pixels_mut().enumerate() {
-            let o = i * 4;
-            *px = image::Rgb([raw[o + 2], raw[o + 1], raw[o]]); // BGRA → RGB
-        }
+        let Some(rgb) = bitmap_to_rgb(&bm) else { continue };
         imgs.push(rgb);
-        if imgs.len() >= OCR_MAX_PAGES {
-            break; // 限制扫描页数，控制耗时
+        if max_pages.is_some_and(|m| imgs.len() >= m) {
+            break; // 限制渲染页数，控制耗时（None 则渲染全部）
         }
     }
     Some((imgs, total_pages))
@@ -497,6 +684,8 @@ fn parse_pdf_extract(path: &Path) -> Result<ParsedBlocks, String> {
         ocr_layout_json: None,
         truncation_notice: None,
         image_hashes: Vec::new(), // parse_pdf 分发后统一填充
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
@@ -540,6 +729,8 @@ fn parse_pdf_pdfium(path: &Path, cancel: &AtomicBool) -> Option<ParsedBlocks> {
         ocr_layout_json: None,
         truncation_notice: None,
         image_hashes: Vec::new(), // parse_pdf 分发后统一填充
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
@@ -834,6 +1025,8 @@ fn parse_docx(
         ocr_layout_json: None,
         truncation_notice,
         image_hashes,
+        pdf_audit: None,
+        xcheck: None,
     })
 }
 
@@ -1800,6 +1993,7 @@ mod tests {
             char_count: 100,
             fingerprint: pdf_fingerprint(p),
             parse_error: None,
+            evasion: None,
         };
         // 同一母文件：trailer /ID 首半相同（字体互不相同）
         let a = write_lineage_pdf(&dir, "a.pdf", b"\x99\x88", None, &["AAAAAA+SimSun"]);
@@ -2096,8 +2290,8 @@ mod tests {
         let body = "<w:p><w:r><w:t>本项目采用分层解耦的微服务架构设计方案。</w:t></w:r></w:p>";
         let p = write_docx_with_media(&dir, "plain.docx", body, &[]);
         let m = crate::engine::ocr::resolve("v6-small");
-        let off = parse_file_blocks_opt(Path::new(&p), &no_cancel(), false, m).unwrap();
-        let on = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true, m).unwrap();
+        let off = parse_file_blocks_opt(Path::new(&p), &no_cancel(), false, m, false).unwrap();
+        let on = parse_file_blocks_opt(Path::new(&p), &no_cancel(), true, m, false).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(off.blocks.len(), on.blocks.len(), "无图片时开关不影响块数");
         assert!(on.blocks.iter().any(|b| b.text.contains("微服务架构")));
@@ -2127,9 +2321,14 @@ mod tests {
             "<w:p><w:r><w:t>下表为截图。</w:t></w:r></w:p>",
             &[("page1.png", png.into_inner())],
         );
-        let pb =
-            parse_file_blocks_opt(Path::new(&p), &no_cancel(), true, crate::engine::ocr::resolve("v6-small"))
-                .unwrap();
+        let pb = parse_file_blocks_opt(
+            Path::new(&p),
+            &no_cancel(),
+            true,
+            crate::engine::ocr::resolve("v6-small"),
+            false,
+        )
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let joined = pb.blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n").to_lowercase();
         assert!(
@@ -2258,5 +2457,168 @@ mod tests {
         );
         let l = pages.iter().flat_map(|p| &p.lines).next().unwrap();
         assert!((0.0..=1.0).contains(&l.x) && (0.0..=1.0).contains(&l.y), "坐标应已归一化");
+    }
+
+    /// pdfium 造一个 N 页 PDF（各页 A4 空白，保证可渲染）；返回文件路径。造夹具的 Pdfium
+    /// 必须在返回前释放（marshall 锁不可重入，否则后续 bind_pdfium 死锁）。
+    fn write_multipage_pdf(dir: &Path, name: &str, n: usize) -> Option<PathBuf> {
+        let pdfium = bind_pdfium()?;
+        let bytes = {
+            let mut doc = pdfium.create_new_pdf().unwrap();
+            for i in 0..n {
+                doc.pages_mut()
+                    .create_page_at_index(PdfPagePaperSize::a4(), i as u16)
+                    .unwrap();
+            }
+            doc.save_to_bytes().unwrap()
+        };
+        drop(pdfium);
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        Some(p)
+    }
+
+    #[test]
+    fn rasterize_cap_lift_and_sampled_pages() {
+        // W2-4「回落解除 OCR 页上限」的底层保证：max_pages 参数化 + 按索引抽样渲染。
+        // 无 libpdfium 环境优雅跳过（与其他 pdfium 测试同），不联网、不加载 OCR 模型。
+        let dir = std::env::temp_dir().join(format!("bg_capm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(p) = write_multipage_pdf(&dir, "multi.pdf", 4) else {
+            eprintln!("跳过：当前平台无可用 libpdfium");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        // 上限 2：仅渲染前 2 页，但如实上报总页数 4
+        let (capped, total) = rasterize_pdf_capped(&p, &no_cancel(), Some(2)).expect("应能栅格化");
+        assert_eq!(total, 4, "总页数如实上报");
+        assert_eq!(capped.len(), 2, "上限 2 只渲染前 2 页");
+        // 解除上限（None）：渲染全部 4 页——这正是命中回落时的行为
+        let (uncapped, total2) = rasterize_pdf_capped(&p, &no_cancel(), None).expect("应能栅格化");
+        assert_eq!(total2, 4);
+        assert_eq!(uncapped.len(), 4, "解除上限渲染全部页（超 20 页文档后部亦参与）");
+        // 按索引抽样：只渲染指定页，越界索引跳过
+        let sampled = rasterize_pages(&p, &[0, 3], &no_cancel()).expect("应能抽样渲染");
+        assert_eq!(sampled.len(), 2, "抽样 2 页");
+        let with_oob = rasterize_pages(&p, &[0, 99], &no_cancel()).expect("越界不 panic");
+        assert_eq!(with_oob.len(), 1, "越界索引跳过，仅渲染有效页");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cross_check_disabled_records_skipped_without_ocr() {
+        // pdf_cross_check=false：不跑渲染-OCR（零耗时、不联网），xcheck 记 skipped（非清白背书）。
+        // 走 pdfium 或 pdf-extract 任一文字层路径都应命中此分支（sample.pdf 是正常文字版）。
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
+        if !fixture.exists() {
+            return;
+        }
+        let m = crate::engine::ocr::resolve("v6-small");
+        let pb = parse_file_blocks_opt(&fixture, &no_cancel(), false, m, false).expect("应能解析");
+        assert!(matches!(pb.method, "pdfium" | "pdf-extract"), "文字版应走文字层路径，实际 {}", pb.method);
+        let xr = pb.xcheck.expect("关闭时也应记 xcheck（skipped）");
+        assert!(xr.skipped.is_some(), "关闭应记 skipped 原因");
+        assert!(!xr.is_hit(), "关闭不产生命中");
+        assert!(pb.method != "ocr-fallback", "关闭不回落");
+    }
+
+    #[test]
+    #[ignore] // 需 pdfium + OCR 模型：`cargo test cross_check -- --ignored`
+    fn cross_check_normal_pdf_does_not_fallback() {
+        // 验收 3：正常文字版 sample.pdf 开启交叉验证 → 中位失配低、不回落。
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
+        if !fixture.exists() {
+            return;
+        }
+        let m = crate::engine::ocr::resolve("v6-small");
+        let pb = parse_file_blocks_opt(&fixture, &no_cancel(), false, m, true).expect("应能解析");
+        assert_ne!(pb.method, "ocr-fallback", "正常文档不应回落 OCR");
+        let xr = pb.xcheck.expect("开启应有 xcheck 结果");
+        if xr.skipped.is_none() {
+            assert!(xr.verdict.is_none(), "正常文档不命中，实际 {:?}", xr.verdict);
+            assert!(xr.median_mismatch < 0.35, "中位失配应 <0.35，实际 {}", xr.median_mismatch);
+        }
+    }
+
+    #[test]
+    #[ignore] // 需 pdfium + OCR 模型：`cargo test cross_check -- --ignored`
+    fn cross_check_imaged_text_with_garbage_layer_falls_back() {
+        // 验收 1：图片化正文（渲染=真实文字图）+ 垃圾隐藏文字层 → 抽取得垃圾、OCR 读真文字 →
+        // 中位失配 >0.35 → method=ocr-fallback、verdict 就位、evasion 提示写入。
+        // 构造：把 sample.pdf 首页栅格成整页图贴进新 PDF，另加一层 Tr=3 隐藏垃圾文本。
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
+        if !fixture.exists() {
+            return;
+        }
+        let Some(pdfium) = bind_pdfium() else { return };
+        let (imgs, _) = match rasterize_pdf_capped(&fixture, &no_cancel(), Some(1)) {
+            Some(v) if !v.0.is_empty() => v,
+            _ => return,
+        };
+        let dynimg = image::DynamicImage::ImageRgb8(imgs.into_iter().next().unwrap());
+        let dir = std::env::temp_dir().join(format!("bg_xchk_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = {
+            let mut doc = pdfium.create_new_pdf().unwrap();
+            {
+                let mut page =
+                    doc.pages_mut().create_page_at_index(PdfPagePaperSize::a4(), 0).unwrap();
+                let (pw, ph) = (page.width(), page.height());
+                page.objects_mut()
+                    .create_image_object(PdfPoints::new(0.0), PdfPoints::new(0.0), &dynimg, Some(pw), Some(ph))
+                    .unwrap();
+            }
+            doc.save_to_bytes().unwrap()
+        };
+        drop(pdfium);
+        // 注入 Tr=3 垃圾文字层（lopdf 追加内容流）：pdfium 抽取会读到垃圾串
+        let garbage = "Xq7zKp9wRt2vBn4mLl8aQs3dWf6gHj0cZx5yVb1nMk7lOp4iUr2eYt9wAc6s".repeat(20);
+        let p = dir.join("imaged.pdf");
+        std::fs::write(&p, bytes).unwrap();
+        inject_hidden_text(&p, &garbage);
+
+        let m = crate::engine::ocr::resolve("v6-small");
+        let pb = parse_file_blocks_opt(&p, &no_cancel(), false, m, true).expect("应能解析");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pb.method, "ocr-fallback", "应回落 OCR，实际 {}", pb.method);
+        let xr = pb.xcheck.expect("应有 xcheck");
+        assert!(xr.is_hit(), "应命中");
+        assert!(xr.median_mismatch > 0.35, "中位失配 {} 应 >0.35", xr.median_mismatch);
+        assert!(pb.truncation_notice.as_deref().unwrap_or("").contains("OCR"), "应有回落提示");
+    }
+
+    /// 测试辅助：用 lopdf 给单页 PDF 追加一段 Tr=3 隐藏文本内容流（模拟垃圾文字层）。
+    fn inject_hidden_text(path: &Path, text: &str) {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Object, Stream};
+        let mut doc = lopdf::Document::load(path).unwrap();
+        let pages: Vec<_> = doc.get_pages().into_iter().collect();
+        let (_, page_id) = pages[0];
+        // 需要一个字体资源；直接在内容里用未定义字体名，pdfium 抽取仍读 Tj 串
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 8.into()]),
+                Operation::new("Tr", vec![3.into()]),
+                Operation::new("Td", vec![72.into(), 700.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let cid = doc.add_object(Stream::new(lopdf::dictionary! {}, content.encode().unwrap()));
+        // 追加到页面 Contents（数组化）
+        if let Ok(page_dict) = doc.get_dictionary_mut(page_id) {
+            let existing = page_dict.get(b"Contents").ok().cloned();
+            let new_contents = match existing {
+                Some(Object::Array(mut a)) => {
+                    a.push(cid.into());
+                    Object::Array(a)
+                }
+                Some(other) => Object::Array(vec![other, cid.into()]),
+                None => Object::Array(vec![cid.into()]),
+            };
+            page_dict.set("Contents", new_contents);
+        }
+        doc.save(path).unwrap();
     }
 }

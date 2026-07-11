@@ -396,6 +396,7 @@ mod tests {
             char_count: 100,
             fingerprint: fp,
             parse_error: None,
+            evasion: None,
         }
     }
     fn rsid_doc(rsids: &[&str], root: Option<&str>) -> DocInfo {

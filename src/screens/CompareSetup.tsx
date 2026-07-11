@@ -23,6 +23,7 @@ import {
 import { useProgressStore } from "../stores/progressStore";
 import { docTag } from "../utils/docTag";
 import { isJobLive } from "../utils/jobStatus";
+import { isEvasionConfirmed } from "../utils/evasion";
 
 const ACCEPT = /\.(docx|pdf|txt|md|xlsx|xls)$/i;
 const MAX_PICK = 10;
@@ -654,6 +655,12 @@ function DocCard({
             {doc.parseMethod === "ocr" && (
               <Pill fg="#8a6d3b" bg="rgba(194,132,48,0.14)" size={10}>
                 OCR
+              </Pill>
+            )}
+            {/* 规避特征徽标（§1.5：仅 confirmed 打徽标；suspect 不在此显示）。 */}
+            {isEvasionConfirmed(doc.evasionSummary) && (
+              <Pill fg={C.danger} bg={C.dangerSoft} size={10}>
+                规避特征
               </Pill>
             )}
           </>

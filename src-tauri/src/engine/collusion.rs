@@ -1,7 +1,7 @@
 // 围标综合判定：把文本相似度、跨文档雷同条款、元数据同源、共有特征词、
 // 报价梯度（金额接近但条款雷同）、rsid 修订标识交集、PDF 血缘加权成一个结论。
 use crate::engine::fingerprint::{LineageHit, RsidHit, RSID_MIN_SHARED};
-use crate::engine::report::{Cluster, Collusion, CollusionSignal, DocInfo, SharedTerm};
+use crate::engine::report::{Cluster, Collusion, CollusionSignal, DocInfo, EvasionSummary, SharedTerm};
 use std::collections::HashSet;
 
 /// 文档天干代号（信号 detail 中指代具体文档对）。
@@ -133,6 +133,12 @@ const LEVEL_LOW: f32 = 0.1; // score > LEVEL_LOW → low
 /// 的产品边界。此处只封顶四类对 score 的合计贡献（各信号 detail 仍呈现原始权重供人工判断），
 /// 条件化 floor 规则本里程碑不启用（M4 招标豁免落地后再激活）。⚠️ 0.45 未经语料校准。
 const FORENSIC_CAP: f32 = 0.45;
+// 检测到疑似规避特征（M2 入口对抗层聚合）：独立信号，【在 FORENSIC_CAP 之外】——规避行为
+// 本身即极强串通证据（正常投标人不会做字体重映射/零宽注入/PDF 隐藏文字层），比文本相似度
+// 更难抵赖。连续特征 x = 任一文档 confirmed ? 1.0 : 仅 suspect ? 0.5 : 0；同类证据不叠加。
+// ⚠️ 0.25 未经校准；单信号不达 high 线(0.6) 是有意设计——单证据不定罪（§1.5）。
+const EVASION_WEIGHT: f32 = 0.25;
+const EVASION_SHOW_MAX: usize = 5; // detail 最多列出几份命中文档
 
 /// assess_with 的统一入参（执行方案 §1.2 裁决：签名只改这一次）。
 /// 后续里程碑将按「连续特征 x∈[0,1]」往此结构体追加字段组——M1 取证 forensic、
@@ -164,6 +170,10 @@ pub struct CollusionInputs<'a> {
     /// —— M1 取证：共同错误指纹（compare_service::shared_error_fingerprints 输出，
     /// kind="sharedErrors"、rarity 稀有度归一分、context 前后文；招标文件笔误豁免在检测侧完成）——
     pub shared_errors: &'a [SharedTerm],
+    /// —— M2 规避：各参评文档的规避特征摘要（compare_service 从 evasion_json 判级后传入，
+    /// 与 docs 同序、同下标；元素 None = 该文档无 evasion_json/无发现）。独立信号在 FORENSIC_CAP
+    /// 之外，见 EVASION_WEIGHT。空切片 = 无规避数据（旧任务/全清白）——
+    pub evasion: &'a [Option<EvasionSummary>],
 }
 
 pub fn assess_with(inputs: CollusionInputs) -> Collusion {
@@ -177,6 +187,7 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         lineage_hits,
         image_hits,
         shared_errors,
+        evasion,
     } = inputs;
     let mut signals = Vec::new();
     let mut score = 0.0f32;
@@ -427,6 +438,40 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         });
     }
 
+    // 10) 检测到疑似规避特征（M2 入口对抗层）：独立信号，【在 FORENSIC_CAP 之外】直接并入
+    //     score。连续特征 x = 任一文档 confirmed ? 1.0 : 仅 suspect ? 0.5 : 0（同类证据不叠加）。
+    //     §1.5：命中是线索级结论——detail 措辞「检测到疑似规避特征，请人工复核」，绝不下
+    //     「规避/串通」定性；单信号权重不达 high 线是有意设计（单证据不定罪）。
+    let any_confirmed = evasion.iter().flatten().any(EvasionSummary::is_confirmed);
+    let any_suspect = evasion.iter().flatten().any(EvasionSummary::is_suspect);
+    if any_confirmed || any_suspect {
+        let x = if any_confirmed { 1.0 } else { 0.5 };
+        // 天干标签列出命中文档 + 各自证据种类（与 docs 同下标）
+        let shown: Vec<String> = evasion
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let e = e.as_ref()?;
+                if !e.is_flagged() {
+                    return None;
+                }
+                Some(format!("「{}」{}", stem(i), e.evidence_kinds().join("/")))
+            })
+            .take(EVASION_SHOW_MAX)
+            .collect();
+        let w = EVASION_WEIGHT * x;
+        score += w;
+        signals.push(CollusionSignal {
+            kind: "evasion".into(),
+            detail: format!(
+                "检测到疑似规避特征，请人工复核：{}。规避特征（零宽注入/同形字/字体重映射/\
+                 PDF 隐藏文字层）可被清除，未命中不代表清白，请结合原文人工判断",
+                shown.join("；")
+            ),
+            weight: w,
+        });
+    }
+
     // 取证四类合计封顶后并入总分（防叠满直接 high；各信号 detail 权重不受此影响）
     score += forensic.min(FORENSIC_CAP);
     let score = score.clamp(0.0, 1.0);
@@ -449,7 +494,7 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::report::Fingerprint;
+    use crate::engine::report::{Fingerprint, SEVERITY_CONFIRMED, SEVERITY_NONE, SEVERITY_SUSPECT};
 
     fn cluster(docs: Vec<usize>) -> Cluster {
         Cluster { avg_score: 0.9, peak: 0.9, docs, segments: vec![] }
@@ -466,6 +511,17 @@ mod tests {
                 ..Default::default()
             },
             parse_error: None,
+            evasion: None,
+        }
+    }
+    /// 造一个指定严重级 + 证据种类的 EvasionSummary（severity 直接设定，绕过判级——
+    /// 本模块只消费 severity/evidence_kinds，判级逻辑由 report::EvasionSummary 单测覆盖）。
+    fn ev(severity: &str) -> EvasionSummary {
+        EvasionSummary {
+            zero_width: 12,
+            confusable_folds: 1,
+            severity: severity.into(),
+            ..Default::default()
         }
     }
     fn weight_of(c: &Collusion, kind: &str) -> Option<f32> {
@@ -910,5 +966,89 @@ mod tests {
         let two = vec![doc(vec!["作者相同"]), doc(vec!["作者相同"])];
         let c = assess_with(CollusionInputs { peak: 1.0, docs: &two, ..Default::default() });
         assert_eq!(c.level, "high", "非取证信号不封顶，实际 {:.2}", c.score);
+    }
+
+    // —— M2 规避：evasion 信号（x = confirmed?1.0 : suspect?0.5，权重 EVASION_WEIGHT）——
+
+    #[test]
+    fn evasion_confirmed_takes_full_weight() {
+        // 任一文档 confirmed → x=1.0 → weight = 0.25
+        let ev_docs = [None, Some(ev(SEVERITY_CONFIRMED)), Some(ev(SEVERITY_SUSPECT))];
+        let c = assess_with(CollusionInputs { evasion: &ev_docs, ..Default::default() });
+        let w = weight_of(&c, "evasion").expect("应有 evasion 信号");
+        assert!((w - EVASION_WEIGHT).abs() < 1e-6, "confirmed → 满权重 0.25，实际 {w}");
+    }
+
+    #[test]
+    fn evasion_suspect_only_takes_half_weight() {
+        // 仅 suspect（无 confirmed）→ x=0.5 → weight = 0.125
+        let ev_docs = [None, Some(ev(SEVERITY_SUSPECT))];
+        let c = assess_with(CollusionInputs { evasion: &ev_docs, ..Default::default() });
+        let w = weight_of(&c, "evasion").expect("应有 evasion 信号");
+        assert!((w - EVASION_WEIGHT * 0.5).abs() < 1e-6, "仅 suspect → 半权重 0.125，实际 {w}");
+    }
+
+    #[test]
+    fn evasion_none_yields_no_signal() {
+        // 无 evasion 数据 / 均 severity none → 无信号
+        let empty: [Option<EvasionSummary>; 0] = [];
+        let c = assess_with(CollusionInputs { evasion: &empty, ..Default::default() });
+        assert!(weight_of(&c, "evasion").is_none());
+        let none_docs = [Some(ev(SEVERITY_NONE)), None];
+        let c2 = assess_with(CollusionInputs { evasion: &none_docs, ..Default::default() });
+        assert!(weight_of(&c2, "evasion").is_none(), "均未过判级线不产生信号");
+        assert_eq!(c2.level, "none");
+    }
+
+    #[test]
+    fn evasion_detail_carries_stems_evidence_and_disclaimer() {
+        // detail 含天干标签 + 证据种类 + §1.5 线索级措辞 + 免责，且不含背书式表述
+        let ev_docs = [Some(ev(SEVERITY_CONFIRMED)), None, Some(ev(SEVERITY_SUSPECT))];
+        let c = assess_with(CollusionInputs { evasion: &ev_docs, ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "evasion").expect("应有 evasion 信号");
+        assert!(s.detail.contains("甲") && s.detail.contains("丙"), "detail 应含命中文档天干：{}", s.detail);
+        assert!(!s.detail.contains("乙"), "未命中文档不列出：{}", s.detail);
+        assert!(s.detail.contains("隐形码点") && s.detail.contains("同形字"), "detail 应含证据种类：{}", s.detail);
+        assert!(s.detail.contains("检测到疑似规避特征，请人工复核"), "应含线索级措辞：{}", s.detail);
+        assert!(s.detail.contains("未命中不代表清白"));
+        assert!(!s.detail.contains("检查通过") && !s.detail.contains("清白证明"), "不得输出背书式结论");
+    }
+
+    #[test]
+    fn evasion_is_outside_forensic_cap() {
+        // evasion 在 FORENSIC_CAP 之外：取证四类叠满(封顶 0.45) + evasion confirmed(0.25) = 0.70。
+        // 若 evasion 被错误并入取证封顶，则四类+evasion 仍封顶 0.45，score 只有 0.45。
+        let rsid = [rsid_hit(0, true)];
+        let lineage = [lineage_hit(true, &[])];
+        let images = [
+            ImageHit { a: 0, b: 1, page_a: None, page_b: None, exact: true },
+            ImageHit { a: 0, b: 2, page_a: None, page_b: None, exact: true },
+            ImageHit { a: 1, b: 2, page_a: None, page_b: None, exact: true },
+        ];
+        let errs: Vec<SharedTerm> = (0..5).map(|i| shared_error(&format!("错{i}"), 1.0, None)).collect();
+        let ev_docs = [Some(ev(SEVERITY_CONFIRMED))];
+        let c = assess_with(CollusionInputs {
+            rsid_hits: &rsid,
+            lineage_hits: &lineage,
+            image_hits: &images,
+            shared_errors: &errs,
+            evasion: &ev_docs,
+            ..Default::default()
+        });
+        assert!(
+            (c.score - (FORENSIC_CAP + EVASION_WEIGHT)).abs() < 1e-6,
+            "取证封顶 0.45 + evasion 0.25 = 0.70（evasion 不受封顶），实际 {}",
+            c.score
+        );
+        assert_eq!(c.level, "high", "0.70 ≥ LEVEL_HIGH");
+    }
+
+    #[test]
+    fn evasion_single_signal_alone_does_not_reach_high() {
+        // 单一 evasion 信号（即便 confirmed，0.25）不达 high 线是有意设计（单证据不定罪）
+        let ev_docs = [Some(ev(SEVERITY_CONFIRMED))];
+        let c = assess_with(CollusionInputs { evasion: &ev_docs, ..Default::default() });
+        assert_eq!(c.level, "low", "0.25 < LEVEL_MEDIUM(0.35)，落 low");
+        assert!(c.score < LEVEL_HIGH);
     }
 }

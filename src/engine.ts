@@ -47,7 +47,9 @@ export interface DiffOp {
 }
 
 export interface CollusionSignal {
-  kind: string; // similarity | cluster | metadata | sharedTerms | facts
+  // similarity | cluster | metadata | sharedTerms | facts
+  // | rsid | pdfLineage | imageReuse | sharedErrors（M1 取证）| evasion（M2 规避）
+  kind: string;
   detail: string;
   weight: number;
 }

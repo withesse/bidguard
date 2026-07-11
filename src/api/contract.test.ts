@@ -24,6 +24,7 @@ const documentSample = {
   createdAt: "2026-07-02T00:00:00.000Z",
   updatedAt: "2026-07-02T00:00:00.000Z",
   truncationNotice: null,
+  evasionSummary: null,
   docRole: "bid",
 } satisfies DocumentDto;
 
@@ -63,11 +64,11 @@ const terminalSample = {
 } satisfies TerminalEvent;
 
 describe("IPC DTO 契约（camelCase 镜像）", () => {
-  it("DocumentDto 关键字段齐备（含 truncationNotice / docRole）", () => {
+  it("DocumentDto 关键字段齐备（含 truncationNotice / evasionSummary / docRole）", () => {
     expect(Object.keys(documentSample)).toEqual(
       expect.arrayContaining([
         "id", "workspaceId", "fileName", "status", "parseError",
-        "chunkCount", "truncationNotice", "docRole",
+        "chunkCount", "truncationNotice", "evasionSummary", "docRole",
       ]),
     );
   });

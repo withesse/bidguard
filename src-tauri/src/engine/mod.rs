@@ -17,6 +17,8 @@ pub mod matrix;
 pub mod normalize;
 pub mod ocr;
 pub mod parse;
+pub mod pdf_audit;
+pub mod pdf_xcheck;
 pub mod report;
 pub mod scoring;
 pub mod segment;

@@ -7,7 +7,7 @@ use crate::db::repo::{chunk_repo, document_repo, embedding_repo, image_repo, job
 use crate::db::repo::document_repo::DocumentRow;
 use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
-use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, Fingerprint, SectionStat, SharedTerm};
+use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
 use crate::engine::{candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring};
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
@@ -309,6 +309,9 @@ fn run_inner(
                 .and_then(|s| serde_json::from_str::<Fingerprint>(s).ok())
                 .unwrap_or_default(),
             parse_error: None,
+            // M2 规避：从 documents.evasion_json 判级出的规避特征摘要（清白文档 evasion_json
+            // 为 NULL → None，不做「检查通过」背书）
+            evasion: d.evasion_json.as_deref().and_then(EvasionSummary::from_evasion_json),
         })
         .collect();
     fingerprint::cross_flags(&mut doc_infos);
@@ -362,6 +365,8 @@ fn run_inner(
     let r_shared: Vec<SharedTerm> = shared.clone();
     // 报价梯度信号：金额接近但不同 + 多处条款雷同（典型陪标价特征）
     let price_pairs = price_proximity(&comparable, docs.len(), &raw);
+    // M2 规避：各文档规避特征摘要（与 doc_infos/docs 同序），独立信号在 FORENSIC_CAP 之外
+    let evasion: Vec<Option<EvasionSummary>> = doc_infos.iter().map(|d| d.evasion.clone()).collect();
     let collusion = collusion::assess_with(collusion::CollusionInputs {
         peak,
         clusters: &r_clusters,
@@ -372,6 +377,7 @@ fn run_inner(
         lineage_hits: &lineage_hits,
         image_hits: &image_hits,
         shared_errors: &shared_errors,
+        evasion: &evasion,
     });
 
     let mut summary = CompareSummary {
@@ -2165,6 +2171,66 @@ mod tests {
         assert!(
             shared_error_fingerprints(&jieba, &flat, None).iter().all(|t| t.term != "第9章"),
             "无标题树的文档应降级跳过引用错误检测"
+        );
+    }
+
+    /// M2 W2-5 端到端：导入带零宽注入的标书 → collusion_json.signals 含 kind=evasion，
+    /// detail 含天干标签 + 证据种类 + §1.5 线索级措辞；清白工作区不产生该信号（前端容错）。
+    #[test]
+    fn evasion_signal_flows_into_collusion_json_end_to_end() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        // 甲：一段内注入 18 个零宽字符（隐形码点 ≥10 且浓度高 → suspect，x=0.5）
+        let evasive = "本项目\u{200B}采用\u{200B}分层\u{200B}解耦\u{200B}的\u{200B}微服务\u{200B}\
+             总体\u{200B}架构\u{200B}设计\u{200B}方案\u{200B}，\u{200B}支持\u{200B}横向\u{200B}\
+             扩展\u{200B}与\u{200B}读写\u{200B}分离\u{200B}机制。"
+            .to_string();
+        let clean = "我公司具备信息系统集成一级资质，注册资本一亿元，近三年无重大违法记录。".to_string();
+        let (job_id, _ids) =
+            import_and_compare(&pool, &ws, &[("evasive.txt", evasive), ("clean.txt", clean)], 0.5);
+        let collusion: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        let ev = collusion
+            .signals
+            .iter()
+            .find(|s| s.kind == "evasion")
+            .expect("应含 evasion 信号");
+        // 零宽注入 → suspect → 半权重 0.125（EVASION_WEIGHT 0.25 × 0.5）
+        assert!((ev.weight - 0.125).abs() < 1e-6, "零宽 suspect → 0.125，实际 {}", ev.weight);
+        assert!(ev.detail.contains("检测到疑似规避特征，请人工复核"), "§1.5 线索级措辞：{}", ev.detail);
+        assert!(ev.detail.contains('甲'), "detail 应含命中文档天干：{}", ev.detail);
+        assert!(ev.detail.contains("隐形码点"), "detail 应含证据种类：{}", ev.detail);
+        assert!(ev.detail.contains("未命中不代表清白"));
+        assert!(!ev.detail.contains("检查通过") && !ev.detail.contains("清白证明"), "不得输出背书式结论");
+
+        // 清白工作区：两份干净标书 → collusion_json 不含 evasion 信号（旧任务/前端遍历天然容错）
+        let ws2 = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "clean").unwrap().id
+        };
+        let (job2, _) = import_and_compare(
+            &pool,
+            &ws2,
+            &[
+                ("c1.txt", "系统采用事件驱动与消息队列实现子系统之间的异步协同与削峰填谷处理。".to_string()),
+                ("c2.txt", "平台提供统一身份认证与细粒度权限管控构成的整体安全基座与审计能力。".to_string()),
+            ],
+            0.5,
+        );
+        let collusion2: crate::engine::report::Collusion = {
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &job2).unwrap();
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
+        };
+        assert!(
+            collusion2.signals.iter().all(|s| s.kind != "evasion"),
+            "清白工作区不产生 evasion 信号（不做检查通过背书）"
         );
     }
 }

@@ -4,10 +4,13 @@ use crate::db::repo::{compare_repo, document_repo, job_repo};
 use crate::db::now_iso;
 use crate::engine::diff::graded_diff;
 use crate::engine::fact::FactConflict;
-use crate::engine::report::{Collusion, DocInfo, Fingerprint, PairDetail, SectionStat, SegMatch, SharedTerm};
+use crate::engine::report::{Collusion, DocInfo, EvasionSummary, Fingerprint, PairDetail, SectionStat, SegMatch, SharedTerm};
 use crate::engine::fingerprint;
 use crate::error::{AppError, AppErrorCode, AppResult};
-use crate::export::data::{ExportCluster, ExportData, ExportDoc, ExportMember};
+use crate::export::data::{
+    EvasionDoc, EvasionSection, ExportCluster, ExportData, ExportDoc, ExportMember, ForensicDoc,
+    ForensicHit, ForensicSection, MethodsAndLimitations,
+};
 use crate::export::{self};
 use crate::services::compare_service::CompareSummary;
 use jieba_rs::Jieba;
@@ -64,14 +67,15 @@ pub fn assemble(
                 .and_then(|s| serde_json::from_str::<Fingerprint>(s).ok())
                 .unwrap_or_default(),
             parse_error: None,
+            evasion: d.evasion_json.as_deref().and_then(EvasionSummary::from_evasion_json),
         });
         docs_meta.push((d.page_count.unwrap_or(0), d.char_count.unwrap_or(0), d.parse_method));
     }
     fingerprint::cross_flags(&mut doc_infos);
-    // 与报告页同一套风险标记口径：rsid 交集/PDF 血缘也要出现在导出的指纹表
-    // （命中对结构此处不消费，围标信号取自落库的 collusion_json）
-    let _ = fingerprint::rsid_pairs(&mut doc_infos, &Default::default());
-    let _ = fingerprint::lineage_pairs(&mut doc_infos);
+    // 与报告页同一套风险标记口径：rsid 交集/PDF 血缘既写进导出的指纹表，也充当「取证证据」节的
+    // 结构化逐对命中（围标分级仍取自落库 collusion_json；此处仅供导出逐对列示，不改判定）。
+    let rsid_hits = fingerprint::rsid_pairs(&mut doc_infos, &Default::default());
+    let lineage_hits = fingerprint::lineage_pairs(&mut doc_infos);
     let documents: Vec<ExportDoc> = doc_infos
         .iter()
         .zip(&docs_meta)
@@ -184,6 +188,12 @@ pub fn assemble(
         }
     }
 
+    // 附录 A 冻结节（M2 落地 HTML/JSON）：取证/规避从已装配的 doc_infos 与落库 collusion 派生；
+    // 「检查方法与局限」§1.5 常驻（无条件）。
+    let forensic = build_forensic(&doc_infos, &rsid_hits, &lineage_hits, &collusion);
+    let evasion = build_evasion(&doc_infos);
+    let methods_and_limitations = MethodsAndLimitations::standard();
+
     let mut data = ExportData {
         report_version: REPORT_VERSION,
         app_version: env!("CARGO_PKG_VERSION"),
@@ -201,6 +211,9 @@ pub fn assemble(
         sections,
         clusters,
         pairs,
+        forensic,
+        evasion,
+        methods_and_limitations,
     };
     apply_export_prefs(conn, &mut data, include_raw_text, include_config)?;
     Ok(data)
@@ -251,6 +264,112 @@ fn apply_export_prefs(
         }
     }
     Ok(())
+}
+
+/// 组装「取证证据」节：rsid/PDF 血缘用结构化逐对命中（含 hard/mid 分级与天干对），
+/// 内嵌图片同源/共同错误取自落库 collusion 信号明细（逐对结构未在导出侧重算，明细含天干对与
+/// 免责文案）。逐文档取证指纹（rsid 数/模板/血缘 GUID）无论是否有跨文档命中都列出。
+/// None = 无任何取证命中（§1.5：不渲染空「取证证据」表，避免沉默背书）。
+fn build_forensic(
+    doc_infos: &[DocInfo],
+    rsid_hits: &[fingerprint::RsidHit],
+    lineage_hits: &[fingerprint::LineageHit],
+    collusion: &Collusion,
+) -> Option<ForensicSection> {
+    let tag = crate::export::data_tag;
+    let mut hits: Vec<ForensicHit> = Vec::new();
+    for h in rsid_hits {
+        hits.push(ForensicHit {
+            kind: "rsid".into(),
+            doc_a: tag(h.a),
+            doc_b: tag(h.b),
+            level: if h.root_match { "hard" } else { "mid" }.into(),
+            detail: format!(
+                "共享 {} 个 rsid 修订标识{}",
+                h.shared_count,
+                if h.root_match { "，rsidRoot 相同（高度指示派生自同一母文件）" } else { "" }
+            ),
+        });
+    }
+    for h in lineage_hits {
+        hits.push(ForensicHit {
+            kind: "pdfLineage".into(),
+            doc_a: tag(h.a),
+            doc_b: tag(h.b),
+            level: if h.is_hard() { "hard" } else { "mid" }.into(),
+            detail: if h.is_hard() {
+                format!("{}（同一母文件）", h.hard_evidence.join("、"))
+            } else {
+                format!("共享字体子集标签「{}」（同一次生成环境）", h.shared_subset_tags.join("、"))
+            },
+        });
+    }
+    // 内嵌图片同源 / 共同错误：逐对结构未在导出侧重算，取落库信号 detail（已含天干对与免责纪律）。
+    for s in &collusion.signals {
+        let level = match s.kind.as_str() {
+            "imageReuse" => "mid",
+            "sharedErrors" => "weak",
+            _ => continue,
+        };
+        hits.push(ForensicHit {
+            kind: s.kind.clone(),
+            doc_a: String::new(),
+            doc_b: String::new(),
+            level: level.into(),
+            detail: s.detail.clone(),
+        });
+    }
+    if hits.is_empty() {
+        return None; // 无跨文档取证命中：不渲染空表（逐文档指纹留待「检查方法与局限」交代已执行项）
+    }
+    let per_document: Vec<ForensicDoc> = doc_infos
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let fp = &d.fingerprint;
+            ForensicDoc {
+                doc_id: d.id.clone(),
+                tag: tag(i),
+                rsid_count: fp.rsids.len(),
+                template_name: fp.template_name.clone(),
+                lineage: serde_json::json!({
+                    "documentId": fp.xmp_document_id,
+                    "idFirst": fp.pdf_id_first,
+                    "derivedFrom": fp.xmp_derived_from,
+                    "fontSubsetTags": fp.font_subset_tags,
+                }),
+            }
+        })
+        .collect();
+    Some(ForensicSection { hits, per_document })
+}
+
+/// 组装「规避特征」节：仅列出达判级线（suspect/confirmed）的文档；none（弱发现未过线）不进表
+/// （§1.5：不背书、不误报）。verdict 直接沿用 EvasionSummary 判级，counts 为其计数快照。
+/// None = 无任何达线规避发现。
+fn build_evasion(doc_infos: &[DocInfo]) -> Option<EvasionSection> {
+    let tag = crate::export::data_tag;
+    let per_document: Vec<EvasionDoc> = doc_infos
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| {
+            let e = d.evasion.as_ref()?;
+            if !e.is_flagged() {
+                return None;
+            }
+            Some(EvasionDoc {
+                doc_id: d.id.clone(),
+                tag: tag(i),
+                counts: serde_json::to_value(e).unwrap_or_default(),
+                verdict: e.severity.clone(),
+                evidence_kinds: e.evidence_kinds().iter().map(|s| s.to_string()).collect(),
+            })
+        })
+        .collect();
+    if per_document.is_empty() {
+        return None;
+    }
+    Some(EvasionSection { per_document })
 }
 
 // 端到端：导入 → 比对（开事实冲突）→ 六格式导出，逐一断言含八类统计与冲突信息。
@@ -390,6 +509,137 @@ mod tests {
                 .unwrap();
             assert!(xml.contains("总览统计") && xml.contains("事实冲突"), "docx 应含升级结构");
         }
+        // M2 附录 A：「检查方法与局限」§1.5 无条件常驻（验收：零命中仍在）；空表逻辑由下方
+        // 合成用例确定性断言（本 e2e 的 txt 语料是否触发 sharedErrors 取决于信号阈值，不在此断言）。
+        {
+            let html = std::fs::read_to_string(dir.join("report.html")).unwrap();
+            assert!(html.contains("检查方法与局限"), "HTML 应含常驻「检查方法与局限」章节");
+            assert!(html.contains("未命中不构成清白证明"), "HTML 应含清白免责声明");
+            let json = std::fs::read_to_string(dir.join("report.json")).unwrap();
+            assert!(json.contains("methodsAndLimitations"), "JSON 应含常驻 methodsAndLimitations 节");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 附录 A 三节 golden（HTML/JSON）：直接构造带取证/规避命中的 ExportData 喂给写器——
+    /// 与导入管线解耦、离线秒级，验证 forensic/evasion/methodsAndLimitations 三节的渲染与序列化。
+    #[test]
+    fn forensic_evasion_and_methods_sections_render_in_html_and_json() {
+        use crate::engine::report::Collusion;
+        let dir = std::env::temp_dir().join(format!("bg_forensic_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = |tag: &str, name: &str| ExportDoc {
+            tag: tag.into(),
+            name: name.into(),
+            file_type: "docx".into(),
+            pages: 10,
+            char_count: 5000,
+            parse_method: Some("docx".into()),
+            risk_flags: vec![],
+        };
+        let data = ExportData {
+            report_version: "2.0",
+            app_version: "test",
+            generated_at: "2026-07-11T00:00:00.000Z".into(),
+            workspace_id: "w1".into(),
+            job_id: "j1".into(),
+            job_name: Some("取证测试".into()),
+            documents: vec![doc("甲", "甲标.docx"), doc("乙", "乙标.docx")],
+            config: serde_json::json!({}),
+            summary: None,
+            matrix: vec![vec![1.0, 0.9], vec![0.9, 1.0]],
+            peak: 0.9,
+            collusion: Collusion::default(),
+            shared_terms: vec![],
+            sections: vec![],
+            clusters: vec![],
+            pairs: vec![],
+            forensic: Some(ForensicSection {
+                hits: vec![
+                    ForensicHit {
+                        kind: "rsid".into(),
+                        doc_a: "甲".into(),
+                        doc_b: "乙".into(),
+                        level: "hard".into(),
+                        detail: "共享 5 个 rsid 修订标识，rsidRoot 相同".into(),
+                    },
+                    ForensicHit {
+                        kind: "imageReuse".into(),
+                        doc_a: String::new(),
+                        doc_b: String::new(),
+                        level: "mid".into(),
+                        detail: "内嵌图片同源：「甲」第3页 ↔ 「乙」第5页".into(),
+                    },
+                ],
+                per_document: vec![
+                    ForensicDoc {
+                        doc_id: "d1".into(),
+                        tag: "甲".into(),
+                        rsid_count: 5,
+                        template_name: Some("投标模板.dotx".into()),
+                        lineage: serde_json::json!({ "documentId": "uuid:ABC", "fontSubsetTags": ["ABCDEF+SimSun"] }),
+                    },
+                    ForensicDoc {
+                        doc_id: "d2".into(),
+                        tag: "乙".into(),
+                        rsid_count: 5,
+                        template_name: None,
+                        lineage: serde_json::json!({}),
+                    },
+                ],
+            }),
+            evasion: Some(EvasionSection {
+                per_document: vec![EvasionDoc {
+                    doc_id: "d1".into(),
+                    tag: "甲".into(),
+                    counts: serde_json::json!({ "zeroWidth": 12 }),
+                    verdict: "confirmed".into(),
+                    evidence_kinds: vec!["隐形码点".into()],
+                }],
+            }),
+            methods_and_limitations: MethodsAndLimitations::standard(),
+        };
+
+        let hp = dir.join("f.html");
+        crate::export::write(&data, "html", hp.to_str().unwrap()).unwrap();
+        let html = std::fs::read_to_string(&hp).unwrap();
+        assert!(html.contains("取证证据"), "HTML 应含「取证证据」标题");
+        assert!(html.contains("规避特征复核"), "HTML 应含规避复核表");
+        assert!(html.contains("检查方法与局限"), "HTML 应含常驻方法与局限");
+        assert!(html.contains("投标模板.dotx"), "逐文档取证指纹应列出模板名");
+        assert!(html.contains("隐形码点"), "规避表应列出证据种类");
+        assert!(html.contains("未命中不构成清白证明"), "应含清白免责声明");
+
+        let jp = dir.join("f.json");
+        crate::export::write(&data, "json", jp.to_str().unwrap()).unwrap();
+        let json = std::fs::read_to_string(&jp).unwrap();
+        assert!(json.contains("\"forensic\""), "JSON 应含 forensic 节");
+        assert!(json.contains("\"rsidCount\": 5"), "forensic.perDocument 应含 rsidCount");
+        assert!(json.contains("\"evasion\""), "JSON 应含 evasion 节");
+        assert!(json.contains("\"verdict\": \"confirmed\""), "evasion 应含判级 confirmed");
+        assert!(json.contains("methodsAndLimitations"), "JSON 应含常驻 methodsAndLimitations");
+
+        // 空态（验收 4）：forensic/evasion 缺省 → 不渲染空表，但方法与局限仍常驻。
+        let empty = ExportData {
+            forensic: None,
+            evasion: None,
+            documents: vec![doc("甲", "甲标.docx"), doc("乙", "乙标.docx")],
+            job_name: Some("空态".into()),
+            ..data
+        };
+        let ehp = dir.join("empty.html");
+        crate::export::write(&empty, "html", ehp.to_str().unwrap()).unwrap();
+        let ehtml = std::fs::read_to_string(&ehp).unwrap();
+        assert!(!ehtml.contains("取证证据"), "无取证命中不渲染「取证证据」表");
+        assert!(!ehtml.contains("规避特征复核"), "无规避命中不渲染规避表");
+        assert!(ehtml.contains("检查方法与局限"), "方法与局限仍常驻");
+        let ejp = dir.join("empty.json");
+        crate::export::write(&empty, "json", ejp.to_str().unwrap()).unwrap();
+        let ejson = std::fs::read_to_string(&ejp).unwrap();
+        assert!(!ejson.contains("\"forensic\""), "空态 JSON 不含 forensic 节");
+        assert!(!ejson.contains("\"evasion\""), "空态 JSON 不含 evasion 节");
+        assert!(ejson.contains("methodsAndLimitations"), "空态 JSON 仍含 methodsAndLimitations");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

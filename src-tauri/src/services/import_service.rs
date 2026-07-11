@@ -71,17 +71,20 @@ impl ImportOptions {
     /// 时只把值 1→2，不再动版本前缀），旧缓存的分块/统计/指纹不可复用，必须整体失效重建；
     /// embedding 缓存按 normalized_hash 寻址，随之自然失效。
     pub fn options_hash(&self, templates_digest: &str) -> String {
-        self.options_hash_with_fpv(
+        self.options_hash_with_versions(
             templates_digest,
             crate::engine::report::FINGERPRINT_SCHEMA_VERSION,
+            crate::engine::pdf_audit::PDF_AUDIT_SCHEMA_VERSION,
         )
     }
 
-    /// fpv 单独入参：常量在单测里无法「变化」，参数化让「fpv 变则 hash 变」可直接断言。
-    /// 生产路径只经 options_hash 走 FINGERPRINT_SCHEMA_VERSION。
-    fn options_hash_with_fpv(&self, templates_digest: &str, fpv: u32) -> String {
+    /// fpv + pav 双版本入参：常量在单测里无法「变化」，参数化让「fpv/pav 变则 hash 变」可直接
+    /// 断言。fpv=取证指纹 schema 版本；pav=PDF 隐藏文字层审计 schema 版本——pdfAudit 是解析期
+    /// 新产出、cache-hit 旧文档不会有它，bump pav 让 options_hash 变化、旧缓存整体失效重建
+    /// （做法对齐 fpv，只改 VALUE 不动 v6 前缀）。生产路径经 options_hash 走两常量当前值。
+    fn options_hash_with_versions(&self, templates_digest: &str, fpv: u32, pav: u32) -> String {
         let s = format!(
-            "v6|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|xchk={}|fpv={}|lang={}|tpl={}",
+            "v6|min={}|case={}|punct={}|ws={}|tbl={}|page={}|hf={}|img={}|ocr={}|xchk={}|fpv={}|pav={}|lang={}|tpl={}",
             self.min_paragraph_chars,
             self.normalize.ignore_case,
             self.normalize.ignore_punctuation,
@@ -93,6 +96,7 @@ impl ImportOptions {
             self.ocr_model,
             self.pdf_cross_check,
             fpv,
+            pav,
             self.language,
             templates_digest,
         );
@@ -324,6 +328,7 @@ fn import_one(
         ctx.cancel_flag(),
         opts.ocr_docx_images,
         crate::engine::ocr::resolve(&opts.ocr_model),
+        opts.pdf_cross_check,
     );
     if ctx.cancelled() {
         // 解析被打断的半成品不保留（该行还没有任何分块）
@@ -355,7 +360,8 @@ fn import_one(
             let char_count = pb.legacy_text.chars().count();
             let fingerprint_json = serde_json::to_string(&pb.fingerprint)
                 .unwrap_or_else(|_| "{}".to_string());
-            let evasion_json = aggregate_evasion(&chunks);
+            let evasion_json =
+                aggregate_evasion(&chunks, pb.pdf_audit.as_ref(), pb.xcheck.as_ref());
             // 写入持锁串行（大文档事务可达数秒，不能与他文档并发写）
             let _w = ctx.write_lock();
             let mut conn = ctx.db.get()?;
@@ -381,23 +387,38 @@ fn import_one(
     }
 }
 
-/// 文档级规避统计聚合（写 documents.evasion_json）：各类计数 + 受影响块数 + 最大单块浓度。
-/// 只聚合段落级分块：三档粒度相互包含（sentence ⊂ paragraph ⊂ section），跨档求和会把
-/// 同一处扰动计三次；段落级覆盖全部正文/表格行/标题，且是前端下钻的定位单位
-/// （低于 min_chars 的碎段只进 section 累计文本，其扰动不计入文档级——这些文本
-/// 同样几乎不参与比对，可接受）。无任何发现返回 None（列保持 NULL，与老工作区行为一致）。
-fn aggregate_evasion(chunks: &[NewChunk]) -> Option<String> {
-    /// 文档级 evasion_json 结构：InvisibleStats 字段展平 + 分布口径。
+/// 文档级规避统计聚合（写 documents.evasion_json）：隐形码点各类计数、受影响块数、最大单块
+/// 浓度，以及 PDF 隐藏文字层审计（pdfAudit 子对象）。只聚合段落级分块：三档粒度相互包含
+/// （sentence ⊂ paragraph ⊂ section），跨档求和会把同一处扰动计三次；段落级覆盖全部正文、
+/// 表格行、标题，且是前端下钻的定位单位（低于 min_chars 的碎段只进 section 累计文本，其扰动
+/// 不计入文档级——这些文本同样几乎不参与比对，可接受）。
+///
+/// pdf_audit 是解析期正交产物（与分块无关）：仅在有注入嫌疑（hidden_chars>0）时并入
+/// pdfAudit 子对象——干净 PDF（含 OCR 双层页）不写，不做「检查通过/清白」背书（§1.5）。
+/// xcheck（W2-4 渲染-OCR 交叉验证）同理：仅在命中（有 verdict）时并入 xcheck 子对象——
+/// 未命中/跳过不写（跳过不代表清白）。无任何发现时返回 None（列保持 NULL，与老工作区一致）。
+fn aggregate_evasion(
+    chunks: &[NewChunk],
+    pdf_audit: Option<&crate::engine::pdf_audit::PdfHiddenStats>,
+    xcheck: Option<&crate::engine::pdf_xcheck::XCheckResult>,
+) -> Option<String> {
+    /// 文档级 evasion_json 结构：InvisibleStats 字段展平 + 分布口径 + PDF 隐藏层审计 + 交叉验证。
     /// 只做总数不做浓度分布证明力弱（执行方案风险条目），故必须落块级分布。
     #[derive(serde::Serialize)]
     #[serde(rename_all = "camelCase")]
-    struct DocEvasion {
+    struct DocEvasion<'a> {
         #[serde(flatten)]
         stats: crate::engine::normalize::InvisibleStats,
         /// 有任一发现的段落级分块数。
         affected_chunks: u32,
         /// 最大单块浓度：改写类命中数（剥离+折叠）/ 块字符数——扰动聚集度证据。
         max_chunk_concentration: f64,
+        /// PDF 隐藏文字层审计（仅有注入嫌疑时并入；干净 PDF/OCR 双层页/非 PDF 缺省）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pdf_audit: Option<&'a crate::engine::pdf_audit::PdfHiddenStats>,
+        /// 渲染-OCR 交叉验证（仅命中时并入；未命中/跳过缺省——不做清白背书）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        xcheck: Option<&'a crate::engine::pdf_xcheck::XCheckResult>,
     }
 
     // 文档级采样词多于块级上限，够呈现层列举即可
@@ -425,13 +446,19 @@ fn aggregate_evasion(chunks: &[NewChunk]) -> Option<String> {
             f64::from(e.perturbation_total()) / c.text.chars().count().max(1) as f64;
         max_concentration = max_concentration.max(conc);
     }
-    if affected == 0 {
+    // PDF 隐藏层：仅有注入嫌疑时纳入（OCR 双层页/干净 PDF 的 has_suspect()=false 不写）
+    let pdf_hit = pdf_audit.filter(|a| a.has_suspect());
+    // 交叉验证：仅命中时纳入（跳过/未命中的 is_hit()=false 不写，不做清白背书）
+    let xcheck_hit = xcheck.filter(|x| x.is_hit());
+    if affected == 0 && pdf_hit.is_none() && xcheck_hit.is_none() {
         return None;
     }
     serde_json::to_string(&DocEvasion {
         stats: agg,
         affected_chunks: affected,
         max_chunk_concentration: max_concentration,
+        pdf_audit: pdf_hit,
+        xcheck: xcheck_hit,
     })
     .ok()
 }
@@ -751,11 +778,38 @@ mod tests {
         // 旧缓存随之失效，不再动版本前缀——否则 persist_cached 会按同 hash 命中旧行、
         // 复制缺新字段的旧 fingerprint_json（执行方案全局裁决 3「只 bump 一次」）
         let o = ImportOptions::default();
-        assert_ne!(o.options_hash_with_fpv("t", 1), o.options_hash_with_fpv("t", 2), "fpv 变则 hash 变");
+        let pav = crate::engine::pdf_audit::PDF_AUDIT_SCHEMA_VERSION;
+        assert_ne!(
+            o.options_hash_with_versions("t", 1, pav),
+            o.options_hash_with_versions("t", 2, pav),
+            "fpv 变则 hash 变"
+        );
         assert_eq!(
             o.options_hash("t"),
-            o.options_hash_with_fpv("t", crate::engine::report::FINGERPRINT_SCHEMA_VERSION),
+            o.options_hash_with_versions("t", crate::engine::report::FINGERPRINT_SCHEMA_VERSION, pav),
             "生产路径经当前 schema 版本"
+        );
+    }
+
+    #[test]
+    fn options_hash_covers_pdf_audit_version() {
+        // pav 预置解析审计版本键：pdfAudit 是解析期新产出、cache-hit 旧文档不会有它，
+        // bump pav 让 options_hash 变化、旧缓存整体失效重建（做法对齐 fpv，不动 v6 前缀）
+        let o = ImportOptions::default();
+        let fpv = crate::engine::report::FINGERPRINT_SCHEMA_VERSION;
+        assert_ne!(
+            o.options_hash_with_versions("t", fpv, 1),
+            o.options_hash_with_versions("t", fpv, 2),
+            "pav 变则 hash 变"
+        );
+        assert_eq!(
+            o.options_hash("t"),
+            o.options_hash_with_versions(
+                "t",
+                fpv,
+                crate::engine::pdf_audit::PDF_AUDIT_SCHEMA_VERSION,
+            ),
+            "生产路径经当前审计 schema 版本"
         );
     }
 
@@ -858,6 +912,100 @@ mod tests {
             )
             .unwrap();
         assert!(copied >= 1, "块级 extra_json 随缓存复制");
+    }
+
+    /// 程序化构造含"可见 + Tr=3 隐藏文本"的单页 PDF（可被 pdfium 抽取可见文本，
+    /// 同时被 pdf_audit 判为注入嫌疑）。
+    fn write_hidden_pdf(dir: &Path, name: &str) -> String {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let content = b"\
+BT /F1 12 Tf 0 0 0 rg 1 0 0 1 72 720 Tm 0 Tr (Visible bid paragraph for evaluation.) Tj ET\n\
+BT /F1 12 Tf 1 0 0 1 72 700 Tm 3 Tr (injected hidden duplicate clause) Tj ET\n";
+        let content_id =
+            doc.add_object(Stream::new(dictionary! {}, content.to_vec()).with_compression(false));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let p = dir.join(name);
+        doc.save(&p).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn pdf_hidden_layer_audit_lands_in_evasion_json() {
+        // 集成验收（W2-3）：导入含隐藏文字层的 PDF → documents.evasion_json.pdfAudit 就位、
+        // hiddenChars>0；伪造损坏 PDF 导入不失败（audit=None 静默降级，不阻塞）。
+        // pdfium 不可用时解析可能走 OCR（需模型）——本环境自检不可用则跳过，避免门禁挂死。
+        if !parse::pdfium_available() {
+            eprintln!("跳过：pdfium 不可绑定，PDF 文本抽取不可用");
+            return;
+        }
+        let (pool, ws, dir) = setup();
+        let jieba = Arc::new(Jieba::new());
+        let hidden = write_hidden_pdf(&dir, "hidden.pdf");
+        // 伪造损坏 PDF：审计 None、解析失败 → 文档标失败但 job 不报错
+        let broken = write(&dir, "broken.pdf", "这不是 PDF，只是伪装扩展名。");
+        let (ctx, _) = ctx_for(&pool, &ws, false);
+        run_import(&ctx, jieba, &ws, &[hidden, broken], &Default::default(), "bid").unwrap();
+
+        let conn = pool.get().unwrap();
+        let docs = document_repo::list(&conn, &ws).unwrap();
+        let hit = docs.iter().find(|d| d.file_name == "hidden.pdf").expect("含隐藏层的文档应入库");
+        assert_eq!(hit.status, "parsed", "含隐藏层的 PDF 应解析成功");
+        let ev = hit.evasion_json.clone().expect("含隐藏层文档应有 evasion_json");
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        let audit = &v["pdfAudit"];
+        assert!(!audit.is_null(), "evasion_json.pdfAudit 就位");
+        assert!(audit["hiddenChars"].as_u64().unwrap() > 0, "hiddenChars>0");
+        assert!(audit["trInvisibleChars"].as_u64().unwrap() > 0, "Tr=3 计数");
+        assert!(audit["ocrLayerPages"].as_array().unwrap().is_empty(), "非 OCR 双层页");
+
+        let broken_doc = docs.iter().find(|d| d.file_name == "broken.pdf").expect("损坏文档应留痕");
+        assert_eq!(broken_doc.status, "failed", "损坏 PDF 标失败但不阻塞 job");
+    }
+
+    #[test]
+    fn xcheck_hit_merges_into_evasion_json_skipped_does_not() {
+        // W2-4：交叉验证命中 → 即使无隐形码点/无 PDF 隐藏层，也产出 evasion_json 且含 xcheck.verdict；
+        // 跳过/未命中不并入（不做清白背书），无其他发现时返回 None。
+        use crate::engine::pdf_xcheck::{XCheckResult, XCheckVerdict, KIND_FONT_REMAP};
+        let hit = XCheckResult {
+            sampled_pages: vec![1, 5, 9],
+            verdict: Some(XCheckVerdict {
+                kind: KIND_FONT_REMAP.into(),
+                label: "疑似字体重映射/图片化正文".into(),
+            }),
+            median_mismatch: 0.62,
+            ..Default::default()
+        };
+        let json = aggregate_evasion(&[], None, Some(&hit)).expect("命中应产出 evasion_json");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["xcheck"]["verdict"]["kind"], KIND_FONT_REMAP);
+        assert_eq!(v["xcheck"]["sampledPages"], serde_json::json!([1, 5, 9]));
+        assert!(v["pdfAudit"].is_null(), "无隐藏层不写 pdfAudit");
+
+        let skipped = XCheckResult::skipped("OCR 不可用（缺模型或识别失败）");
+        assert!(
+            aggregate_evasion(&[], None, Some(&skipped)).is_none(),
+            "跳过/未命中不写 evasion_json（不做清白背书）"
+        );
     }
 
     #[test]

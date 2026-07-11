@@ -27,6 +27,10 @@ pub struct DocumentRow {
     /// 文档级规避统计 JSON（W2 入口对抗层：隐形码点/同形字/混合脚本聚合）；
     /// 无发现或老版本导入的行为 None。呈现统一在 M2（evasion 围标信号）接入。
     pub evasion_json: Option<String>,
+    /// evasion_json 判级后的规避特征摘要（none/suspect/confirmed + 各类计数；无数据/旧行 None）。
+    /// §1.5：仅 confirmed 驱动 Library 文档卡徽标与 DocPreview 顶部告警条，suspect 不打徽标不挂
+    /// 告警条。判级逻辑集中在 engine::report::EvasionSummary，前端不重复阈值（camelCase evasionSummary）。
+    pub evasion_summary: Option<crate::engine::report::EvasionSummary>,
     /// 文档角色：'bid' 投标（默认）| 'tender' 招标文件 | 'tender_supplement' 补遗/答疑。
     /// 招标类文档不参与交叉比对（compare 入口校验），是 W3 对减/k-共现查证的语料来源。
     pub doc_role: String,
@@ -39,6 +43,12 @@ const SELECT: &str = "SELECT d.id, d.workspace_id, d.file_name, d.file_path, d.f
   d.created_at, d.updated_at, d.truncation_notice, d.evasion_json, d.doc_role FROM documents d";
 
 fn map_row(r: &rusqlite::Row) -> rusqlite::Result<DocumentRow> {
+    // evasion_summary 从 evasion_json 判级派生（§1.5 判级单一来源在 engine::report）；
+    // 计数是小对象、解析在读路径上可忽略，前端徽标/告警条直接消费判级结果。
+    let evasion_json: Option<String> = r.get(16)?;
+    let evasion_summary = evasion_json
+        .as_deref()
+        .and_then(crate::engine::report::EvasionSummary::from_evasion_json);
     Ok(DocumentRow {
         id: r.get(0)?,
         workspace_id: r.get(1)?,
@@ -56,7 +66,8 @@ fn map_row(r: &rusqlite::Row) -> rusqlite::Result<DocumentRow> {
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
         truncation_notice: r.get(15)?,
-        evasion_json: r.get(16)?,
+        evasion_json,
+        evasion_summary,
         doc_role: r.get(17)?,
     })
 }

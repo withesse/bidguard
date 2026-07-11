@@ -47,6 +47,7 @@ const BUILTIN_PARSER = {
   detectTable: true,
   ocrDocxImages: true,
   ocrModel: "v6-small",
+  pdfCrossCheck: true,
 };
 
 /** 与后端 config::SecurityDefaults 内置值一致的前端镜像。 */
@@ -325,6 +326,17 @@ export function Settings() {
               <Toggle
                 on={parser.ocrDocxImages as boolean}
                 onChange={() => changeParser({ ocrDocxImages: !parser.ocrDocxImages })}
+              />
+            </Row>
+            <Row
+              label="PDF 渲染交叉验证"
+              sub="抽样页渲染成图再 OCR，比对文字层是否被字体重映射/图片化正文篡改；命中改用 OCR 文本。每份文字版 PDF 约 +5–10 秒"
+              ink={ink}
+              mute={mute}
+            >
+              <Toggle
+                on={parser.pdfCrossCheck as boolean}
+                onChange={() => changeParser({ pdfCrossCheck: !parser.pdfCrossCheck })}
               />
             </Row>
             {(appInfo?.ocrModels ?? []).length > 0 && (

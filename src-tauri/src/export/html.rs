@@ -209,6 +209,73 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         h.push_str("</p>");
     }
 
+    // 取证证据（附录 A forensic 节；无命中不渲染——§1.5 不留空表沉默背书）
+    if let Some(f) = &data.forensic {
+        h.push_str("<h2>取证证据</h2>");
+        h.push_str("<p class=\"muted\">取证信号为线索级同源证据（rsid / PDF 血缘 / 图片同源 / 共同错误）。请核对是否源自招标方统一模板或同一代理机构；未命中不构成清白证明（另存为 / 元数据清洗可消除痕迹）。</p>");
+        h.push_str("<table><tr><th>类型</th><th>文档</th><th>强度</th><th>说明</th></tr>");
+        for hit in &f.hits {
+            let pair = if hit.doc_a.is_empty() && hit.doc_b.is_empty() {
+                "见说明".to_string()
+            } else {
+                format!("{} ↔ {}", e(&hit.doc_a), e(&hit.doc_b))
+            };
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td style=\"text-align:left\">{}</td></tr>",
+                forensic_kind_cn(&hit.kind),
+                pair,
+                forensic_level_cn(&hit.level),
+                e(&hit.detail)
+            );
+        }
+        h.push_str("</table>");
+        h.push_str("<p style=\"margin-top:14px\"><b>逐文档取证指纹</b></p>");
+        h.push_str("<table><tr><th>编号</th><th>rsid 数</th><th>模板</th><th>血缘键</th></tr>");
+        for d in &f.per_document {
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td style=\"text-align:left\">{}</td><td style=\"text-align:left\">{}</td></tr>",
+                d.tag,
+                d.rsid_count,
+                e(d.template_name.as_deref().unwrap_or("—")),
+                e(&lineage_summary(&d.lineage))
+            );
+        }
+        h.push_str("</table>");
+    }
+
+    // 规避特征复核（附录 A evasion 节；仅列达判级线文档，无则不渲染）
+    if let Some(ev) = &data.evasion {
+        h.push_str("<h2>规避特征复核</h2>");
+        h.push_str("<p class=\"muted\">检测到疑似规避特征，请人工复核；本工具不作「规避 / 串通」定性结论。未命中不构成清白证明。</p>");
+        h.push_str("<table><tr><th>编号</th><th>判级</th><th>证据种类</th></tr>");
+        for d in &ev.per_document {
+            let kinds = if d.evidence_kinds.is_empty() { "—".to_string() } else { d.evidence_kinds.join("、") };
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td style=\"text-align:left\">{}</td></tr>",
+                d.tag,
+                evasion_verdict_cn(&d.verdict),
+                e(&kinds)
+            );
+        }
+        h.push_str("</table>");
+    }
+
+    // 检查方法与局限（附录 A methodsAndLimitations：§1.5 无条件常驻，堵沉默背书）
+    let ml = &data.methods_and_limitations;
+    h.push_str("<h2>检查方法与局限</h2>");
+    h.push_str("<p><b>本次已执行的取证 / 对抗检查项：</b></p><ul>");
+    for c in &ml.checks_run {
+        let _ = write!(h, "<li>{}</li>", e(c));
+    }
+    h.push_str("</ul><p><b>局限与声明：</b></p><ul>");
+    for d in &ml.disclaimers {
+        let _ = write!(h, "<li>{}</li>", e(d));
+    }
+    h.push_str("</ul>");
+
     // 附录
     h.push_str("<h2>附录：比对配置与版本</h2>");
     let _ = write!(
@@ -223,4 +290,62 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     );
     h.push_str("</body></html>");
     std::fs::write(path, h).map_err(|e| e.to_string())
+}
+
+/// 取证命中类型中文标签（forensic.hits[].kind）。
+fn forensic_kind_cn(kind: &str) -> &str {
+    match kind {
+        "rsid" => "docx 修订标识（rsid）",
+        "pdfLineage" => "PDF 血缘",
+        "imageReuse" => "内嵌图片同源",
+        "sharedErrors" => "共同错误指纹",
+        other => other,
+    }
+}
+
+/// 取证命中强度中文标签（forensic.hits[].level）。
+fn forensic_level_cn(level: &str) -> &str {
+    match level {
+        "hard" => "硬命中",
+        "mid" => "中命中",
+        "weak" => "弱命中",
+        other => other,
+    }
+}
+
+/// 规避判级中文标签（evasion.perDocument[].verdict）——§1.5：措辞不下定性结论。
+fn evasion_verdict_cn(verdict: &str) -> &str {
+    match verdict {
+        "confirmed" => "需人工复核",
+        "suspect" => "疑似（弱信号）",
+        other => other,
+    }
+}
+
+/// 逐文档血缘键摘要（forensic.perDocument[].lineage → 单行可读串）。
+fn lineage_summary(lineage: &serde_json::Value) -> String {
+    let get = |k: &str| lineage.get(k).and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = get("documentId") {
+        parts.push(format!("GUID {v}"));
+    }
+    if let Some(v) = get("idFirst") {
+        parts.push(format!("trailer ID {v}"));
+    }
+    if let Some(v) = get("derivedFrom") {
+        parts.push(format!("派生自 {v}"));
+    }
+    let tags = lineage
+        .get("fontSubsetTags")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if tags > 0 {
+        parts.push(format!("字体子集 {tags} 个"));
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join("；")
+    }
 }

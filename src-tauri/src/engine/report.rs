@@ -78,6 +78,175 @@ pub struct DocInfo {
     pub char_count: usize,
     pub fingerprint: Fingerprint,
     pub parse_error: Option<String>, // 该份解析失败时的原因（不影响整体）
+    /// M2 入口对抗层：从 documents.evasion_json 判级后的规避特征摘要（None = 无发现/旧任务）。
+    /// serde(default)：旧比对任务的 DocInfo（无此字段）反序列化天然兼容（取 None）。
+    #[serde(default)]
+    pub evasion: Option<EvasionSummary>,
+}
+
+/// 规避特征严重级（§1.5：机器不下「规避/串通」定性，severity 仅驱动呈现权重与围标信号强度）。
+pub const SEVERITY_NONE: &str = "none";
+pub const SEVERITY_SUSPECT: &str = "suspect";
+pub const SEVERITY_CONFIRMED: &str = "confirmed";
+
+// —— 规避判级线（集中于此，沿用 collusion 权重的「⚠️ 未经校准」惯例）——
+// ⚠️ 未经语料校准（等 scheme §9.3 合成对抗语料回测）：以下均为基于攻击面的经验初值。
+/// confirmed：PDF 隐藏文字层占比达此值即强证据（成规模的隐藏正文注入）。
+const CONFIRMED_HIDDEN_RATIO: f64 = 0.05;
+/// confirmed：同词混合脚本红旗词达此数即强证据（跨脚本同形替换是刻意行为，非误触）。
+const CONFIRMED_MIXED_SCRIPT: u32 = 3;
+/// suspect：隐形码点（零宽/双向/Tags/变体）总数达此值方计弱证据。
+const SUSPECT_INVISIBLE_MIN: u32 = 10;
+/// suspect 聚集度过滤：最大单块改写浓度达此值即视为聚集扰动（防复制粘贴零宽残留误判）。
+const SUSPECT_CONCENTRATION_MIN: f64 = 0.02;
+/// suspect 聚集度过滤：受影响段块数达此值即视为系统性扰动而非单处零星残留。
+const SUSPECT_AFFECTED_MIN: u32 = 2;
+
+/// 文档级规避特征摘要：比对期从 documents.evasion_json（W2 入口对抗层落库的冻结通道）解析、
+/// 判级后挂到 DocInfo，供 evasion 围标信号与前端呈现消费。§1.5 产品纪律：severity 只驱动呈现
+/// 权重，措辞统一「检测到疑似规避特征，请人工复核」，机器不下「规避/串通/清白」结论。
+/// 全字段 serde(default)：旧 evasion_json 缺 pdfAudit/xcheck 子对象时反序列化取零值兜底。
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvasionSummary {
+    /// 零宽字符数（U+200B–200F/FEFF）。
+    #[serde(default)]
+    pub zero_width: u32,
+    /// 双向控制符数。
+    #[serde(default)]
+    pub bidi: u32,
+    /// Tags 隐写块字符数。
+    #[serde(default)]
+    pub tags: u32,
+    /// 变体选择符数。
+    #[serde(default)]
+    pub variation: u32,
+    /// 跨脚本同形字折叠命中数。
+    #[serde(default)]
+    pub confusable_folds: u32,
+    /// 同词内混合脚本红旗数。
+    #[serde(default)]
+    pub mixed_script_words: u32,
+    /// 有任一发现的段落级分块数（聚集度判据）。
+    #[serde(default)]
+    pub affected_chunks: u32,
+    /// 最大单块改写浓度（聚集度判据）。
+    #[serde(default)]
+    pub max_chunk_concentration: f64,
+    /// PDF 隐藏文字层占比（无 pdfAudit 时 0）。
+    #[serde(default)]
+    pub pdf_hidden_ratio: f64,
+    /// PDF 隐藏字符数（无 pdfAudit 时 0）。
+    #[serde(default)]
+    pub pdf_hidden_chars: u64,
+    /// 渲染-OCR 交叉验证命中种类（fontRemap/coordShuffle 机器标识；None = 未命中/未做）。
+    #[serde(default)]
+    pub xcheck_kind: Option<String>,
+    /// 渲染-OCR 交叉验证命中中文标签（呈现用；None = 未命中/未做，不做清白背书）。
+    #[serde(default)]
+    pub xcheck_label: Option<String>,
+    /// 严重级：none | suspect | confirmed（由 from_evasion_json 判级填入）。
+    pub severity: String,
+}
+
+impl EvasionSummary {
+    /// 从 documents.evasion_json 解析并判级。None = json 缺失或无法解析（视作无发现）；
+    /// 解析成功恒返回 Some（severity 可能为 none——存在弱发现但未过判级线，前端不打徽标、
+    /// 围标信号不计权，但计数仍保留供人工下钻）。
+    pub fn from_evasion_json(json: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let u32_at = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+        let mut s = EvasionSummary {
+            zero_width: u32_at("zeroWidth"),
+            bidi: u32_at("bidi"),
+            tags: u32_at("tags"),
+            variation: u32_at("variation"),
+            confusable_folds: u32_at("confusableFolds"),
+            mixed_script_words: u32_at("mixedScriptWords"),
+            affected_chunks: u32_at("affectedChunks"),
+            max_chunk_concentration: v
+                .get("maxChunkConcentration")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            pdf_hidden_ratio: v
+                .pointer("/pdfAudit/hiddenRatio")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            pdf_hidden_chars: v
+                .pointer("/pdfAudit/hiddenChars")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            xcheck_kind: v
+                .pointer("/xcheck/verdict/kind")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            xcheck_label: v
+                .pointer("/xcheck/verdict/label")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            severity: SEVERITY_NONE.to_string(),
+        };
+        s.severity = s.grade().to_string();
+        Some(s)
+    }
+
+    /// 隐形码点（剥离类）总数。
+    fn invisible_total(&self) -> u32 {
+        self.zero_width + self.bidi + self.tags + self.variation
+    }
+
+    /// 判级：confirmed（强证据）> suspect（弱证据，经聚集度过滤）> none。判级常量集中于本模块。
+    fn grade(&self) -> &'static str {
+        // confirmed：xcheck 命中 / PDF 隐藏文本占比高 / 多处跨脚本同形替换——任一即强证据。
+        if self.xcheck_kind.is_some()
+            || self.pdf_hidden_ratio >= CONFIRMED_HIDDEN_RATIO
+            || self.mixed_script_words >= CONFIRMED_MIXED_SCRIPT
+        {
+            return SEVERITY_CONFIRMED;
+        }
+        // suspect：隐形码点多 / 同形字折叠命中，且经聚集度过滤排除零星复制粘贴残留。
+        let aggregated = self.max_chunk_concentration >= SUSPECT_CONCENTRATION_MIN
+            || self.affected_chunks >= SUSPECT_AFFECTED_MIN;
+        if aggregated && (self.invisible_total() >= SUSPECT_INVISIBLE_MIN || self.confusable_folds > 0)
+        {
+            return SEVERITY_SUSPECT;
+        }
+        SEVERITY_NONE
+    }
+
+    pub fn is_confirmed(&self) -> bool {
+        self.severity == SEVERITY_CONFIRMED
+    }
+
+    pub fn is_suspect(&self) -> bool {
+        self.severity == SEVERITY_SUSPECT
+    }
+
+    /// 达判级线（confirmed 或 suspect）——供围标信号与前端徽标判据。
+    pub fn is_flagged(&self) -> bool {
+        self.is_confirmed() || self.is_suspect()
+    }
+
+    /// 命中的证据种类中文短标签（供围标信号 detail 列举「证据种类」；flagged 时恒非空）。
+    pub fn evidence_kinds(&self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        if self.invisible_total() > 0 {
+            kinds.push("隐形码点");
+        }
+        if self.confusable_folds > 0 {
+            kinds.push("同形字");
+        }
+        if self.mixed_script_words > 0 {
+            kinds.push("混合脚本");
+        }
+        if self.pdf_hidden_chars > 0 {
+            kinds.push("PDF隐藏文字");
+        }
+        if self.xcheck_kind.is_some() {
+            kinds.push("渲染-OCR交叉验证");
+        }
+        kinds
+    }
 }
 
 
@@ -131,7 +300,7 @@ pub struct Cluster {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CollusionSignal {
-    pub kind: String, // similarity | cluster | metadata | sharedTerms
+    pub kind: String, // similarity|cluster|metadata|sharedTerms|facts|rsid|pdfLineage|imageReuse|sharedErrors|evasion
     pub detail: String,
     pub weight: f32,
 }
@@ -218,6 +387,78 @@ mod tests {
         assert!(terms[0].kind.is_none(), "缺 kind 字段应取 None");
         assert!(terms[0].rarity.is_none());
         assert!(terms[0].context.is_none());
+    }
+
+    // —— M2 规避：EvasionSummary 判级（confirmed/suspect/none）与旧任务兼容 ——
+
+    #[test]
+    fn evasion_confirmed_by_xcheck_hit() {
+        // xcheck 命中即 confirmed（即使无隐形码点/无 PDF 隐藏层）
+        let json = r#"{"zeroWidth":0,"affectedChunks":0,"maxChunkConcentration":0.0,
+            "xcheck":{"verdict":{"kind":"fontRemap","label":"疑似字体重映射/图片化正文"},"medianMismatch":0.62}}"#;
+        let e = EvasionSummary::from_evasion_json(json).expect("应解析");
+        assert!(e.is_confirmed(), "xcheck 命中 → confirmed");
+        assert_eq!(e.xcheck_kind.as_deref(), Some("fontRemap"));
+        assert!(e.evidence_kinds().contains(&"渲染-OCR交叉验证"));
+    }
+
+    #[test]
+    fn evasion_confirmed_by_hidden_ratio_and_mixed_script() {
+        // 隐藏文本占比 ≥5% → confirmed
+        let ratio = r#"{"zeroWidth":0,"pdfAudit":{"hiddenChars":80,"hiddenRatio":0.06,"totalChars":1333}}"#;
+        let e = EvasionSummary::from_evasion_json(ratio).expect("应解析");
+        assert!(e.is_confirmed(), "隐藏占比 6% ≥ 5% → confirmed");
+        assert!(e.evidence_kinds().contains(&"PDF隐藏文字"));
+        // 占比不足但同词混合脚本 ≥3 → confirmed
+        let mixed = r#"{"mixedScriptWords":3,"confusableFolds":5,"affectedChunks":1,"maxChunkConcentration":0.5}"#;
+        let e2 = EvasionSummary::from_evasion_json(mixed).expect("应解析");
+        assert!(e2.is_confirmed(), "混合脚本词 3 ≥3 → confirmed");
+        assert!(e2.evidence_kinds().contains(&"混合脚本"));
+    }
+
+    #[test]
+    fn evasion_suspect_requires_aggregation_filter() {
+        // 隐形码点 ≥10 且浓度达标 → suspect
+        let dense = r#"{"zeroWidth":12,"affectedChunks":1,"maxChunkConcentration":0.08}"#;
+        let e = EvasionSummary::from_evasion_json(dense).expect("应解析");
+        assert!(e.is_suspect(), "隐形码点多+浓度达标 → suspect");
+        assert!(e.evidence_kinds().contains(&"隐形码点"));
+        // 隐形码点 ≥10 但浓度极低、单块 → 复制粘贴残留，判 none（聚集度过滤）
+        let sparse = r#"{"zeroWidth":11,"affectedChunks":1,"maxChunkConcentration":0.001}"#;
+        let e2 = EvasionSummary::from_evasion_json(sparse).expect("应解析");
+        assert_eq!(e2.severity, SEVERITY_NONE, "零星残留经聚集度过滤应为 none");
+        // 受影响块数 ≥2 也算聚集（系统性扰动）
+        let spread = r#"{"zeroWidth":10,"affectedChunks":2,"maxChunkConcentration":0.001}"#;
+        let e3 = EvasionSummary::from_evasion_json(spread).expect("应解析");
+        assert!(e3.is_suspect(), "多块受扰应过聚集度过滤 → suspect");
+    }
+
+    #[test]
+    fn evasion_lone_confusable_without_aggregation_is_none() {
+        // 单个同形字折叠、单块、浓度极低（疑似打字错误）→ none，不误报
+        let json = r#"{"confusableFolds":1,"affectedChunks":1,"maxChunkConcentration":0.005}"#;
+        let e = EvasionSummary::from_evasion_json(json).expect("应解析");
+        assert_eq!(e.severity, SEVERITY_NONE, "孤立同形字未过聚集度过滤应为 none");
+    }
+
+    #[test]
+    fn evasion_old_json_without_pdf_or_xcheck_deserializes() {
+        // W2-1/2 早期 evasion_json（仅隐形码点统计，无 pdfAudit/xcheck 子对象）应解析且判级正确
+        let old = r#"{"zeroWidth":15,"bidi":0,"tags":0,"variation":0,"confusableFolds":2,
+            "mixedScriptWords":1,"affectedChunks":3,"maxChunkConcentration":0.03}"#;
+        let e = EvasionSummary::from_evasion_json(old).expect("旧 evasion_json 应兼容");
+        assert_eq!(e.pdf_hidden_chars, 0, "缺 pdfAudit 取零值");
+        assert!(e.xcheck_kind.is_none(), "缺 xcheck 取 None");
+        assert!(e.is_suspect(), "混合脚本仅 1（<3）→ 不 confirmed；隐形码点多+多块 → suspect");
+    }
+
+    #[test]
+    fn old_doc_info_json_without_evasion_deserializes() {
+        // 旧比对任务落库的 DocInfo（无 evasion 字段）反序列化应取 None（serde default）
+        let old = r#"{"id":"d1","name":"标书.docx","docType":"docx","pages":10,
+            "charCount":5000,"fingerprint":{"riskFlags":[]},"parseError":null}"#;
+        let d: DocInfo = serde_json::from_str(old).expect("旧 DocInfo JSON 应兼容");
+        assert!(d.evasion.is_none(), "缺 evasion 字段应取 None");
     }
 }
 
