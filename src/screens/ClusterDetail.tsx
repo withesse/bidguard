@@ -12,6 +12,7 @@ import {
   useAddAnnotation,
   useAnnotations,
   useClusterDetail,
+  useClusterSegments,
   useCompareSummary,
   useDeleteAnnotation,
   useSetReviewStatus,
@@ -41,6 +42,8 @@ export function ClusterDetail() {
   const { dark } = useTheme();
   const { data, isLoading } = useClusterDetail(cid);
   const { data: summary } = useCompareSummary(jobId);
+  // 区段归属（反向互链，只读）：该聚类成员命中的对齐区段；旧任务/无区段返回空数组。
+  const { data: clusterSegs } = useClusterSegments(cid);
   const review = useSetReviewStatus(jobId);
   // 批注：按成员 chunk 锚定（评审记录入库，导出与重启后仍在）
   const { data: anns } = useAnnotations(wsId);
@@ -147,6 +150,49 @@ export function ClusterDetail() {
             <span style={{ fontSize: 12, color: mute }}>组内平均相似 {Math.round(c.score * 100)}%</span>
           )}
         </div>
+
+        {/* 区段归属（W4-5 反向互链，只读）：该条款成员命中的对齐区段 → 跳区段视图定位。 */}
+        {clusterSegs && clusterSegs.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, color: mute }}>所在区段</span>
+            {clusterSegs.map((sg) => {
+              const cov = Math.round(Math.max(sg.aCoverage, sg.bCoverage) * 100);
+              return (
+                <span
+                  key={sg.segmentId}
+                  role="button"
+                  tabIndex={0}
+                  title="在对齐区段视图中查看此区段"
+                  onClick={() =>
+                    nav(
+                      `/workspace/${wsId}/job/${jobId}/segments?a=${sg.docAId}&b=${sg.docBId}&seg=${sg.segmentId}`,
+                    )
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      nav(
+                        `/workspace/${wsId}/job/${jobId}/segments?a=${sg.docAId}&b=${sg.docBId}&seg=${sg.segmentId}`,
+                      );
+                    }
+                  }}
+                  style={{
+                    fontSize: 10.5,
+                    padding: "3px 9px",
+                    borderRadius: 999,
+                    cursor: "pointer",
+                    color: "var(--accent, #4F58A8)",
+                    border: `1px solid var(--accent, #4F58A8)`,
+                    fontWeight: 600,
+                  }}
+                >
+                  所在区段 · 覆盖 {cov}%
+                  {sg.verbatimChars > 0 ? ` · 逐字 ${sg.verbatimChars} 字` : ""}
+                </span>
+              );
+            })}
+          </div>
+        )}
 
         {/* 分区阈值说明（W3-5）：legal 区阈值已上调、price 区证据主体为金额事实冲突。 */}
         {(c.sectionKind === "legal" || c.sectionKind === "price") && (

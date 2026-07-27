@@ -7,11 +7,14 @@ import type {
   LicenseStatusDto,
   ModelStatusDto,
   StorageInfoDto,
+  AlignedSegmentDto,
   ClusterDetailDto,
   ClusterFilter,
+  ClusterSegmentRefDto,
   ClusterSummaryDto,
   CompareRequest,
   CompareSummaryDto,
+  SegmentDetailDto,
   DocRole,
   DocumentDto,
   DocumentPreviewDto,
@@ -176,3 +179,18 @@ export const setClusterReviewStatus = (clusterId: string, status: string) =>
   call<void>("set_cluster_review_status", { clusterId, status });
 export const getPairDetail = (jobId: string, documentA: string, documentB: string) =>
   call<PairMatchDto[]>("get_pair_detail", { jobId, documentA, documentB });
+
+// —— 对齐区段（W4-5，M5b）——
+/** 某任务的对齐区段列表；documentA/B 可选（方向无关过滤）。旧任务返回空数组。 */
+export const listAlignedSegments = (jobId: string, documentA?: string, documentB?: string) =>
+  call<AlignedSegmentDto[]>("list_aligned_segments", {
+    jobId,
+    documentA: documentA ?? null,
+    documentB: documentB ?? null,
+  });
+/** 区段详情（双栏高亮 + 反向互链所需数据）。 */
+export const getSegmentDetail = (segmentId: string) =>
+  call<SegmentDetailDto>("get_segment_detail", { segmentId });
+/** 某聚类反查关联的对齐区段（ClusterDetail「所在区段」Pill）。旧任务返回空数组。 */
+export const getClusterSegments = (clusterId: string) =>
+  call<ClusterSegmentRefDto[]>("get_cluster_segments", { clusterId });

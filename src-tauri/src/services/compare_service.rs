@@ -9,7 +9,8 @@ use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
 use crate::engine::{
-    background, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring, winnow,
+    align, background, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring,
+    verbatim, winnow,
 };
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
@@ -45,10 +46,22 @@ pub struct CompareRunConfig {
     /// security.allowCloudModel：是否允许联网下载语义模型（本地已缓存时不受限）。
     #[serde(default)]
     pub allow_model_download: bool,
+    /// 逐字雷同区间最小字符数（W4-1，M5a）：极大公共子串 ≥ 此长度才作铁证。默认 30 汉字
+    /// （可配 20–40，CompareSetup 暂不暴露）。旧任务 config_json 无此键 → 走 serde 默认。
+    #[serde(default = "default_verbatim_min_chars")]
+    pub verbatim_min_chars: usize,
+    /// 对齐区段链化（W4-2 seed-chain-align，M5a）：残差边∪软种子∪逐字锚点链化成连续对齐区段
+    /// （新增证据层，不替代聚类）。CompareSetup 暂不暴露，走默认开启。旧任务无此键 → serde 默认 true。
+    #[serde(default = "default_true")]
+    pub enable_alignment: bool,
 }
 
 fn default_embedding_model() -> String {
     "bge-zh".to_string()
+}
+
+pub fn default_verbatim_min_chars() -> usize {
+    30
 }
 
 fn default_true() -> bool {
@@ -409,11 +422,15 @@ fn run_inner(
     ctx.progress("score", 0, total_pairs, "精排打分");
     let done = AtomicUsize::new(0);
     let threshold = cfg.similarity_threshold;
-    let (edges, best): (Vec<ScoredEdge>, HashMap<u32, f32>) = cands
+    // 软种子（W4-2 链化用）：final_score ∈ [有效阈值−SOFT_SEED_BAND, 有效阈值) 的边，仅供 align 链化
+    // 提升连续性，【不入】candidate_edges、不参与聚类。仅 enable_alignment 时收集（否则空转，逐字节不变）。
+    let collect_soft = cfg.enable_alignment;
+    #[allow(clippy::type_complexity)]
+    let (edges, soft_seeds, best): (Vec<ScoredEdge>, Vec<ScoredEdge>, HashMap<u32, f32>) = cands
         .par_iter()
         .fold(
-            || (Vec::new(), HashMap::new()),
-            |(mut es, mut best), &(i, j)| {
+            || (Vec::new(), Vec::new(), HashMap::new()),
+            |(mut es, mut softs, mut best), &(i, j)| {
                 let n = done.fetch_add(1, Ordering::Relaxed);
                 if n.is_multiple_of(512) {
                     ctx.progress("score", n, total_pairs, format!("已精排 {n} / {total_pairs}"));
@@ -431,25 +448,35 @@ fn run_inner(
                     *e = e.max(parts.final_score);
                 }
                 // 短文本对用上浮后的阈值过滤（§9.5 场景化阈值）
-                if parts.final_score
-                    >= effective_threshold(threshold, &comparable[i as usize], &comparable[j as usize])
-                {
+                let eff = effective_threshold(threshold, &comparable[i as usize], &comparable[j as usize]);
+                if parts.final_score >= eff {
                     es.push(ScoredEdge { a: i, b: j, parts });
+                } else if collect_soft && parts.final_score >= eff - align::SOFT_SEED_BAND {
+                    softs.push(ScoredEdge { a: i, b: j, parts });
                 }
-                (es, best)
+                (es, softs, best)
             },
         )
         .reduce(
-            || (Vec::new(), HashMap::new()),
-            |(mut e1, mut b1), (e2, b2)| {
+            || (Vec::new(), Vec::new(), HashMap::new()),
+            |(mut e1, mut s1, mut b1), (e2, s2, b2)| {
                 e1.extend(e2);
+                s1.extend(s2);
                 for (k, v) in b2 {
                     let e = b1.entry(k).or_insert(0.0f32);
                     *e = e.max(v);
                 }
-                (e1, b1)
+                (e1, s1, b1)
             },
         );
+    ctx.check()?;
+
+    // 4.5) 逐字雷同区间（W4-1 铁证层 + W3 残差桥接，M5a）：paragraph 级原文求跨文档极大公共子串。
+    //   独立的新证据层——不消费 edges/聚类，直接读 paragraph 分块建 SAM（较短文档侧），只报去空白后
+    //   一字不差的长串（高精度低召回）。W3 桥接：完全落在引用招标块（tender_coverage≥0.8）或样板块
+    //   （ignore_templates 开启）内的区间丢弃——对招标条款的合法逐字应答不得以「铁证」形态还魂。
+    ctx.progress("verbatim", 0, 1, "逐字雷同区间");
+    let verbatim_rows = compute_verbatim(ctx, &docs, cfg, tender_index)?;
     ctx.check()?;
 
     // 5) 聚类（招标对减双口径）：
@@ -477,6 +504,120 @@ fn run_inner(
         rf.truncate(MAX_STORE_CLUSTERS);
         rf
     });
+
+    // 5.5) 对齐区段链化（W4-2 seed-chain-align，M5a）：残差边∪软种子∪逐字锚点 → 连续对齐区段。
+    //   新增证据层、不替代聚类：区段是文档对粒度的证据成型，经 chunk_id 与聚类互链。
+    //   W3 桥接：种子喂【残差边】（residual_edges，剔除双方引用招标的合法共享边），软种子同口径
+    //   残差过滤，verbatim 锚点已在 verbatim 层丢弃完全落在豁免块的区间——铁证不以合法共享还魂。
+    let segment_rows: Vec<compare_repo::NewSegment> = if cfg.enable_alignment {
+        ctx.progress("align", 0, 1, "对齐区段");
+        let seed_edges: &[ScoredEdge] = residual_edges.as_deref().unwrap_or(&edges);
+        let soft_use: Vec<ScoredEdge> = if tender_index.is_some() {
+            soft_seeds
+                .into_iter()
+                .filter(|e| !(exempt(e.a) && exempt(e.b)))
+                .collect()
+        } else {
+            soft_seeds
+        };
+        let vseeds: Vec<align::VerbatimSeed> = verbatim_rows
+            .iter()
+            .map(|m| align::VerbatimSeed {
+                a_chunk_id: m.a_start_chunk_id.clone(),
+                b_chunk_id: m.b_start_chunk_id.clone(),
+                char_len: m.char_len.max(0) as usize,
+            })
+            .collect();
+        let segments = align::chain(&comparable, seed_edges, &soft_use, &vseeds);
+        // chunk_id → 原文（gap 细化取文本）。
+        let text_of: HashMap<&str, &str> =
+            comparable.iter().map(|c| (c.id.as_str(), c.text.as_str())).collect();
+        // W4-3 区段内 gap 带状字符级细化：并行细化每区段的 gap（锚点间未命中块），按 Σeq_chars 把
+        // 覆盖率从「锚点覆盖」升级为「细化后真实覆盖」，并组装 segment_diffs 行。eq 双侧对称（相同文本
+        // 等长）→ 两侧同量累加，封顶区间总字符。全空 gap 不产 DiffOp（align 侧已不产，此处再滤空）。
+        segments
+            .into_par_iter()
+            .map(|s| {
+                let gap_texts: Vec<(String, String)> = s
+                    .gaps
+                    .iter()
+                    .map(|g| {
+                        let a: String = g
+                            .a_chunk_ids
+                            .iter()
+                            .filter_map(|id| text_of.get(id.as_str()).copied())
+                            .collect();
+                        let b: String = g
+                            .b_chunk_ids
+                            .iter()
+                            .filter_map(|id| text_of.get(id.as_str()).copied())
+                            .collect();
+                        (a, b)
+                    })
+                    .collect();
+                let refined = diff::refine_segment_gaps(jieba, &gap_texts);
+                let extra: usize = refined.iter().map(|r| r.eq_chars).sum();
+                let a_covered = (s.a_covered_chars + extra).min(s.a_span);
+                let b_covered = (s.b_covered_chars + extra).min(s.b_span);
+                let a_coverage =
+                    if s.a_span > 0 { (a_covered as f32 / s.a_span as f32).min(1.0) } else { 0.0 };
+                let b_coverage =
+                    if s.b_span > 0 { (b_covered as f32 / s.b_span as f32).min(1.0) } else { 0.0 };
+                let diffs: Vec<compare_repo::NewSegmentDiff> = s
+                    .gaps
+                    .iter()
+                    .zip(refined.iter())
+                    .filter(|(_, r)| !r.ops.is_empty())
+                    .map(|(g, r)| compare_repo::NewSegmentDiff {
+                        a_chunk_id: g.a_chunk_ids.first().cloned(),
+                        b_chunk_id: g.b_chunk_ids.first().cloned(),
+                        diff_type: r.diff_type.to_string(),
+                        diff_json: serde_json::to_string(&r.ops).unwrap_or_else(|_| "[]".into()),
+                        eq_chars: r.eq_chars as i64,
+                    })
+                    .collect();
+                compare_repo::NewSegment {
+                    doc_a_id: docs[s.doc_a].id.clone(),
+                    doc_b_id: docs[s.doc_b].id.clone(),
+                    a_start_order: s.a_start_order as i64,
+                    a_end_order: s.a_end_order as i64,
+                    b_start_order: s.b_start_order as i64,
+                    b_end_order: s.b_end_order as i64,
+                    a_start_chunk_id: s.a_start_chunk_id.clone(),
+                    a_end_chunk_id: s.a_end_chunk_id.clone(),
+                    b_start_chunk_id: s.b_start_chunk_id.clone(),
+                    b_end_chunk_id: s.b_end_chunk_id.clone(),
+                    anchor_count: s.anchor_count as i64,
+                    verbatim_chars: s.verbatim_chars as i64,
+                    a_covered_chars: a_covered as i64,
+                    b_covered_chars: b_covered as i64,
+                    a_coverage,
+                    b_coverage,
+                    avg_score: s.avg_score,
+                    a_section_path: s.a_section_path.clone(),
+                    b_section_path: s.b_section_path.clone(),
+                    a_page_start: s.a_page_start.map(|p| p as i64),
+                    a_page_end: s.a_page_end.map(|p| p as i64),
+                    b_page_start: s.b_page_start.map(|p| p as i64),
+                    b_page_end: s.b_page_end.map(|p| p as i64),
+                    anchors: s
+                        .anchors
+                        .iter()
+                        .map(|a| compare_repo::NewSegmentAnchor {
+                            a_chunk_id: a.a_chunk_id.clone(),
+                            b_chunk_id: a.b_chunk_id.clone(),
+                            kind: a.kind.as_str().to_string(),
+                            score: a.score,
+                        })
+                        .collect(),
+                    diffs,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    ctx.check()?;
 
     // 6) 分类 + diff + 组装入库结构
     let base_idx = cfg
@@ -540,6 +681,8 @@ fn run_inner(
         compare_repo::insert_clusters(&tx, &ctx.job_id, &new_clusters)?;
         compare_repo::insert_clusters(&tx, &ctx.job_id, &deleted)?;
         compare_repo::insert_exemptions(&tx, &ctx.job_id, &exemptions)?;
+        compare_repo::insert_verbatim_matches(&tx, &ctx.job_id, &verbatim_rows)?;
+        compare_repo::insert_segments(&tx, &ctx.job_id, &segment_rows)?;
         crate::db::repo::fact_repo::replace_for_chunks(&tx, &fact_rows)?;
         tx.commit()?;
     }
@@ -706,15 +849,37 @@ fn run_inner(
         }
     }
 
-    // 附录 A 冻结 schema：matrix(剔除后·主口径) + matrixOriginal(未对减) + peak/peakOriginal；
-    // mode="cluster"（M4a 不出区段口径）。segmentMatrix/segmentPeak 为 M5 追加键，此处不填。
+    // 区段口径矩阵（W4-4，M5）：由对齐区段细化后覆盖字数聚合，与残差主矩阵同分母、同剔除口径
+    // （区段种子已喂残差边、逐字锚点已丢弃招标豁免块）。展示层切换用（Matrix.tsx Pill）；围标信号①
+    // 仍消费 peak（剔除后聚类口径），待校准语料回测后再决定是否切 segmentPeak。mode 反映默认展示口径：
+    // 有区段时 "segment"，否则 "cluster"（无区段时 segmentMatrix 全 0，前端亦回退聚类口径）。
+    let doc_index: HashMap<&str, usize> =
+        docs.iter().enumerate().map(|(i, d)| (d.id.as_str(), i)).collect();
+    let seg_cov: Vec<matrix::SegCoverage> = segment_rows
+        .iter()
+        .filter_map(|s| {
+            Some(matrix::SegCoverage {
+                doc_a: *doc_index.get(s.doc_a_id.as_str())?,
+                doc_b: *doc_index.get(s.doc_b_id.as_str())?,
+                a_covered_chars: s.a_covered_chars,
+                b_covered_chars: s.b_covered_chars,
+            })
+        })
+        .collect();
+    let (seg_matrix, seg_peak) = matrix::doc_matrix_segments(docs.len(), &comparable, &seg_cov);
+    let matrix_mode = if seg_cov.is_empty() { "cluster" } else { "segment" };
+
+    // 附录 A 冻结 schema：matrix(剔除后·主口径) + matrixOriginal(未对减) + segmentMatrix(区段口径)
+    // + peak/peakOriginal/segmentPeak + mode。旧任务缺新键 → 前端走缺省渲染。
     let matrix_json = serde_json::json!({
         "documentIds": cfg.document_ids,
         "matrix": m,
         "peak": peak,
         "matrixOriginal": m_original,
         "peakOriginal": peak_original,
-        "mode": "cluster",
+        "segmentMatrix": seg_matrix,
+        "segmentPeak": seg_peak,
+        "mode": matrix_mode,
     });
     // 罕见词 + 共同错误指纹并入同一 shared_terms_json 通道（错误条目 kind="sharedErrors"）
     let mut shared_out = shared;
@@ -733,6 +898,57 @@ fn run_inner(
     }
     ctx.progress("done", 1, 1, "完成");
     Ok(())
+}
+
+/// 逐字雷同区间计算（W4-1 + W3 桥接）：为每份参评文档加载 paragraph 级原文分块，逐块预置豁免标记
+/// （引用招标 tender_coverage≥0.8 或 ignore_templates 下的样板块），交 verbatim::find_pairwise 求
+/// 跨文档极大公共子串，映射回 (document_id, chunk 锚点) 的落库行。逐字层固定 paragraph 粒度、不受
+/// cfg.chunk_level 影响；覆盖率复用 M4 的 winnow::TenderIndex（与残差口径同源）。
+fn compute_verbatim(
+    ctx: &JobCtx,
+    docs: &[DocumentRow],
+    cfg: &CompareRunConfig,
+    tender_index: Option<&winnow::TenderIndex>,
+) -> AppResult<Vec<compare_repo::NewVerbatim>> {
+    let vdocs: Vec<verbatim::VbDoc> = {
+        let conn = ctx.db.get()?;
+        docs.iter()
+            .map(|d| {
+                let chunks = chunk_repo::load_texts(&conn, &d.id, "paragraph")?
+                    .into_iter()
+                    .map(|r| {
+                        let coverage = match tender_index {
+                            Some(idx) => winnow::coverage(&r.normalized_text, idx).0,
+                            None => 0.0,
+                        };
+                        let exempt = (cfg.ignore_templates && r.is_template)
+                            || coverage >= winnow::COVERAGE_EXEMPT;
+                        verbatim::VbChunk { id: r.id, text: r.text, exempt }
+                    })
+                    .collect();
+                Ok(verbatim::VbDoc { chunks })
+            })
+            .collect::<AppResult<Vec<_>>>()?
+    };
+    let min = cfg.verbatim_min_chars.max(1);
+    let rows = verbatim::find_pairwise(&vdocs, min)
+        .into_iter()
+        .map(|m| compare_repo::NewVerbatim {
+            doc_a_id: docs[m.doc_a].id.clone(),
+            doc_b_id: docs[m.doc_b].id.clone(),
+            a_start_chunk_id: m.a_start_chunk_id,
+            a_start_offset: m.a_start_offset as i64,
+            a_end_chunk_id: m.a_end_chunk_id,
+            a_end_offset: m.a_end_offset as i64,
+            b_start_chunk_id: m.b_start_chunk_id,
+            b_start_offset: m.b_start_offset as i64,
+            b_end_chunk_id: m.b_end_chunk_id,
+            b_end_offset: m.b_end_offset as i64,
+            char_len: m.char_len as i64,
+            sample_text: m.sample_text,
+        })
+        .collect();
+    Ok(rows)
 }
 
 /// 语义向量：唯一 normalized_hash 查缓存 → 缺失的批量嵌入并回写。
@@ -1496,7 +1712,7 @@ fn shared_error_fingerprints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::repo::workspace_repo;
+    use crate::db::repo::{segment_repo, workspace_repo};
     use crate::db::{open_in_memory, DbPool};
     use crate::jobs::progress::CollectSink;
     use crate::services::import_service;
@@ -1530,6 +1746,8 @@ mod tests {
             subtract_tender: true,
             embedding_model: "e5-small".into(),
             allow_model_download: false,
+            verbatim_min_chars: 30,
+            enable_alignment: true,
         }
     }
 
@@ -1583,6 +1801,261 @@ mod tests {
     ) -> Vec<crate::db::repo::compare_repo::ClusterSummaryRow> {
         let conn = pool.get().unwrap();
         compare_repo::list_clusters(&conn, job_id, &Default::default(), 0, 500).unwrap()
+    }
+
+    /// 逐字铁证层端到端（W4-1 + M5a 接线）：导入两份共享一整段 120 字逐字文本、前后段落各异的
+    /// 标书 → 跑 compare → verbatim_matches 落库正确（单块锚点、char_len=120、sample 与原文一致），
+    /// 且 delete_job_results 后无残留（复用取消清理口径）。走真实 load_texts/coverage/落库路径，
+    /// 补齐纯函数单测未覆盖的 DB 接线。
+    #[test]
+    fn verbatim_evidence_persisted_end_to_end() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "逐字铁证").unwrap().id
+        };
+        // 一整段 120 个连续 CJK 字符（块内无重复、块间可拼接），两份文档逐字相同
+        let shared: String = (0..120u32).map(|k| char::from_u32(0x4E00 + k).unwrap()).collect();
+        let a = format!("甲方投标文件封面独有内容第一段落文字\n\n{shared}\n\n甲方独有的结尾段落说明文字内容");
+        let b = format!("乙方投标单位另类开头段落表述\n\n{shared}\n\n乙方独有收束段落陈述文本");
+        let (job_id, ids) = import_and_compare(
+            &pool,
+            &ws,
+            &[("甲.txt", a), ("乙.txt", b)],
+            0.5,
+        );
+
+        let conn = pool.get().unwrap();
+        let ms = compare_repo::list_verbatim_for_pair(&conn, &job_id, &ids[0], &ids[1]).unwrap();
+        assert_eq!(ms.len(), 1, "应恰好落库 1 条逐字区间");
+        let m = &ms[0];
+        assert_eq!(m.char_len, 120);
+        assert_eq!(m.sample_text, shared, "sample 应为去空白后的逐字文本");
+        assert_eq!(m.a_start_chunk_id, m.a_end_chunk_id, "整段落命中 → 起止同块");
+        assert_eq!(m.a_start_offset, 0);
+        assert_eq!(m.a_end_offset, 120);
+        // 锚点回指真实块：块内 char 切片 [start,end) 应还原逐字文本
+        let text: String =
+            conn.query_row("SELECT text FROM chunks WHERE id=?1", [&m.a_start_chunk_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let sliced: String = text
+            .chars()
+            .skip(m.a_start_offset as usize)
+            .take((m.a_end_offset - m.a_start_offset) as usize)
+            .collect();
+        assert_eq!(sliced, shared, "块内偏移应精确锚定原文");
+        // 方向无关查询：交换 a/b 仍命中同一条
+        assert_eq!(
+            compare_repo::list_verbatim_for_pair(&conn, &job_id, &ids[1], &ids[0]).unwrap().len(),
+            1
+        );
+        drop(conn);
+
+        // 清理口径：delete_job_results 后逐字区间无残留（取消/重跑安全）
+        {
+            let conn = pool.get().unwrap();
+            compare_repo::delete_job_results(&conn, &job_id).unwrap();
+            let after =
+                compare_repo::list_verbatim_for_pair(&conn, &job_id, &ids[0], &ids[1]).unwrap();
+            assert!(after.is_empty(), "delete_job_results 后 verbatim_matches 应清空");
+        }
+    }
+
+    /// 对齐区段链化端到端（W4-2 + M5a 接线）：导入两份共享一整块连续 6 段（各异段落、逐字相同）
+    /// 的标书 → 跑 compare → aligned_segments 落库为一条覆盖连续段的区段，segment_anchors 的
+    /// chunk_id 能反查到 cluster_members（区段↔聚类经 chunk 互链），逐字锚点计入 verbatim_chars，
+    /// 且 delete_job_results 后两表无残留。走真实残差边/软种子/verbatim 接线，补齐纯函数单测未覆盖的
+    /// DB 通路。
+    #[test]
+    fn aligned_segments_persisted_end_to_end() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "对齐区段").unwrap().id
+        };
+        // 6 个各异真实段落（真实词汇 → 非空 token 进 comparable；段间不同 → 独立 chunk），
+        // 两份文档该整块逐字相同 → hash 通道召回每段、连续 6 锚点链成一条区段。
+        let shared_block = [
+            "本工程施工组织设计依据现行国家标准规范以及招标文件的具体要求编制完成",
+            "项目部配备专职安全员负责施工现场的安全生产管理与隐患排查治理工作",
+            "主体结构采用框架剪力墙体系混凝土强度等级严格满足设计图纸相关要求",
+            "施工现场实行封闭式管理进出人员及车辆均须登记并佩戴安全防护用品",
+            "质量保证体系覆盖材料进场检验隐蔽工程验收及分部分项工程质量评定",
+            "工程竣工后我方提供不少于两年的质量保修服务并建立回访跟踪机制",
+        ]
+        .join("\n\n");
+        let a = format!("甲方投标文件封面独有内容第一段落说明文字信息\n\n{shared_block}\n\n甲方独有的结尾段落补充说明文字内容");
+        let b = format!("乙方投标单位另类开头段落陈述表达文本信息\n\n{shared_block}\n\n乙方独有收束段落总结陈述内容表述");
+        let (job_id, ids) =
+            import_and_compare(&pool, &ws, &[("甲.txt", a), ("乙.txt", b)], 0.5);
+
+        let conn = pool.get().unwrap();
+        // 区段行
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, doc_a_id, doc_b_id, anchor_count, verbatim_chars, a_covered_chars,
+                 a_coverage, b_coverage FROM aligned_segments WHERE job_id = ?1",
+            )
+            .unwrap();
+        let segs: Vec<(String, String, String, i64, i64, i64, f64, f64)> = stmt
+            .query_map([&job_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        assert_eq!(segs.len(), 1, "共享连续块应成恰好 1 条区段");
+        let (seg_id, doc_a_id, doc_b_id, anchor_count, verbatim_chars, a_covered, a_cov, b_cov) =
+            &segs[0];
+        assert_eq!((doc_a_id.as_str(), doc_b_id.as_str()), (ids[0].as_str(), ids[1].as_str()));
+        assert!(*anchor_count >= 2, "区段锚点数应 ≥2，实际 {anchor_count}");
+        assert!(*a_covered > 0);
+        assert!(*a_cov > 0.0 && *a_cov <= 1.0 + 1e-6, "a_coverage 应 ∈(0,1]，实际 {a_cov}");
+        assert!(*b_cov > 0.0 && *b_cov <= 1.0 + 1e-6);
+        assert!(*verbatim_chars > 0, "逐字相同段落应计入 verbatim_chars，实际 {verbatim_chars}");
+
+        // 锚点落库 + 区段↔聚类经 chunk 互链：至少一条锚点的 a_chunk_id 出现在 cluster_members。
+        let anchor_chunks: Vec<String> = conn
+            .prepare("SELECT a_chunk_id FROM segment_anchors WHERE segment_id = ?1")
+            .unwrap()
+            .query_map([seg_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!anchor_chunks.is_empty(), "区段应有锚点落库");
+        let linked = anchor_chunks.iter().any(|cid| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM cluster_members m JOIN clusters cl ON cl.id = m.cluster_id
+                 WHERE cl.job_id = ?1 AND m.chunk_id = ?2",
+                rusqlite::params![job_id, cid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        });
+        assert!(linked, "区段锚点 chunk 应可反查到 cluster_members（互链）");
+
+        // 区段口径矩阵（W4-4）：matrix_json 含 segmentMatrix/segmentPeak/mode；对角线为 1、
+        // 峰值 ∈(0,1]、有区段时 mode="segment"。
+        let mv: serde_json::Value = {
+            let r = job_repo::get_result_jsons(&conn, &job_id).unwrap();
+            serde_json::from_str(&r.matrix_json.unwrap()).unwrap()
+        };
+        let sm: Vec<Vec<f32>> = serde_json::from_value(mv["segmentMatrix"].clone()).unwrap();
+        assert!((sm[0][0] - 1.0).abs() < 1e-6 && (sm[1][1] - 1.0).abs() < 1e-6, "segmentMatrix 对角线应为 1");
+        let sp = mv["segmentPeak"].as_f64().unwrap();
+        assert!(sp > 0.0 && sp <= 1.0 + 1e-6, "segmentPeak 应 ∈(0,1]，实际 {sp}");
+        assert!((sm[0][1] as f64 - sp).abs() < 1e-4, "两文档时 segmentPeak 即该对相似度");
+        assert_eq!(mv["mode"].as_str(), Some("segment"), "有区段时默认展示口径为 segment");
+
+        // 读侧数据通路（验收 1）：list_segments 非空、get_segment_detail 与落库一致、cluster 可反查。
+        let listed =
+            segment_repo::list_segments(&conn, &job_id, Some(&ids[0]), Some(&ids[1])).unwrap();
+        assert_eq!(listed.len(), 1, "list_segments 应返回该文档对的 1 条区段");
+        let detail = segment_repo::get_segment_detail(&conn, seg_id).unwrap();
+        assert_eq!(detail.anchors.len() as i64, *anchor_count, "详情锚点数应与落库一致");
+        assert!(!detail.a_chunks.is_empty() && !detail.b_chunks.is_empty(), "双栏跨度应有 chunk");
+        assert!(!detail.verbatims.is_empty(), "逐字相同段落应有落在跨度内的逐字区间");
+        assert!(!detail.cluster_ids.is_empty(), "锚点 chunk 应反查到关联 cluster");
+        // 旧任务（无区段数据）读路径：不相干任务 id 返回空数组，不报错。
+        assert!(segment_repo::list_segments(&conn, "job-none", None, None).unwrap().is_empty());
+        drop(conn);
+
+        // 清理口径：delete_job_results 后区段与锚点无残留。
+        {
+            let conn = pool.get().unwrap();
+            compare_repo::delete_job_results(&conn, &job_id).unwrap();
+            let seg_after: i64 = conn
+                .query_row("SELECT COUNT(*) FROM aligned_segments WHERE job_id=?1", [&job_id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let anc_after: i64 =
+                conn.query_row("SELECT COUNT(*) FROM segment_anchors", [], |r| r.get(0)).unwrap();
+            assert_eq!(seg_after, 0, "delete_job_results 后 aligned_segments 应清空");
+            assert_eq!(anc_after, 0, "区段清空后 segment_anchors 应随 FK 级联清空");
+        }
+    }
+
+    /// 区段 gap 带状细化端到端（W4-3 + M5a 接线）：两份文档共享 6 段（逐字相同→连续锚点），
+    /// 但甲方在第 3、4 段之间【独有插入】一段乙方没有的内容 → 该段落成为锚点之间一个「A 侧非空、
+    /// B 侧空」的 gap。验证：细化产出 1 条 segment_diffs（diff_type=gap-sentence、全 del、eq_chars=0）、
+    /// 细化后 a_coverage <1.0（插入段计入 a_span 却未被覆盖，方向正确不虚高）、b_coverage≈1.0、
+    /// list_segment_diffs 读回一致、delete_job_results 后 segment_diffs 随区段级联清空。
+    /// 全等锚点相邻处不产 gap（否则 segment_diffs 会 >1）——即验收「全空 gap 不产 DiffOp」。
+    #[test]
+    fn segment_gap_diffs_persisted_end_to_end() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "区段细化").unwrap().id
+        };
+        let shared = [
+            "本工程施工组织设计依据现行国家标准规范以及招标文件的具体要求编制完成",
+            "项目部配备专职安全员负责施工现场的安全生产管理与隐患排查治理工作",
+            "主体结构采用框架剪力墙体系混凝土强度等级严格满足设计图纸相关要求",
+            "施工现场实行封闭式管理进出人员及车辆均须登记并佩戴安全防护用品",
+            "质量保证体系覆盖材料进场检验隐蔽工程验收及分部分项工程质量评定",
+            "工程竣工后我方提供不少于两年的质量保修服务并建立回访跟踪机制",
+        ];
+        // 甲方在第 3、4 段之间独有插入一段（乙方无、且与乙方任何段落均不相似）→ 形成 gap。
+        let extra = "本节为甲方单独补充的施工进度专项激励承诺条款其余投标单位概不涉及此项内容";
+        let a_middle = [shared[0], shared[1], shared[2], extra, shared[3], shared[4], shared[5]]
+            .join("\n\n");
+        let b_middle = shared.join("\n\n");
+        let a = format!("甲方投标文件封面独有内容第一段落说明文字信息\n\n{a_middle}\n\n甲方独有的结尾段落补充说明文字内容");
+        let b = format!("乙方投标单位另类开头段落陈述表达文本信息\n\n{b_middle}\n\n乙方独有收束段落总结陈述内容表述");
+        let (job_id, _ids) =
+            import_and_compare(&pool, &ws, &[("甲.txt", a), ("乙.txt", b)], 0.5);
+
+        let conn = pool.get().unwrap();
+        let seg: (String, f64, f64) = conn
+            .query_row(
+                "SELECT id, a_coverage, b_coverage FROM aligned_segments WHERE job_id = ?1",
+                [&job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let (seg_id, a_cov, b_cov) = seg;
+        // 细化后覆盖率：插入段计入 a_span 却未被覆盖 → a_coverage 明显 <1.0；b 侧无 gap → ≈1.0。
+        assert!(a_cov < 0.99, "插入段应压低 a_coverage（未虚高），实际 {a_cov}");
+        assert!(b_cov > 0.99, "B 侧无 gap，b_coverage 应≈1.0，实际 {b_cov}");
+
+        let diffs = compare_repo::list_segment_diffs(&conn, &seg_id).unwrap();
+        assert_eq!(diffs.len(), 1, "仅一个非空 gap（插入段）应产 1 条 segment_diffs");
+        let d = &diffs[0];
+        assert_eq!(d.diff_type, "gap-sentence");
+        assert_eq!(d.eq_chars, 0, "B 侧无对应文本 → 无相同字符");
+        // A 侧独有插入 → 全 del；过滤后可还原插入段原文
+        let ops: serde_json::Value = serde_json::from_str(&d.diff_json).unwrap();
+        let arr = ops.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert!(arr.iter().all(|o| o["op"] == "del"), "纯插入 gap 应全为 del：{arr:?}");
+        let restored: String =
+            arr.iter().map(|o| o["text"].as_str().unwrap()).collect();
+        assert_eq!(restored, extra, "del 文本应还原甲方插入段");
+        drop(conn);
+
+        // 清理口径：delete_job_results 后 segment_diffs 随区段 FK 级联清空。
+        {
+            let conn = pool.get().unwrap();
+            compare_repo::delete_job_results(&conn, &job_id).unwrap();
+            let after: i64 =
+                conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
+            assert_eq!(after, 0, "delete_job_results 后 segment_diffs 应级联清空");
+        }
     }
 
     /// 真实标书语料校准（手动运行）：

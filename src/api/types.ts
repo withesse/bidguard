@@ -170,6 +170,9 @@ export interface CompareSummaryDto {
     /** 未对减口径（原始相似度）；旧任务缺键。M4 起填充。 */
     matrixOriginal?: number[][];
     peakOriginal?: number;
+    /** 区段口径（对齐区段按 chunk 去重后覆盖率）；旧任务/无区段缺键或全 0。M5 起填充。 */
+    segmentMatrix?: number[][];
+    segmentPeak?: number;
     /** 前端主显口径："cluster" | "segment"；旧任务缺键按 cluster 渲染。 */
     mode?: string;
   } | null;
@@ -300,6 +303,120 @@ export interface PairMatchDto {
   score: number;
   diffType: string;
   diff: DiffOp[];
+}
+
+// —— 对齐区段（W4-5，M5b）：新增证据层，只读，与聚类经 chunk_id 互链 ——
+
+/** 区段列表摘要行（镜像 Rust segment_repo::SegmentSummaryRow）。 */
+export interface AlignedSegmentDto {
+  id: string;
+  docAId: string;
+  docBId: string;
+  anchorCount: number;
+  verbatimChars: number;
+  aCoveredChars: number;
+  bCoveredChars: number;
+  aCoverage: number;
+  bCoverage: number;
+  avgScore: number;
+  aSectionPath: string | null;
+  bSectionPath: string | null;
+  aPageStart: number | null;
+  aPageEnd: number | null;
+  bPageStart: number | null;
+  bPageEnd: number | null;
+}
+
+/** 区段头（aligned_segments 整行）。 */
+export interface SegmentHeadDto {
+  id: string;
+  jobId: string;
+  docAId: string;
+  docBId: string;
+  aStartChunkId: string;
+  aEndChunkId: string;
+  bStartChunkId: string;
+  bEndChunkId: string;
+  anchorCount: number;
+  verbatimChars: number;
+  aCoveredChars: number;
+  bCoveredChars: number;
+  aCoverage: number;
+  bCoverage: number;
+  avgScore: number;
+  aSectionPath: string | null;
+  bSectionPath: string | null;
+  aPageStart: number | null;
+  aPageEnd: number | null;
+  bPageStart: number | null;
+  bPageEnd: number | null;
+}
+
+/** 区段跨度内一个 chunk（双栏按 order 顺序渲染）。tenderCoverage≥0.8 显示「引用招标文件」徽标。 */
+export interface SegmentChunkDto {
+  chunkId: string;
+  text: string;
+  page: number | null;
+  sectionPath: string | null;
+  orderIndex: number;
+  tenderCoverage: number | null;
+}
+
+/** 区段内一条链化锚点。kind: edge 残差边 | soft 软种子 | verbatim 逐字铁证。 */
+export interface SegmentAnchorDto {
+  aChunkId: string;
+  bChunkId: string;
+  kind: string;
+  score: number;
+}
+
+/** 逐字铁证区间（深红底）。offset 按原文 char 计，chunk.text 的 char 切片 [startOffset,endOffset) 即匹配文本。 */
+export interface VerbatimIntervalDto {
+  id: string;
+  docAId: string;
+  docBId: string;
+  aStartChunkId: string;
+  aStartOffset: number;
+  aEndChunkId: string;
+  aEndOffset: number;
+  bStartChunkId: string;
+  bStartOffset: number;
+  bEndChunkId: string;
+  bEndOffset: number;
+  charLen: number;
+  sampleText: string;
+  segmentId: string | null;
+}
+
+/** 区段内一条 gap 细化产物（黄底差异）。diffJson=DiffOp 序列。 */
+export interface SegmentGapDiffDto {
+  aChunkId: string | null;
+  bChunkId: string | null;
+  diffType: string;
+  diffJson: string;
+  eqChars: number;
+}
+
+/** 区段详情（双栏高亮 + 反向互链所需的全部只读数据）。 */
+export interface SegmentDetailDto {
+  segment: SegmentHeadDto;
+  aChunks: SegmentChunkDto[];
+  bChunks: SegmentChunkDto[];
+  anchors: SegmentAnchorDto[];
+  verbatims: VerbatimIntervalDto[];
+  diffs: SegmentGapDiffDto[];
+  /** 经锚点 chunk_id 反查关联的聚类 id 集合（区段↔聚类互链）。 */
+  clusterIds: string[];
+}
+
+/** 聚类反查关联区段引用（ClusterDetail「所在区段」Pill 反向互链）。 */
+export interface ClusterSegmentRefDto {
+  segmentId: string;
+  docAId: string;
+  docBId: string;
+  aCoverage: number;
+  bCoverage: number;
+  verbatimChars: number;
 }
 
 export interface DocumentPreviewDto {

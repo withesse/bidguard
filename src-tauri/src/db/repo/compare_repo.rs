@@ -71,6 +71,275 @@ pub fn insert_exemptions(
     Ok(())
 }
 
+/// 一条逐字雷同区间（W4-1 铁证层，M5a）。两侧锚点各自「起块 id + 块内起偏移 →
+/// 止块 id + 块内止偏移(不含)」，char_len=去空白后匹配字符数，sample_text=匹配文本样本。
+pub struct NewVerbatim {
+    pub doc_a_id: String,
+    pub doc_b_id: String,
+    pub a_start_chunk_id: String,
+    pub a_start_offset: i64,
+    pub a_end_chunk_id: String,
+    pub a_end_offset: i64,
+    pub b_start_chunk_id: String,
+    pub b_start_offset: i64,
+    pub b_end_chunk_id: String,
+    pub b_end_offset: i64,
+    pub char_len: i64,
+    pub sample_text: String,
+}
+
+/// 批量写入逐字雷同区间（verbatim_matches）。调用方需已开启事务。segment_id 留空（M5b 回填）。
+pub fn insert_verbatim_matches(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+    matches: &[NewVerbatim],
+) -> AppResult<()> {
+    let now = now_iso();
+    let mut stmt = conn.prepare(
+        "INSERT INTO verbatim_matches (id, job_id, doc_a_id, doc_b_id, a_start_chunk_id,
+         a_start_offset, a_end_chunk_id, a_end_offset, b_start_chunk_id, b_start_offset,
+         b_end_chunk_id, b_end_offset, char_len, sample_text, segment_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?15)",
+    )?;
+    for m in matches {
+        stmt.execute(params![
+            uuid::Uuid::new_v4().to_string(),
+            job_id,
+            m.doc_a_id,
+            m.doc_b_id,
+            m.a_start_chunk_id,
+            m.a_start_offset,
+            m.a_end_chunk_id,
+            m.a_end_offset,
+            m.b_start_chunk_id,
+            m.b_start_offset,
+            m.b_end_chunk_id,
+            m.b_end_offset,
+            m.char_len,
+            m.sample_text,
+            now,
+        ])?;
+    }
+    Ok(())
+}
+
+/// 逐字层查询行（DTO 预留，M5b 区段视图消费）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerbatimRow {
+    pub id: String,
+    pub doc_a_id: String,
+    pub doc_b_id: String,
+    pub a_start_chunk_id: String,
+    pub a_start_offset: i64,
+    pub a_end_chunk_id: String,
+    pub a_end_offset: i64,
+    pub b_start_chunk_id: String,
+    pub b_start_offset: i64,
+    pub b_end_chunk_id: String,
+    pub b_end_offset: i64,
+    pub char_len: i64,
+    pub sample_text: String,
+    pub segment_id: Option<String>,
+}
+
+/// 两文档某任务下的逐字区间（按 char_len 降序）。方向无关：任一存储朝向都命中。
+pub fn list_verbatim_for_pair(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+    document_a: &str,
+    document_b: &str,
+) -> AppResult<Vec<VerbatimRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, doc_a_id, doc_b_id, a_start_chunk_id, a_start_offset, a_end_chunk_id,
+         a_end_offset, b_start_chunk_id, b_start_offset, b_end_chunk_id, b_end_offset,
+         char_len, sample_text, segment_id
+         FROM verbatim_matches
+         WHERE job_id = ?1
+           AND ((doc_a_id = ?2 AND doc_b_id = ?3) OR (doc_a_id = ?3 AND doc_b_id = ?2))
+         ORDER BY char_len DESC, id",
+    )?;
+    let rows = stmt
+        .query_map(params![job_id, document_a, document_b], |r| {
+            Ok(VerbatimRow {
+                id: r.get(0)?,
+                doc_a_id: r.get(1)?,
+                doc_b_id: r.get(2)?,
+                a_start_chunk_id: r.get(3)?,
+                a_start_offset: r.get(4)?,
+                a_end_chunk_id: r.get(5)?,
+                a_end_offset: r.get(6)?,
+                b_start_chunk_id: r.get(7)?,
+                b_start_offset: r.get(8)?,
+                b_end_chunk_id: r.get(9)?,
+                b_end_offset: r.get(10)?,
+                char_len: r.get(11)?,
+                sample_text: r.get(12)?,
+                segment_id: r.get(13)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 一条对齐区段的链化锚点（W4-2，M5a）。kind: edge 残差边 | soft 软种子 | verbatim 逐字铁证。
+pub struct NewSegmentAnchor {
+    pub a_chunk_id: String,
+    pub b_chunk_id: String,
+    pub kind: String,
+    pub score: f32,
+}
+
+/// 一条区段内 gap 的带状字符级细化产物（W4-3，M5a）。diff_json=DiffOp 序列（eq/ins/del），
+/// eq_chars=该 gap 双方相同字符数（回填细化后覆盖率）。随区段一并落库（segment_diffs），
+/// segment_id 由 insert_segments 生成的区段主键回填、随区段 FK 级联删除。
+pub struct NewSegmentDiff {
+    pub a_chunk_id: Option<String>,
+    pub b_chunk_id: Option<String>,
+    pub diff_type: String,
+    pub diff_json: String,
+    pub eq_chars: i64,
+}
+
+/// 一条对齐区段（W4-2 seed-chain-align，M5a）。两侧各以稠密行序区间 + 首末 chunk 锚定，
+/// coverage=被命中块字符和/区间总字符和；anchors 随区段一并落库（segment_anchors）。
+pub struct NewSegment {
+    pub doc_a_id: String,
+    pub doc_b_id: String,
+    pub a_start_order: i64,
+    pub a_end_order: i64,
+    pub b_start_order: i64,
+    pub b_end_order: i64,
+    pub a_start_chunk_id: String,
+    pub a_end_chunk_id: String,
+    pub b_start_chunk_id: String,
+    pub b_end_chunk_id: String,
+    pub anchor_count: i64,
+    pub verbatim_chars: i64,
+    pub a_covered_chars: i64,
+    pub b_covered_chars: i64,
+    pub a_coverage: f32,
+    pub b_coverage: f32,
+    pub avg_score: f32,
+    pub a_section_path: Option<String>,
+    pub b_section_path: Option<String>,
+    pub a_page_start: Option<i64>,
+    pub a_page_end: Option<i64>,
+    pub b_page_start: Option<i64>,
+    pub b_page_end: Option<i64>,
+    pub anchors: Vec<NewSegmentAnchor>,
+    /// 区段内各 gap 的带状字符级细化产物（W4-3）；随区段主键一并落 segment_diffs。
+    pub diffs: Vec<NewSegmentDiff>,
+}
+
+/// 批量写入对齐区段及其锚点（aligned_segments + segment_anchors）。调用方需已开启事务。
+/// 每区段生成 uuid 主键，锚点以 (segment_id, a_chunk_id, b_chunk_id) 去重（INSERT OR IGNORE
+/// 容忍同一区段内极少见的重复锚点键，不因主键冲突整批回滚）。
+pub fn insert_segments(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+    segments: &[NewSegment],
+) -> AppResult<()> {
+    let now = now_iso();
+    let mut ins_seg = conn.prepare(
+        "INSERT INTO aligned_segments (id, job_id, doc_a_id, doc_b_id, a_start_order, a_end_order,
+         b_start_order, b_end_order, a_start_chunk_id, a_end_chunk_id, b_start_chunk_id,
+         b_end_chunk_id, anchor_count, verbatim_chars, a_covered_chars, b_covered_chars,
+         a_coverage, b_coverage, avg_score, a_section_path, b_section_path, a_page_start,
+         a_page_end, b_page_start, b_page_end, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+    )?;
+    let mut ins_anchor = conn.prepare(
+        "INSERT OR IGNORE INTO segment_anchors (segment_id, a_chunk_id, b_chunk_id, kind, score)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut ins_diff = conn.prepare(
+        "INSERT INTO segment_diffs (id, segment_id, a_chunk_id, b_chunk_id, diff_type, diff_json,
+         eq_chars, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for s in segments {
+        let id = uuid::Uuid::new_v4().to_string();
+        ins_seg.execute(params![
+            id,
+            job_id,
+            s.doc_a_id,
+            s.doc_b_id,
+            s.a_start_order,
+            s.a_end_order,
+            s.b_start_order,
+            s.b_end_order,
+            s.a_start_chunk_id,
+            s.a_end_chunk_id,
+            s.b_start_chunk_id,
+            s.b_end_chunk_id,
+            s.anchor_count,
+            s.verbatim_chars,
+            s.a_covered_chars,
+            s.b_covered_chars,
+            s.a_coverage,
+            s.b_coverage,
+            s.avg_score,
+            s.a_section_path,
+            s.b_section_path,
+            s.a_page_start,
+            s.a_page_end,
+            s.b_page_start,
+            s.b_page_end,
+            now,
+        ])?;
+        for a in &s.anchors {
+            ins_anchor.execute(params![id, a.a_chunk_id, a.b_chunk_id, a.kind, a.score])?;
+        }
+        for d in &s.diffs {
+            ins_diff.execute(params![
+                uuid::Uuid::new_v4().to_string(),
+                id,
+                d.a_chunk_id,
+                d.b_chunk_id,
+                d.diff_type,
+                d.diff_json,
+                d.eq_chars,
+                now,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// 一条区段 gap 细化产物（读侧，W4-3；供 M5b 区段详情渲染）。
+pub struct SegmentDiffRow {
+    pub a_chunk_id: Option<String>,
+    pub b_chunk_id: Option<String>,
+    pub diff_type: String,
+    pub diff_json: String,
+    pub eq_chars: i64,
+}
+
+/// 列出某区段的全部 gap 细化产物（按插入序 rowid，与区段内 gap 顺序一致）。
+pub fn list_segment_diffs(
+    conn: &rusqlite::Connection,
+    segment_id: &str,
+) -> AppResult<Vec<SegmentDiffRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT a_chunk_id, b_chunk_id, diff_type, diff_json, eq_chars
+         FROM segment_diffs WHERE segment_id = ?1 ORDER BY rowid",
+    )?;
+    let rows = stmt
+        .query_map([segment_id], |r| {
+            Ok(SegmentDiffRow {
+                a_chunk_id: r.get(0)?,
+                b_chunk_id: r.get(1)?,
+                diff_type: r.get(2)?,
+                diff_json: r.get(3)?,
+                eq_chars: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn insert_edges(conn: &rusqlite::Connection, job_id: &str, edges: &[NewEdge]) -> AppResult<()> {
     let now = now_iso();
     let mut stmt = conn.prepare(
@@ -163,6 +432,11 @@ pub fn delete_job_results(conn: &rusqlite::Connection, job_id: &str) -> AppResul
     conn.execute("DELETE FROM candidate_edges WHERE job_id = ?1", [job_id])?;
     conn.execute("DELETE FROM clusters WHERE job_id = ?1", [job_id])?;
     conn.execute("DELETE FROM chunk_exemptions WHERE job_id = ?1", [job_id])?;
+    // verbatim_matches 的 job_id 外键 ON DELETE CASCADE 仅在删 job 行时触发；delete_job_results
+    // 保留 job 行、只清结果，故显式删除（否则取消/重跑会残留上次的逐字区间，与 chunk_exemptions 同理）。
+    conn.execute("DELETE FROM verbatim_matches WHERE job_id = ?1", [job_id])?;
+    // aligned_segments 同理显式删除（segment_anchors 随 segment_id 外键级联，无需单独删）。
+    conn.execute("DELETE FROM aligned_segments WHERE job_id = ?1", [job_id])?;
     Ok(())
 }
 
@@ -553,4 +827,116 @@ pub fn set_review_status(conn: &rusqlite::Connection, cluster_id: &str, status: 
         return Err(AppError::not_found("条款聚合"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> rusqlite::Connection {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::db::migrations::run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1','测试','t','t')",
+            [],
+        )
+        .unwrap();
+        for id in ["d1", "d2"] {
+            conn.execute(
+                "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+                 status, created_at, updated_at)
+                 VALUES (?1,'w1','f','p','h','docx','parsed','t','t')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1','w1','compare','completed','t')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn delete_job_results_clears_segments_and_anchors() {
+        // 验收 (5)：delete_job_results 后 aligned_segments 与 segment_anchors 两表无残留。
+        let conn = setup();
+        let seg = NewSegment {
+            doc_a_id: "d1".into(),
+            doc_b_id: "d2".into(),
+            a_start_order: 0,
+            a_end_order: 9,
+            b_start_order: 0,
+            b_end_order: 9,
+            a_start_chunk_id: "a0".into(),
+            a_end_chunk_id: "a9".into(),
+            b_start_chunk_id: "b0".into(),
+            b_end_chunk_id: "b9".into(),
+            anchor_count: 2,
+            verbatim_chars: 80,
+            a_covered_chars: 400,
+            b_covered_chars: 400,
+            a_coverage: 1.0,
+            b_coverage: 1.0,
+            avg_score: 0.9,
+            a_section_path: Some("第三章 › 3.2 施工组织".into()),
+            b_section_path: Some("第三章 › 3.2 施工组织".into()),
+            a_page_start: Some(3),
+            a_page_end: Some(5),
+            b_page_start: Some(3),
+            b_page_end: Some(5),
+            anchors: vec![
+                NewSegmentAnchor {
+                    a_chunk_id: "a0".into(),
+                    b_chunk_id: "b0".into(),
+                    kind: "verbatim".into(),
+                    score: 1.0,
+                },
+                NewSegmentAnchor {
+                    a_chunk_id: "a1".into(),
+                    b_chunk_id: "b1".into(),
+                    kind: "edge".into(),
+                    score: 0.9,
+                },
+            ],
+            diffs: vec![NewSegmentDiff {
+                a_chunk_id: Some("a5".into()),
+                b_chunk_id: Some("b5".into()),
+                diff_type: "gap-sentence".into(),
+                diff_json: "[{\"op\":\"eq\",\"text\":\"甲\"}]".into(),
+                eq_chars: 1,
+            }],
+        };
+        insert_segments(&conn, "j1", &[seg]).unwrap();
+        let segs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM aligned_segments", [], |r| r.get(0)).unwrap();
+        let ancs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_anchors", [], |r| r.get(0)).unwrap();
+        let diffs: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
+        assert_eq!(segs, 1);
+        assert_eq!(ancs, 2);
+        assert_eq!(diffs, 1);
+        // list_segment_diffs 读回一致（取该区段主键）
+        let seg_id: String =
+            conn.query_row("SELECT id FROM aligned_segments", [], |r| r.get(0)).unwrap();
+        let rows = list_segment_diffs(&conn, &seg_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].eq_chars, 1);
+        assert_eq!(rows[0].diff_type, "gap-sentence");
+
+        delete_job_results(&conn, "j1").unwrap();
+        let segs_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM aligned_segments", [], |r| r.get(0)).unwrap();
+        let ancs_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_anchors", [], |r| r.get(0)).unwrap();
+        let diffs_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
+        assert_eq!(segs_after, 0, "delete_job_results 后 aligned_segments 应无残留");
+        assert_eq!(ancs_after, 0, "区段清空后 segment_anchors 应随 FK 级联清空");
+        assert_eq!(diffs_after, 0, "区段清空后 segment_diffs 应随 FK 级联清空");
+    }
 }

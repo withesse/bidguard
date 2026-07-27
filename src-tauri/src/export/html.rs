@@ -252,6 +252,89 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         h.push_str("</p>");
     }
 
+    // 对齐区段与逐字证据（附录 A segments 节；无区段/逐字不渲染——§1.5 屏幕可见证据须在正式报告可引用）
+    if let Some(seg) = &data.segments {
+        h.push_str("<h2>对齐区段与逐字证据</h2>");
+        h.push_str(
+            "<p class=\"muted\">对齐区段是与聚类并存的独立证据层：按 chunk 去重后的真实覆盖，\
+             与区段视图/矩阵区段口径同源。三级视觉语义——\
+             <span style=\"background:#F7D4D4;color:#8B2E2E;padding:0 5px;border-radius:3px\">深红＝逐字铁证（去空白一字不差）</span> \
+             <span style=\"background:#F6DFC6;color:#9A5B18;padding:0 5px;border-radius:3px\">橙＝锚点雷同</span> \
+             <span style=\"background:#F5EEC2;color:#7E6E12;padding:0 5px;border-radius:3px\">黄＝gap 细化差异</span>。\
+             标注「引用招标文件」的区段/区间落在招标豁免块，系对同一招标条款的合法应答，非串通证据；\
+             未命中不构成清白证明。</p>",
+        );
+        for p in &seg.pairs {
+            let _ =
+                write!(h, "<h3 style=\"font-size:15px;margin-top:22px\">{} × {}</h3>", e(&p.a), e(&p.b));
+            // 区段摘要表
+            if p.segments.is_empty() {
+                h.push_str("<p class=\"muted\">无对齐区段（仅逐字铁证，见下）。</p>");
+            } else {
+                let _ = write!(
+                    h,
+                    "<p class=\"muted\">对齐区段摘要（{} 段，按逐字字数排序）</p>",
+                    p.segments.len()
+                );
+                let _ = write!(
+                    h,
+                    "<table><tr><th>{} 侧定位</th><th>{} 侧定位</th><th>覆盖</th><th>锚点</th><th>逐字字数</th><th>标注</th></tr>",
+                    e(&p.a),
+                    e(&p.b)
+                );
+                for s in &p.segments {
+                    let badge = if s.tender_quote {
+                        "<span class=\"chip\">引用招标文件</span>"
+                    } else {
+                        "—"
+                    };
+                    let _ = write!(
+                        h,
+                        "<tr><td style=\"text-align:left\">{}</td><td style=\"text-align:left\">{}</td><td>{:.0}%</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        e(&s.a_range),
+                        e(&s.b_range),
+                        s.coverage * 100.0,
+                        s.anchor_count,
+                        s.verbatim_chars,
+                        badge
+                    );
+                }
+                h.push_str("</table>");
+            }
+            // 逐字雷同区间清单（深红铁证 + 双侧页码）
+            if !p.verbatims.is_empty() {
+                let _ = write!(
+                    h,
+                    "<p class=\"muted\">逐字雷同区间清单（{} 处 · 深红铁证 · 含双侧页码）</p>",
+                    p.verbatims.len()
+                );
+                let _ = write!(
+                    h,
+                    "<table><tr><th>{} 侧页码/章节</th><th>{} 侧页码/章节</th><th>字数</th><th>逐字样本</th><th>标注</th></tr>",
+                    e(&p.a),
+                    e(&p.b)
+                );
+                for v in &p.verbatims {
+                    let badge = if v.tender_quote {
+                        "<span class=\"chip\">引用招标文件</span>"
+                    } else {
+                        "—"
+                    };
+                    let _ = write!(
+                        h,
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td style=\"text-align:left;background:#F7D4D4;color:#8B2E2E\">{}</td><td>{}</td></tr>",
+                        e(&verbatim_locator(v.a_page, v.a_section.as_deref())),
+                        e(&verbatim_locator(v.b_page, v.b_section.as_deref())),
+                        v.char_len,
+                        e(&v.sample),
+                        badge
+                    );
+                }
+                h.push_str("</table>");
+            }
+        }
+    }
+
     // 取证证据（附录 A forensic 节；无命中不渲染——§1.5 不留空表沉默背书）
     if let Some(f) = &data.forensic {
         h.push_str("<h2>取证证据</h2>");
@@ -362,6 +445,22 @@ fn evasion_verdict_cn(verdict: &str) -> &str {
         "confirmed" => "需人工复核",
         "suspect" => "疑似（弱信号）",
         other => other,
+    }
+}
+
+/// 逐字区间一侧定位串（页码 + 章节路径 → 单行；调用方再 xml_escape）。
+fn verbatim_locator(page: Option<i64>, section: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pg) = page {
+        parts.push(format!("第{pg}页"));
+    }
+    if let Some(s) = section.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(s.to_string());
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 

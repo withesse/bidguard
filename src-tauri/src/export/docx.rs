@@ -175,6 +175,66 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         docx_p(&mut body, &terms.join("、"), false, 21);
     }
 
+    // 对齐区段与逐字证据（附录 A segments 节；§1.5 第二种正式格式。无区段/逐字则整章省略）
+    if let Some(seg) = &data.segments {
+        docx_p(&mut body, "对齐区段与逐字证据", true, 28);
+        docx_p(
+            &mut body,
+            "对齐区段为与聚类并存的独立证据层（按 chunk 去重的真实覆盖）。深红＝逐字铁证、橙＝锚点雷同、\
+             黄＝gap 细化差异；标注「引用招标文件」者落在招标豁免块，系对同一招标条款的合法应答，非串通证据。\
+             未命中不构成清白证明。",
+            false,
+            20,
+        );
+        for p in &seg.pairs {
+            docx_p(&mut body, &format!("{} × {}", p.a, p.b), true, 24);
+            if p.segments.is_empty() {
+                docx_p(&mut body, "　无对齐区段（仅逐字铁证，见下）。", false, 21);
+            } else {
+                docx_p(&mut body, &format!("对齐区段摘要（{} 段）", p.segments.len()), true, 22);
+                for s in &p.segments {
+                    let badge = if s.tender_quote { "　[引用招标文件]" } else { "" };
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} ↔ {} · 覆盖 {:.0}% · 锚点 {} · 逐字 {} 字{badge}",
+                            s.a_range,
+                            s.b_range,
+                            s.coverage * 100.0,
+                            s.anchor_count,
+                            s.verbatim_chars
+                        ),
+                        false,
+                        21,
+                    );
+                }
+            }
+            if !p.verbatims.is_empty() {
+                docx_p(
+                    &mut body,
+                    &format!("逐字雷同区间清单（{} 处 · 含双侧页码）", p.verbatims.len()),
+                    true,
+                    22,
+                );
+                for v in &p.verbatims {
+                    let badge = if v.tender_quote { "　[引用招标文件]" } else { "" };
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} ↔ {} · {} 字：{}{badge}",
+                            verbatim_locator(v.a_page, v.a_section.as_deref()),
+                            verbatim_locator(v.b_page, v.b_section.as_deref()),
+                            v.char_len,
+                            v.sample
+                        ),
+                        false,
+                        21,
+                    );
+                }
+            }
+        }
+    }
+
     docx_p(&mut body, "附录：比对配置", true, 28);
     docx_p(&mut body, &data.config.to_string(), false, 18);
     docx_p(
@@ -188,4 +248,20 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}<w:sectPr/></w:body></w:document>"
     );
     write_docx_package(path, &doc)
+}
+
+/// 逐字区间一侧定位串（页码 + 章节路径 → 单行；docx_p 内部再转义）。
+fn verbatim_locator(page: Option<i64>, section: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pg) = page {
+        parts.push(format!("第{pg}页"));
+    }
+    if let Some(s) = section.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(s.to_string());
+    }
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }

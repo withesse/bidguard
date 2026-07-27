@@ -7,6 +7,7 @@ pub mod embedding_repo;
 pub mod fact_repo;
 pub mod image_repo;
 pub mod job_repo;
+pub mod segment_repo;
 pub mod settings_repo;
 pub mod template_repo;
 pub mod workspace_repo;

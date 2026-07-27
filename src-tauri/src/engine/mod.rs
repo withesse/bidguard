@@ -2,6 +2,7 @@
 // 解析(parse) → 标准化(normalize) → 分块(chunker) → 特征(features/corpus) →
 // 召回(candidate) → 评分(scoring) → 聚类(clustering) → 分类与 diff(diff) →
 // 矩阵(matrix) + 事实冲突(fact) + 围标判定(collusion) + 指纹(fingerprint)。
+pub mod align;
 pub mod background;
 pub mod candidate;
 pub mod chunker;
@@ -27,4 +28,5 @@ pub mod report;
 pub mod scoring;
 pub mod segment;
 pub mod similarity;
+pub mod verbatim;
 pub mod winnow;

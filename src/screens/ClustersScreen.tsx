@@ -99,9 +99,14 @@ export function ClustersScreen() {
         title="重复条款"
         sub={`${total} 组跨文档雷同条款`}
         actions={
-          <Button kind="secondary" size="sm" onClick={() => nav(`/workspace/${wsId}/job/${jobId}`)}>
-            返回报告
-          </Button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Button kind="secondary" size="sm" icon="diff" onClick={() => nav(`/workspace/${wsId}/job/${jobId}/segments`)}>
+              对齐区段
+            </Button>
+            <Button kind="secondary" size="sm" onClick={() => nav(`/workspace/${wsId}/job/${jobId}`)}>
+              返回报告
+            </Button>
+          </div>
         }
       />
       {/* 过滤器 */}

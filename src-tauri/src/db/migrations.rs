@@ -21,6 +21,9 @@ const MIGRATIONS: &[&str] = &[
     DOCUMENT_IMAGES_V15,
     CHUNK_EXEMPTIONS_V16,
     CLUSTERS_EXEMPT_V17,
+    VERBATIM_MATCHES_V18,
+    ALIGNED_SEGMENTS_V19,
+    SEGMENT_DIFFS_V20,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -415,6 +418,110 @@ ALTER TABLE clusters ADD COLUMN exempt_reason TEXT;
 ALTER TABLE clusters ADD COLUMN multi_doc_anomaly INTEGER NOT NULL DEFAULT 0;
 ";
 
+// V18：逐字雷同区间表（W4-1 铁证层，M5a）。每行是一对参评文档间一条「去空白后一字不差」的
+// 极大公共子串证据：两侧各以（起块 id, 块内起偏移）→（止块 id, 块内止偏移(不含)）锚定原文，
+// char_len=去空白后匹配字符数，sample_text=匹配文本样本。segment_id 预留（M5b 链化区段回填）。
+// 迁移台账（§1 全局裁决 1）：V18=verbatim_matches。job_id/doc_a_id/doc_b_id 外键 ON DELETE
+// CASCADE + 索引（级联删除需索引，与 V10 同理）；区间锚定的 chunk_id 不设 FK——块随文档删除
+// 由 doc/job 级联覆盖，避免为纯锚点列多建两个级联索引。纯增表，旧工作区兼容。
+const VERBATIM_MATCHES_V18: &str = "
+CREATE TABLE verbatim_matches (
+  id               TEXT PRIMARY KEY,
+  job_id           TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  doc_a_id         TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  doc_b_id         TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  a_start_chunk_id TEXT NOT NULL,
+  a_start_offset   INTEGER NOT NULL,
+  a_end_chunk_id   TEXT NOT NULL,
+  a_end_offset     INTEGER NOT NULL,
+  b_start_chunk_id TEXT NOT NULL,
+  b_start_offset   INTEGER NOT NULL,
+  b_end_chunk_id   TEXT NOT NULL,
+  b_end_offset     INTEGER NOT NULL,
+  char_len         INTEGER NOT NULL,
+  sample_text      TEXT NOT NULL,
+  segment_id       TEXT,
+  created_at       TEXT NOT NULL
+);
+CREATE INDEX idx_verbatim_matches_job ON verbatim_matches(job_id);
+CREATE INDEX idx_verbatim_matches_pair ON verbatim_matches(job_id, doc_a_id, doc_b_id);
+";
+
+// V19：对齐区段与锚点表（W4-2 seed-chain-align，M5a）。aligned_segments 每行是一对参评文档间
+// 一条连续对齐区段：两侧各以稠密行序区间 [start_order,end_order] + 首末 chunk 锚定，coverage=
+// 被命中块字符和/区间总字符和（无重复计数覆盖率基础），verbatim_chars=区段内逐字锚点字数累计，
+// avg_score=锚点均分，section_path/page 为两侧首块章节与页码范围。segment_anchors 每行是区段
+// 内一条链化锚点（kind: edge 残差边 | soft 软种子 | verbatim 逐字铁证），复合主键去重、a/b_chunk_id
+// 建索引供与 cluster_members 按 chunk 互查（区段↔聚类互链）。迁移台账（§1 全局裁决）：V19=
+// aligned_segments(+segment_anchors)。job_id/doc_a_id/doc_b_id 外键 ON DELETE CASCADE + 索引
+// （级联删除需索引，与 V10 同理）；segment_anchors.segment_id 外键级联，锚定 chunk_id 不设 FK
+// （块随文档/任务级联覆盖）。纯增表，旧工作区兼容。
+const ALIGNED_SEGMENTS_V19: &str = "
+CREATE TABLE aligned_segments (
+  id               TEXT PRIMARY KEY,
+  job_id           TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  doc_a_id         TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  doc_b_id         TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  a_start_order    INTEGER NOT NULL,
+  a_end_order      INTEGER NOT NULL,
+  b_start_order    INTEGER NOT NULL,
+  b_end_order      INTEGER NOT NULL,
+  a_start_chunk_id TEXT NOT NULL,
+  a_end_chunk_id   TEXT NOT NULL,
+  b_start_chunk_id TEXT NOT NULL,
+  b_end_chunk_id   TEXT NOT NULL,
+  anchor_count     INTEGER NOT NULL,
+  verbatim_chars   INTEGER NOT NULL,
+  a_covered_chars  INTEGER NOT NULL,
+  b_covered_chars  INTEGER NOT NULL,
+  a_coverage       REAL NOT NULL,
+  b_coverage       REAL NOT NULL,
+  avg_score        REAL NOT NULL,
+  a_section_path   TEXT,
+  b_section_path   TEXT,
+  a_page_start     INTEGER,
+  a_page_end       INTEGER,
+  b_page_start     INTEGER,
+  b_page_end       INTEGER,
+  created_at       TEXT NOT NULL
+);
+CREATE INDEX idx_aligned_segments_job ON aligned_segments(job_id);
+CREATE INDEX idx_aligned_segments_pair ON aligned_segments(job_id, doc_a_id, doc_b_id);
+
+CREATE TABLE segment_anchors (
+  segment_id TEXT NOT NULL REFERENCES aligned_segments(id) ON DELETE CASCADE,
+  a_chunk_id TEXT NOT NULL,
+  b_chunk_id TEXT NOT NULL,
+  kind       TEXT NOT NULL,        -- edge | soft | verbatim
+  score      REAL NOT NULL,
+  PRIMARY KEY (segment_id, a_chunk_id, b_chunk_id)
+);
+CREATE INDEX idx_segment_anchors_a ON segment_anchors(a_chunk_id);
+CREATE INDEX idx_segment_anchors_b ON segment_anchors(b_chunk_id);
+";
+
+// V20：区段内 gap 带状字符级细化产物表（W4-3，M5a）。每行是一条对齐区段内相邻锚点之间一个 gap
+// （两侧各一段连续未命中块）的细化结果：diff_json 是句级带状对齐 + 字符级细化后的 DiffOp 序列
+// （eq/ins/del，过滤 ins 还原 A、过滤 del 还原 B），eq_chars 是该 gap 双方相同字符数（供区段
+// 覆盖率从「锚点覆盖」升级为「细化后真实覆盖」的回填）。diff_type: gap-sentence（带状细化）|
+// gap-degraded（任一侧超长降级整段句 diff）。a/b_chunk_id 是 gap 两侧首块定位（可空，供前端定位）。
+// 不复用既有 diffs 表：其 cluster_id NOT NULL 且语义（底版 vs 目标）与 gap 对齐（双侧对称）不同。
+// segment_id 外键 ON DELETE CASCADE：区段随任务/文档级联删除时 segment_diffs 自动清空
+// （delete_job_results 显式删 aligned_segments 即触发级联，无需单独删）。纯增表，旧工作区兼容。
+const SEGMENT_DIFFS_V20: &str = "
+CREATE TABLE segment_diffs (
+  id         TEXT PRIMARY KEY,
+  segment_id TEXT NOT NULL REFERENCES aligned_segments(id) ON DELETE CASCADE,
+  a_chunk_id TEXT,
+  b_chunk_id TEXT,
+  diff_type  TEXT NOT NULL,        -- gap-sentence | gap-degraded
+  diff_json  TEXT NOT NULL,
+  eq_chars   INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_segment_diffs_segment ON segment_diffs(segment_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +775,246 @@ mod tests {
         let after_doc: i64 =
             conn.query_row("SELECT COUNT(*) FROM chunk_exemptions", [], |r| r.get(0)).unwrap();
         assert_eq!(after_doc, 0, "删文档后 chunk_exemptions 应级联清空");
+
+        // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn verbatim_matches_migration_cascades_and_is_idempotent() {
+        // 老库（V17：verbatim_matches 表出现之前）升级：补 V18，表可写；
+        // 删任务级联清空（job_id 外键）、删文档亦级联清空（doc_a_id/doc_b_id 外键）。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..17] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 17).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["d1", "d2"] {
+            conn.execute(
+                "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+                 status, created_at, updated_at)
+                 VALUES (?1, 'w1', 'f', 'p', 'h', 'docx', 'parsed', 't', 't')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verbatim_matches (id, job_id, doc_a_id, doc_b_id, a_start_chunk_id,
+             a_start_offset, a_end_chunk_id, a_end_offset, b_start_chunk_id, b_start_offset,
+             b_end_chunk_id, b_end_offset, char_len, sample_text, created_at)
+             VALUES ('v1', 'j1', 'd1', 'd2', 'c1', 0, 'c2', 40, 'c3', 0, 'c4', 40, 100, '样本', 't')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM verbatim_matches WHERE job_id='j1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        // 删任务 → 级联清空
+        conn.execute("DELETE FROM jobs WHERE id='j1'", []).unwrap();
+        let after_job: i64 =
+            conn.query_row("SELECT COUNT(*) FROM verbatim_matches", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_job, 0, "删任务后 verbatim_matches 应级联清空");
+
+        // 删文档也级联（重插一行，删其中一份文档）
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j2', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verbatim_matches (id, job_id, doc_a_id, doc_b_id, a_start_chunk_id,
+             a_start_offset, a_end_chunk_id, a_end_offset, b_start_chunk_id, b_start_offset,
+             b_end_chunk_id, b_end_offset, char_len, sample_text, created_at)
+             VALUES ('v2', 'j2', 'd1', 'd2', 'c1', 0, 'c2', 40, 'c3', 0, 'c4', 40, 100, '样本', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM documents WHERE id='d1'", []).unwrap();
+        let after_doc: i64 =
+            conn.query_row("SELECT COUNT(*) FROM verbatim_matches", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_doc, 0, "删文档后 verbatim_matches 应级联清空");
+
+        // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn aligned_segments_migration_cascades_and_is_idempotent() {
+        // 老库（V18：aligned_segments/segment_anchors 出现之前）升级：补 V19，两表可写；
+        // 删任务级联清空 aligned_segments（job_id 外键），锚点随区段 FK 级联；删文档亦级联。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..18] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 18).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["d1", "d2"] {
+            conn.execute(
+                "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+                 status, created_at, updated_at)
+                 VALUES (?1, 'w1', 'f', 'p', 'h', 'docx', 'parsed', 't', 't')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO aligned_segments (id, job_id, doc_a_id, doc_b_id, a_start_order, a_end_order,
+             b_start_order, b_end_order, a_start_chunk_id, a_end_chunk_id, b_start_chunk_id,
+             b_end_chunk_id, anchor_count, verbatim_chars, a_covered_chars, b_covered_chars,
+             a_coverage, b_coverage, avg_score, created_at)
+             VALUES ('s1', 'j1', 'd1', 'd2', 0, 9, 0, 9, 'a0', 'a9', 'b0', 'b9', 10, 200, 400, 400,
+             1.0, 1.0, 0.9, 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_anchors (segment_id, a_chunk_id, b_chunk_id, kind, score)
+             VALUES ('s1', 'a0', 'b0', 'verbatim', 1.0), ('s1', 'a1', 'b1', 'edge', 0.9)",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM segment_anchors WHERE segment_id='s1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        // 删任务 → 区段与锚点级联清空
+        conn.execute("DELETE FROM jobs WHERE id='j1'", []).unwrap();
+        let seg_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM aligned_segments", [], |r| r.get(0)).unwrap();
+        let anc_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_anchors", [], |r| r.get(0)).unwrap();
+        assert_eq!(seg_after, 0, "删任务后 aligned_segments 应级联清空");
+        assert_eq!(anc_after, 0, "区段删除后 segment_anchors 应随 FK 级联清空");
+
+        // 删文档也级联（重插，删其中一份文档）
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j2', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO aligned_segments (id, job_id, doc_a_id, doc_b_id, a_start_order, a_end_order,
+             b_start_order, b_end_order, a_start_chunk_id, a_end_chunk_id, b_start_chunk_id,
+             b_end_chunk_id, anchor_count, verbatim_chars, a_covered_chars, b_covered_chars,
+             a_coverage, b_coverage, avg_score, created_at)
+             VALUES ('s2', 'j2', 'd1', 'd2', 0, 9, 0, 9, 'a0', 'a9', 'b0', 'b9', 10, 0, 400, 400,
+             1.0, 1.0, 0.9, 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM documents WHERE id='d1'", []).unwrap();
+        let seg_doc_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM aligned_segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(seg_doc_after, 0, "删文档后 aligned_segments 应级联清空");
+
+        // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn segment_diffs_migration_cascades_and_is_idempotent() {
+        // 老库（V19：segment_diffs 出现之前）升级补 V20，表可写；删区段 → segment_diffs 随 FK 级联。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..19] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 19).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["d1", "d2"] {
+            conn.execute(
+                "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+                 status, created_at, updated_at)
+                 VALUES (?1, 'w1', 'f', 'p', 'h', 'docx', 'parsed', 't', 't')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO aligned_segments (id, job_id, doc_a_id, doc_b_id, a_start_order, a_end_order,
+             b_start_order, b_end_order, a_start_chunk_id, a_end_chunk_id, b_start_chunk_id,
+             b_end_chunk_id, anchor_count, verbatim_chars, a_covered_chars, b_covered_chars,
+             a_coverage, b_coverage, avg_score, created_at)
+             VALUES ('s1', 'j1', 'd1', 'd2', 0, 9, 0, 9, 'a0', 'a9', 'b0', 'b9', 10, 0, 400, 400,
+             1.0, 1.0, 0.9, 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO segment_diffs (id, segment_id, a_chunk_id, b_chunk_id, diff_type, diff_json,
+             eq_chars, created_at)
+             VALUES ('df1', 's1', 'a5', 'b5', 'gap-sentence', '[{\"op\":\"eq\",\"text\":\"甲\"}]', 1, 't')",
+            [],
+        )
+        .unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        // 删区段 → segment_diffs 级联清空
+        conn.execute("DELETE FROM aligned_segments WHERE id='s1'", []).unwrap();
+        let after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 0, "删区段后 segment_diffs 应随 FK 级联清空");
 
         // 幂等
         run(&mut conn).unwrap();

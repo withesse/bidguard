@@ -149,6 +149,44 @@ pub fn load_for_compare(
     Ok(rows)
 }
 
+/// 逐字层轻量查询（W4-1）：某文档某粒度的原文分块（含 normalized_text 供招标覆盖率判定），
+/// 按 order_index 有序、排除 heading。独立于 cfg.chunk_level——逐字层固定 paragraph 粒度调用。
+pub struct TextRow {
+    pub id: String,
+    pub text: String,
+    pub normalized_text: String,
+    pub page: Option<i64>,
+    pub section_path: Option<String>,
+    pub order_index: i64,
+    pub is_template: bool,
+}
+
+pub fn load_texts(
+    conn: &rusqlite::Connection,
+    document_id: &str,
+    chunk_level: &str,
+) -> AppResult<Vec<TextRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, text, normalized_text, page, section_path, order_index, is_template
+         FROM chunks WHERE document_id = ?1 AND chunk_level = ?2 AND chunk_type != 'heading'
+         ORDER BY order_index",
+    )?;
+    let rows = stmt
+        .query_map(params![document_id, chunk_level], |r| {
+            Ok(TextRow {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                normalized_text: r.get(2)?,
+                page: r.get(3)?,
+                section_path: r.get(4)?,
+                order_index: r.get(5)?,
+                is_template: r.get::<_, i64>(6)? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// 把已解析文档的分块与特征复制给另一文档（同 file_hash 缓存复用，免重复解析）。
 /// 调用方需已开启事务。
 pub fn copy_all(conn: &rusqlite::Connection, from_doc: &str, to_doc: &str) -> AppResult<usize> {

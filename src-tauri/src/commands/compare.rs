@@ -2,6 +2,7 @@
 use super::{conn, effective_config};
 use crate::config::{MAX_DOCS, MIN_DOCS};
 use crate::db::repo::compare_repo::{self, ClusterDetail, ClusterFilter, ClusterSummaryRow};
+use crate::db::repo::segment_repo::{self, SegmentDetail, SegmentSummaryRow};
 use crate::db::repo::{document_repo, job_repo};
 use crate::db::repo::document_repo::DocumentRow;
 use crate::db::repo::job_repo::JobRow;
@@ -93,6 +94,10 @@ pub async fn start_compare(
         subtract_tender: request.subtract_tender.unwrap_or(d.subtract_tender),
         embedding_model: request.embedding_model.unwrap_or(d.embedding_model),
         allow_model_download: cfg_all.security.allow_cloud_model,
+        // 逐字层最小字符数（W4-1）：CompareSetup 暂不暴露，走默认 30 汉字。
+        verbatim_min_chars: compare_service::default_verbatim_min_chars(),
+        // 对齐区段链化（W4-2）：CompareSetup 暂不暴露，默认开启。
+        enable_alignment: true,
     };
     let name = request
         .name
@@ -242,6 +247,43 @@ pub async fn set_cluster_review_status(
         return Err(AppError::new(AppErrorCode::InvalidConfig, "确认状态不合法"));
     }
     compare_repo::set_review_status(&*conn(&state)?, &cluster_id, &status)
+}
+
+/// 对齐区段列表（W4-5，M5b）：某任务下的区段摘要（可选按文档对过滤，方向无关）。
+/// 旧任务（无区段数据）返回空数组——前端空态渲染，不报错。
+#[tauri::command]
+pub async fn list_aligned_segments(
+    job_id: String,
+    document_a: Option<String>,
+    document_b: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<SegmentSummaryRow>> {
+    segment_repo::list_segments(
+        &*conn(&state)?,
+        &job_id,
+        document_a.as_deref(),
+        document_b.as_deref(),
+    )
+}
+
+/// 对齐区段详情（W4-5，M5b）：双栏高亮 + 反向互链所需的只读数据（chunk 跨度 + 锚点 +
+/// 逐字区间 + gap 细化 + 关联 cluster 集合）。
+#[tauri::command]
+pub async fn get_segment_detail(
+    segment_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<SegmentDetail> {
+    segment_repo::get_segment_detail(&*conn(&state)?, &segment_id)
+}
+
+/// 聚类反查关联区段（W4-5，M5b）：ClusterDetail「所在区段」Pill 的数据源（cluster → segments
+/// 反向互链）。旧任务（无区段数据）返回空数组——前端不渲染 Pill，不报错。
+#[tauri::command]
+pub async fn get_cluster_segments(
+    cluster_id: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<segment_repo::ClusterSegmentRef>> {
+    segment_repo::segments_for_cluster(&*conn(&state)?, &cluster_id)
 }
 
 /// 成对明细：两文档的 primary 段落对 + 即时分级 diff（喂逐对对比屏）。
