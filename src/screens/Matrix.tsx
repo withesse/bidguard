@@ -68,6 +68,10 @@ interface MatrixView {
   pairRows: PairRow[];
   insights: Insight[];
   forensicSignals: { tag: string; fg: string; bg: string; detail: string; weight: number }[];
+  /** M6 商务标数值层：有清单数据才提供「商务标数值」入口（独立屏，决策 5）。 */
+  hasNumeric: boolean;
+  numericAlarmPairs: number;
+  numericArithErrors: number;
 }
 
 /** 区段口径峰值有效（非空矩阵且有非零项）→ 才提供口径切换（旧任务/无区段不切）。 */
@@ -89,6 +93,12 @@ const KIND_META: Record<string, { tag: string; fg: string; bg: string }> = {
   evasion: { tag: "规避特征", fg: C.danger, bg: C.dangerSoft },
   // W3-3 多家异常一致：独立「待复核」档（不自动 high）；detail 自带涉嫌措辞 + 条例第四十条 + 评标委员会脚注。
   multiDocAnomaly: { tag: "待复核 · 涉嫌一致", fg: C.danger, bg: C.dangerSoft },
+  // M6 商务标数值层（W5-6）：四类数值信号 + 后置的机制反事实。detail 自带 §1.5 口径/线索/核对措辞。
+  numericIdentical: { tag: "清单雷同率", fg: C.danger, bg: C.dangerSoft },
+  numericArithError: { tag: "共享算术错误", fg: C.hi4, bg: C.hi4Soft },
+  numericPattern: { tag: "线索 · 规律性差异", fg: C.hi2, bg: C.hi2Soft },
+  numericCorrelation: { tag: "单价相关性", fg: C.hi3, bg: C.hi3Soft },
+  numericMechanism: { tag: "评标机制反事实", fg: C.hi3, bg: C.hi3Soft },
 };
 const KIND_META_DEFAULT = { tag: "相似", fg: C.hi3, bg: C.brandSoft };
 // 取证指纹折叠区消费的信号 kind（rsid/PDF 血缘/图片同源/共同错误）。
@@ -239,6 +249,10 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
     pairRows,
     insights,
     forensicSignals,
+    hasNumeric: (sm.numeric?.pairs?.length ?? 0) > 0,
+    numericAlarmPairs: sm.numeric?.pairs?.filter((p) => p.alarm).length ?? 0,
+    numericArithErrors:
+      sm.numeric?.pairs?.reduce((s, p) => s + (p.sharedArithErrors?.length ?? 0), 0) ?? 0,
   };
 }
 
@@ -380,13 +394,24 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                   区段口径峰值 {v.segPeakPct}% 仅供矩阵展示，不改变分级。
                 </div>
               )}
-              <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+              <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
                 <Button kind="primary" size="md" icon="diff" onClick={() => onGo("compare")}>
                   查看逐对对比
                 </Button>
                 <Button kind="secondary" size="md" icon="folder" onClick={() => onGo("clusters")}>
                   查看重复条款
                 </Button>
+                {/* M6：数值证据为独立屏（决策 5），仅在识别出报价清单时出现 */}
+                {v.hasNumeric && (
+                  <Button kind="secondary" size="md" onClick={() => onGo("numeric")}>
+                    商务标数值
+                    {v.numericAlarmPairs > 0
+                      ? ` · 告警 ${v.numericAlarmPairs} 对`
+                      : v.numericArithErrors > 0
+                        ? ` · 算术错误 ${v.numericArithErrors} 条`
+                        : ""}
+                  </Button>
+                )}
               </div>
             </div>
             <div

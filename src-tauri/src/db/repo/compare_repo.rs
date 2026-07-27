@@ -437,6 +437,8 @@ pub fn delete_job_results(conn: &rusqlite::Connection, job_id: &str) -> AppResul
     conn.execute("DELETE FROM verbatim_matches WHERE job_id = ?1", [job_id])?;
     // aligned_segments 同理显式删除（segment_anchors 随 segment_id 外键级联，无需单独删）。
     conn.execute("DELETE FROM aligned_segments WHERE job_id = ?1", [job_id])?;
+    // boq_items 同理显式删除（W5-1）：否则取消/重跑会残留上次的清单条目，对齐率与后续数值指标翻倍。
+    conn.execute("DELETE FROM boq_items WHERE job_id = ?1", [job_id])?;
     Ok(())
 }
 
@@ -938,5 +940,38 @@ mod tests {
         assert_eq!(segs_after, 0, "delete_job_results 后 aligned_segments 应无残留");
         assert_eq!(ancs_after, 0, "区段清空后 segment_anchors 应随 FK 级联清空");
         assert_eq!(diffs_after, 0, "区段清空后 segment_diffs 应随 FK 级联清空");
+    }
+
+    #[test]
+    fn delete_job_results_clears_boq_items() {
+        // W5-1：重跑/取消保留 job 行只清结果，清单条目必须一并清空（否则对齐率与数值指标翻倍）。
+        let conn = setup();
+        crate::db::repo::boq_repo::insert_items(
+            &conn,
+            "j1",
+            &[crate::db::repo::boq_repo::NewBoqItem {
+                doc_index: 0,
+                document_id: "d1".into(),
+                chunk_id: "c1".into(),
+                align_key: Some("c12:010101001001#0".into()),
+                code: Some("010101001001".into()),
+                name: Some("挖一般土方".into()),
+                unit: Some("m3".into()),
+                qty: Some(1200.0),
+                unit_price: Some(25.5),
+                total_price: Some(30600.0),
+                row_index: 0,
+                page: Some(1),
+                flags: None,
+            }],
+        )
+        .unwrap();
+        let before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM boq_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, 1);
+        delete_job_results(&conn, "j1").unwrap();
+        let after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM boq_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 0, "delete_job_results 后 boq_items 应无残留");
     }
 }

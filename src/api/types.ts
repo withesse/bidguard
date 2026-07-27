@@ -155,7 +155,133 @@ export interface CompareRequest {
   scope?: "full" | "tech" | "business";
   /** 剔除招标文件内容（W3-2 招标对减）：默认 true；工作区无招标文件时自然空转。 */
   subtractTender?: boolean;
+  /** 商务标数值层（W5-1）：识别报价清单表并跨文档对齐清单行。默认 true；
+   *  仅支持 xlsx / docx / 文本 PDF 的清单表——扫描件 PDF 走 OCR 不产表格行，自然空转。 */
+  enableNumeric?: boolean;
+  /** 逐项单价雷同率告警线（W5-2）：默认 0.80，后端 clamp 到 0.5–1.0，随任务配置快照持久化。 */
+  identicalRateAlarm?: number;
   embeddingModel?: string;
+}
+
+/** 一条共享算术错误（W5-2）：同一对齐清单项在两份文档中 工程量/单价/（算错的）合价三者全等。
+ *  chunkIds 是双方原文锚点，可下钻 DocPreview 核对原文。 */
+export interface SharedArithErrorDto {
+  alignKey: string;
+  name: string | null;
+  qty: number;
+  unitPrice: number;
+  total: number;
+  /** 正确值（工程量×单价）。 */
+  expectedTotal: number;
+  chunkIds: string[];
+}
+
+/** 规律性差异的形态（W5-3）：等差 / 等比（恒定折扣）/ 仿射。 */
+export type BoqPatternKind = 'arith_seq' | 'geo_discount' | 'affine';
+
+/** 规律性差异拟合结果（W5-3）。缺席 = 未达门槛（剔除双方相等项后 n<10 或 R²<0.999）。
+ *  【定位为线索，不得表述为认定串通】：note 必须原样展示。 */
+export interface BoqPatternDto {
+  kind: BoqPatternKind;
+  /** 最小二乘斜率（等比时即折扣系数）。 */
+  a: number;
+  /** 最小二乘截距（等差时即恒定差额，元）。 */
+  b: number;
+  r2: number;
+  /** 参与拟合的条目数（已剔除双方单价到分相等的条目）。 */
+  n: number;
+  /** 比值向量 y/x 的变异系数；<0.5% 佐证等比。 */
+  ratioCv: number | null;
+  /** 差值向量 y−x 的极差（元）；<1 分佐证等差。 */
+  diffRange: number;
+  /** 辅证是否成立（等比看 ratioCv、等差看 diffRange）。 */
+  corroborated: boolean;
+  note: string;
+}
+
+/** 单价向量相关性（W5-4）。面板必须与 ratioCv、散点形态同屏展示：
+ *  只有 r>0.99 且比值 CV≈0 才是强证据。 */
+export interface BoqCorrelationDto {
+  n: number;
+  pearson: number;
+  /** Spearman 秩相关（并列取均秩）。 */
+  spearman: number;
+  ratioCv: number | null;
+  note: string;
+}
+
+/** 一个归一化散点（W5-4）：坐标 = 各自单价 / 全体投标人该项中位价，裁剪至 [0,3]。
+ *  完全雷同 = 点落对角线；恒定折扣 = 平行于对角线的直线带。每对下采样至 ≤2000 点。 */
+export interface BoqScatterPoint {
+  alignKey: string;
+  name: string | null;
+  x: number;
+  y: number;
+}
+
+/** 单文档单价尾数分布（W5-3）：分位/角位 χ² 均匀性 + 0/5 尾占比。
+ *  （Benford 首位检验已砍——单价只跨 2–3 个数量级，前提不成立。） */
+export interface BoqDigitStatsDto {
+  n: number;
+  centCounts: number[];
+  jiaoCounts: number[];
+  centChiSquare: number;
+  jiaoChiSquare: number;
+  /** df=9、α=0.001 的临界值。 */
+  critical: number;
+  zeroFiveRatio: number;
+  clustered: boolean;
+  note: string;
+}
+
+/** 单文档数值画像（W5-3）。digitStats 为 null = 单价样本不足，不出结论。 */
+export interface NumericDocDto {
+  docIndex: number;
+  documentId: string;
+  digitStats: BoqDigitStatsDto | null;
+}
+
+/** 一个文档对的数值统计（W5-2）。identicalRate 为 null 时 reason 给出原因
+ *  （insufficient = 可比条目不足 minComparable，此时不出结论）。 */
+export interface NumericPairDto {
+  /** 文档在本次任务请求次序里的位次（十天干标签口径，与 matrix.documentIds 同序）。 */
+  a: number;
+  b: number;
+  /** 可比条目数：双方均有单价、且非暂估价/信息价类的对齐项。 */
+  comparable: number;
+  /** 单价到分相等的条目数。 */
+  identical: number;
+  identicalRate: number | null;
+  alarm: boolean;
+  reason: string | null;
+  sharedArithErrors: SharedArithErrorDto[];
+  /** 规律性差异（W5-3）：null = 未达门槛。 */
+  pattern?: BoqPatternDto | null;
+  /** 单价向量相关性（W5-4）：null = 可比条目 <10 或方差为 0。 */
+  correlation?: BoqCorrelationDto | null;
+  /** 归一化散点（W5-4）：旧任务缺键。 */
+  scatter?: BoqScatterPoint[];
+}
+
+/** 商务标数值证据（W5-2，jobs.numeric_json）。旧任务/无清单表为 null，前端隐藏数值面板。 */
+export interface NumericDto {
+  documentIds: string[];
+  /** 本次任务生效的雷同率告警线（配置快照，保证报告可复现）。 */
+  identicalRateAlarm: number;
+  /** 出雷同率结论所需的最小可比条目数。 */
+  minComparable: number;
+  itemCount: number;
+  alignedItemCount: number;
+  pairs: NumericPairDto[];
+  /** 单文档数值画像（W5-3）：与 documentIds 同序；旧任务缺键。 */
+  docs?: NumericDocDto[];
+  /** 强制随数据下发的措辞（§1.5）：雷同率口径说明、共享算术错误的人工核对提示、覆盖范围声明。
+   *  呈现层必须原样展示，不得省略。 */
+  notes: {
+    identicalRate: string;
+    sharedArithError: string;
+    coverage: string;
+  };
 }
 
 export interface CompareSummaryDto {
@@ -179,6 +305,8 @@ export interface CompareSummaryDto {
   collusion: Record<string, unknown> | null;
   sharedTerms: unknown[] | null;
   sections: unknown[] | null;
+  /** 商务标数值证据（W5-2）；旧任务/无清单表为 null 或缺键 → 前端隐藏数值面板。可视化见 W5-4。 */
+  numeric?: NumericDto | null;
 }
 
 export interface CompareSummary {
@@ -205,6 +333,15 @@ export interface CompareSummary {
   zoneTechCount: number;
   zoneBusinessCount: number;
   zoneOtherCount: number;
+  /** 商务标数值层（W5-1）：解析出的报价清单条目总数；无清单表（纯技术标/扫描件）时为 0。旧任务缺键。 */
+  boqItemCount?: number;
+  /** 归入跨文档对齐组（≥2 份文档共有）的条目数。 */
+  boqAlignedItemCount?: number;
+  /** 对齐率 = 对齐条目数 / 条目总数。对齐率本身是「同一单位编制」的结构性线索，判读需结合取证类证据。 */
+  boqAlignRate?: number;
+  /** 识别为报价清单的表数 / 表头未识别或列数不一致被跳过的表数。 */
+  boqTableCount?: number;
+  boqSkippedTableCount?: number;
 }
 
 export interface ClusterSummaryDto {

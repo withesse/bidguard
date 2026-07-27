@@ -41,13 +41,13 @@
   },
   "macroF1": 0.47166764521094107,
   "collusionAuc": 1.0,
-  "meanCollusionScore": 0.9799999594688416,
-  "meanIndependentScore": 0.4188888867696126,
+  "meanCollusionScore": 1.0,
+  "meanIndependentScore": 0.2988888919353485,
   "pairsCount": 1750,
   "docsetsCount": 12,
   "pairsHash": "ae38744f8c8aa29677c6fa77118f998ae956f69123a1795d9e6042654051214a",
-  "docsetsHash": "cbcfb7b112fd8dcd52288848e163dd1d8c413a67fdaead6729cf744885ebc322",
-  "gitRev": "b94be43",
-  "generatedAt": "2026-07-11",
+  "docsetsHash": "d68c053648ef246962512217241b397c4d91919c183ca5005d94766301c91601",
+  "gitRev": "eca41c4",
+  "generatedAt": "2026-07-27",
   "note": "无模型层：features→recall→score_pair→classify_cluster→assess_with（不含语义/rerank）"
 }

@@ -235,6 +235,158 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 商务标数值证据（附录 A numeric 节；§1.5 第二种正式格式。无清单数据则整章省略）
+    if let Some(nm) = &data.numeric {
+        docx_p(&mut body, "商务标数值证据", true, 28);
+        docx_p(
+            &mut body,
+            &format!(
+                "报价清单逐项比对：共识别清单条目 {} 条、跨文档对齐 {} 条；雷同率告警线 {:.0}%，\
+                 可比条目不足 {} 项的文档对不出结论。",
+                nm.item_count,
+                nm.aligned_item_count,
+                nm.identical_rate_alarm * 100.0,
+                nm.min_comparable
+            ),
+            false,
+            20,
+        );
+        for note in &nm.notes {
+            docx_p(&mut body, note, false, 20);
+        }
+        docx_p(&mut body, "逐项单价雷同率", true, 24);
+        for p in &nm.pairs {
+            let rate = match p.identical_rate {
+                Some(r) => format!("{:.1}%", r * 100.0),
+                None => match p.reason.as_deref() {
+                    Some("insufficient") => "—（可比条目不足，不出结论）".to_string(),
+                    Some(other) => format!("—（{other}）"),
+                    None => "—（无可比条目）".to_string(),
+                },
+            };
+            docx_p(
+                &mut body,
+                &format!(
+                    "· {} ↔ {} · 可比 {} 项 · 单价相同 {} 项 · 雷同率 {}{}",
+                    p.a,
+                    p.b,
+                    p.comparable,
+                    p.identical,
+                    rate,
+                    if p.alarm { "　[达告警线 · 需重点核查]" } else { "" }
+                ),
+                false,
+                21,
+            );
+        }
+        // 规律性差异 / 相关性结论
+        if nm.pairs.iter().any(|p| p.pattern.is_some() || p.correlation.is_some()) {
+            docx_p(&mut body, "规律性差异与相关性", true, 24);
+            for p in &nm.pairs {
+                if let Some(x) = &p.pattern {
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} ↔ {} · 规律性：{} · a={:.4} · b={:.2} 元 · R²={:.4} · n={}{}。{}",
+                            p.a,
+                            p.b,
+                            pattern_kind_cn(&x.kind),
+                            x.a,
+                            x.b,
+                            x.r2,
+                            x.n,
+                            if x.corroborated { " · 辅证成立" } else { "" },
+                            x.note
+                        ),
+                        false,
+                        21,
+                    );
+                }
+                if let Some(c) = &p.correlation {
+                    let cv = match c.ratio_cv {
+                        Some(cv) => format!("{:.3}%", cv * 100.0),
+                        None => "—".to_string(),
+                    };
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} ↔ {} · 相关性：Pearson r={:.4} · Spearman ρ={:.4} · 比值 CV={} · n={}。{}",
+                            p.a, p.b, c.pearson, c.spearman, cv, c.n, c.note
+                        ),
+                        false,
+                        21,
+                    );
+                }
+            }
+        }
+        // 共享算术错误清单（§1.5 提示必须随清单出现）
+        let err_count: usize = nm.pairs.iter().map(|p| p.shared_arith_errors.len()).sum();
+        if err_count > 0 {
+            docx_p(&mut body, &format!("共享算术错误清单（{err_count} 条）"), true, 24);
+            docx_p(
+                &mut body,
+                "同一清单项在两份文件中工程量、综合单价与（算错的）合价三者到分全等。检测已排除可由常见\
+                 舍入规则解释的差值；请核对是否源自同一计价软件舍入惯例或招标文件，单条命中不构成串通投标认定。",
+                false,
+                20,
+            );
+            for p in &nm.pairs {
+                for x in &p.shared_arith_errors {
+                    let name = x.name.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("—");
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} ↔ {} · {}（{}）· 工程量 {} × 单价 {:.2} · 报出合价 {:.2}（应为 {:.2}）· 原文锚点 {}",
+                            p.a,
+                            p.b,
+                            name,
+                            x.align_key,
+                            x.qty,
+                            x.unit_price,
+                            x.total,
+                            x.expected_total,
+                            x.chunk_ids.join(" / ")
+                        ),
+                        false,
+                        21,
+                    );
+                }
+            }
+        }
+        // 逐文档单价尾数分布
+        if nm.docs.iter().any(|d| d.digit_stats.is_some()) {
+            docx_p(&mut body, "逐文档单价尾数分布", true, 24);
+            for d in &nm.docs {
+                let Some(ds) = &d.digit_stats else { continue };
+                let g = |k: &str| ds.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let clustered =
+                    ds.get("clustered").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                docx_p(
+                    &mut body,
+                    &format!(
+                        "· {} · 样本 {} · 分位 χ²={:.2} · 角位 χ²={:.2} · 临界值 {:.3} · 0/5 尾占比 {:.0}% · {}",
+                        d.tag,
+                        g("n") as i64,
+                        g("centChiSquare"),
+                        g("jiaoChiSquare"),
+                        g("critical"),
+                        g("zeroFiveRatio") * 100.0,
+                        if clustered { "尾数聚集" } else { "未见聚集" }
+                    ),
+                    false,
+                    21,
+                );
+            }
+            docx_p(
+                &mut body,
+                "尾数聚集反映报价的取整习惯（如统一取整到角/元），单独不构成串通认定，需结合取证类证据；\
+                 本工具未做 Benford 首位检验（单价通常只跨 2–3 个数量级，前提不成立）。",
+                false,
+                20,
+            );
+        }
+    }
+
     docx_p(&mut body, "附录：比对配置", true, 28);
     docx_p(&mut body, &data.config.to_string(), false, 18);
     docx_p(
@@ -248,6 +400,16 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{body}<w:sectPr/></w:body></w:document>"
     );
     write_docx_package(path, &doc)
+}
+
+/// 规律性差异形态的中文标签（numeric.pairs[].pattern.kind）。
+fn pattern_kind_cn(kind: &str) -> &str {
+    match kind {
+        "arith_seq" => "等差（各项差额恒定）",
+        "geo_discount" => "等比 / 恒定折扣（各项系数恒定）",
+        "affine" => "仿射（系数与差额均非平凡）",
+        other => other,
+    }
 }
 
 /// 逐字区间一侧定位串（页码 + 章节路径 → 单行；docx_p 内部再转义）。

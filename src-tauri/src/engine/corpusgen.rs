@@ -836,22 +836,56 @@ fn body_xml(paragraphs: &[String], price_rows: &[Vec<String>]) -> String {
     b
 }
 
-/// 报价明细行：单价整组乘同一系数 ratio_pct/100（等比）。base_units 为各行基准单价。
-fn price_rows(base_units: &[i64], ratio_pct: i64) -> Vec<Vec<String>> {
+/// 报价清单明细行数：需 ≥10 以越过 W5-3/W5-4 规律性与相关性的 n≥10 门槛（少于此则数值层
+/// 只出 insufficient，注入的等比证据无法被检出）。
+const BOQ_ROWS: usize = 12;
+
+/// 报价清单明细行（M6 数值层可解析口径）。表头用规范列名（项目编码/项目名称/单位/工程量/
+/// 综合单价/合价）——旧版表头「序号|设备名称及服务内容|单价（元）|工期」只有 2 列能被
+/// boq::extract_document 识别（&lt;3 列即判非清单表），注入的「等比乘系数」证据实际不可读，
+/// 数值信号在门禁中恒不触发。
+/// - 围标组（jitter=None）：各份共用同一基准单价序列、整组乘 ratio ⇒ 份间严格等比（y=kx），
+///   触发 numericPattern/numericCorrelation。
+/// - 独立组（jitter=Some(seed)）：逐行独立扰动 ⇒ 份间无线性关系，作负样本。
+fn price_rows(base_units: &[i64], ratio_pct: i64, jitter: Option<u64>) -> Vec<Vec<String>> {
     let mut rows = vec![vec![
-        "序号".into(),
-        "设备名称及服务内容".into(),
-        "单价（元）".into(),
-        "工期".into(),
+        "项目编码".into(),
+        "项目名称".into(),
+        "单位".into(),
+        "工程量".into(),
+        "综合单价".into(),
+        "合价".into(),
     ]];
-    let items = ["核心交换机及配套光模块安装调试", "机房精密空调供货与调试", "综合布线及线缆敷设"];
-    for (i, &base) in base_units.iter().enumerate() {
-        let unit = base * ratio_pct / 100;
+    let items = [
+        "核心交换机及配套光模块安装调试",
+        "机房精密空调供货与调试",
+        "综合布线及线缆敷设",
+        "UPS 不间断电源及电池组",
+        "防火墙及入侵检测设备",
+        "机柜及配电单元安装",
+    ];
+    let units = ["台", "项", "米", "套"];
+    for i in 0..BOQ_ROWS {
+        let seed_base = base_units[i % base_units.len()];
+        let base = match jitter {
+            // 围标组：确定性展开，份间一致 ⇒ 仅 ratio 造成差异。
+            None => seed_base + (i as i64) * 137,
+            // 独立组：逐行哈希扰动，破坏线性关系。
+            Some(s) => {
+                seed_base + (features::hash64(&format!("{s}|{i}")) % 900) as i64 + (i as i64) * 11
+            }
+        };
+        let unit_price = base * ratio_pct / 100;
+        let qty = 1 + (i as i64) % 5;
         rows.push(vec![
-            (i + 1).to_string(),
+            // 12 位清单编码，份间一致 ⇒ 按编码精确对齐。
+            format!("0304120{:05}", 1000 + i),
             items[i % items.len()].to_string(),
-            unit.to_string(),
-            "30天".into(),
+            units[i % units.len()].to_string(),
+            qty.to_string(),
+            unit_price.to_string(),
+            // 合价 = 工程量 × 综合单价（严格自洽，不植入算术错误）。
+            (qty * unit_price).to_string(),
         ]);
     }
     rows
@@ -887,7 +921,7 @@ fn build_collusion_set(
         let paragraphs = vec![format!("投标人：{company}"), edited, commit];
         // 等比：整组乘同一 ratio（份间不同 ratio，行内同 ratio）。
         let ratio = 100 + (d as i64) * 8; // 100% / 108% / 116%
-        let rows = price_rows(&base_units, ratio);
+        let rows = price_rows(&base_units, ratio, None);
         // 创建时间邻近：同日、分钟差 < 阈值。
         let created = format!("2024-03-15T09:{:02}:00Z", d * 3);
         let parts = vec![
@@ -946,8 +980,12 @@ fn build_independent_set(
         let root = format!("{tag:04X}FFFF");
         let rsids: Vec<String> = (0..RSIDS_PER_DOC).map(|j| format!("{tag:04X}{j:04X}")).collect();
         let png = make_png(features::hash64(&format!("independent-img|{docset_id}|{d}")));
-        // 报价无系数关系：各行独立取值。
-        let rows = price_rows(&[900 + (d as i64) * 137, 3100 + (g as i64) * 91, 760], 100);
+        // 报价无系数关系：各行独立扰动（jitter 按文档取种子）⇒ 份间无线性关系。
+        let rows = price_rows(
+            &[900 + (d as i64) * 137, 3100 + (g as i64) * 91, 760],
+            100,
+            Some(features::hash64(&format!("{docset_id}|{d}"))),
+        );
         let created = format!("202{}-0{}-1{}T1{}:20:00Z", d % 4 + 1, d % 8 + 1, g % 9, d % 9);
         // 唯一惰性部件：打乱 zip 条目名集合 → zip_entry_fp 各份互异（避免假「打包结构相同」）。
         let note = format!("word/note_{tag:04X}.xml");
@@ -1123,6 +1161,8 @@ pub fn run_cli() {
 
 /// docsets 组内聚类的相似阈值：对齐 compare 默认 similarity_threshold（config.rs=0.7）。
 const REGRESSION_THRESHOLD: f32 = 0.7;
+/// 数值层逐项雷同率告警线：对齐 compare 默认 identical_rate_alarm（config.rs=0.80）。
+const REGRESSION_ALARM_LINE: f64 = 0.80;
 /// 计入「召回层召回率」的正类标签（unrelated 是负类，不计召回）。
 const POSITIVE_LABELS: [&str; 4] = ["same", "minor_change", "changed", "rewrite"];
 /// 评分层 per-label 指标覆盖的全部五类（含负类 unrelated）。
@@ -1338,6 +1378,10 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
     let mut per_doc_images: Vec<Vec<collusion::ImageFp>> = Vec::new();
     let mut evasion: Vec<Option<EvasionSummary>> = Vec::new();
     let mut chunks: Vec<CmpChunk> = Vec::new();
+    // 商务标数值层（M6）：docsets 的围标正样本注入了「清单单价整组乘系数」（见 price_rows），
+    // 若此处不建 BOQ，numeric 恒 None ⇒ 五类数值信号在门禁里恒不触发、注入的等比证据被白白丢弃
+    // （M7 拟合 LR 时数值特征会成为死列）。故与生产同口径抽取表格行 → extract → align → pair_stats。
+    let mut per_doc_rows: Vec<Vec<crate::engine::boq::TableRowInput>> = Vec::new();
     for (di, name) in manifest.docs.iter().enumerate() {
         let path = sdir.join(name);
         let pb = parse::parse_file_blocks(&path, &cancel)
@@ -1345,7 +1389,16 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
         let blocks: Vec<&parse::Block> =
             pb.blocks.iter().filter(|b| b.text.chars().count() >= 2).collect();
         let total = blocks.len().max(1);
+        let mut rows: Vec<crate::engine::boq::TableRowInput> = Vec::new();
         for (rank, b) in blocks.iter().enumerate() {
+            if b.is_table_row {
+                rows.push(crate::engine::boq::TableRowInput {
+                    chunk_id: format!("{}-{}-{}", manifest.docset_id, di, rank),
+                    text: b.text.clone(),
+                    page: b.page.map(|p| p as i64),
+                    order_index: rank as i64,
+                });
+            }
             let rel = if total > 1 { rank as f32 / (total - 1) as f32 } else { 0.0 };
             let mut c = regr_build_chunk(
                 jieba,
@@ -1366,6 +1419,7 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
                 .map(|h| collusion::ImageFp { sha256: h.sha256.clone(), dhash: h.dhash, page: h.page })
                 .collect(),
         );
+        per_doc_rows.push(rows);
         evasion.push(regr_evasion(&pb.legacy_text));
         doc_infos.push(DocInfo {
             id: format!("{}-{}", manifest.docset_id, di),
@@ -1417,6 +1471,19 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
     let rsid = fingerprint::rsid_pairs(&mut doc_infos, &empty);
     let lineage = fingerprint::lineage_pairs(&mut doc_infos);
     let images = collusion::image_pairs(&per_doc_images, &empty);
+    // 数值层聚合与生产同口径：extract → align → pair_stats → numeric_evidence_of（复用
+    // compare_service 的聚合函数而非在此复制，避免门禁与生产口径漂移）。无表格行 ⇒ None，
+    // 此时回落到旧「报价梯度」信号，与生产一致。
+    let per_doc_items: Vec<Vec<crate::engine::boq::BoqItem>> = per_doc_rows
+        .iter()
+        .map(|rows| crate::engine::boq::extract_document(rows).items)
+        .collect();
+    let item_count: usize = per_doc_items.iter().map(|v| v.len()).sum();
+    let numeric = (item_count > 0).then(|| {
+        let aligned = crate::engine::boq::align(&per_doc_items);
+        let pairs = crate::engine::boq::pair_stats(&per_doc_items, &aligned, REGRESSION_ALARM_LINE);
+        crate::services::compare_service::numeric_evidence_of(&pairs, REGRESSION_ALARM_LINE)
+    });
     let col = collusion::assess_with(collusion::CollusionInputs {
         peak,
         clusters: &r_clusters,
@@ -1425,6 +1492,7 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
         lineage_hits: &lineage,
         image_hits: &images,
         evasion: &evasion,
+        numeric: numeric.as_ref(),
         ..Default::default()
     });
     col.score
@@ -1955,6 +2023,52 @@ mod tests {
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "召回率不降不触发");
         assert!(!gate_failures(&base, &mk(0.90, 1.00, 0.95)).is_empty(), "AUC 降 0.05 触发");
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "AUC 不降不触发");
+    }
+
+    /// 语料的报价清单必须能被 M6 数值层解析——否则 docsets 注入的「等比乘系数」证据不可读，
+    /// numeric 恒 None、五类数值信号在门禁中恒不触发（M7 拟合 LR 时数值特征会成为死列）。
+    /// 曾因表头用「序号|设备名称及服务内容|单价（元）|工期」（仅 2 列可识别、3 行 < n≥10 门槛）
+    /// 而静默失效，故以本测试钉死：清单可解析 + 围标组呈严格等比 + 独立组无线性关系。
+    #[test]
+    fn docset_price_tables_are_boq_parsable_and_carry_planted_ratio() {
+        use crate::engine::boq;
+        let base_units = [1200i64, 3400, 760];
+        let extract = |rows: &[Vec<String>]| -> Vec<boq::BoqItem> {
+            let inputs: Vec<boq::TableRowInput> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| boq::TableRowInput {
+                    chunk_id: format!("c{i}"),
+                    text: r.join(" | "),
+                    page: None,
+                    order_index: i as i64,
+                })
+                .collect();
+            boq::extract_document(&inputs).items
+        };
+        // 围标组：同基准、份间不同 ratio ⇒ 可解析且严格等比。
+        let a = extract(&price_rows(&base_units, 100, None));
+        let b = extract(&price_rows(&base_units, 108, None));
+        assert!(a.len() >= 10, "清单行数须 ≥10 以越过规律性/相关性 n≥10 门槛，实得 {}", a.len());
+        assert_eq!(a.len(), b.len(), "同基准两份清单条目数应一致");
+        assert!(a.iter().all(|it| it.unit_price.is_some() && it.total_price.is_some()));
+        assert!(a.iter().all(|it| it.code.is_some()), "编码列须被识别（按编码对齐）");
+        for (x, y) in a.iter().zip(b.iter()) {
+            let (px, py) = (x.unit_price.unwrap(), y.unit_price.unwrap());
+            // 整数截断带来 ≤1 元噪声，比值仍应贴近 1.08。
+            assert!((py / px - 1.08).abs() < 0.01, "围标组份间应呈等比：{px} → {py}");
+        }
+        // 独立组：逐行扰动 ⇒ 比值离散（非恒定），不构成等比。
+        let i1 = extract(&price_rows(&base_units, 100, Some(11)));
+        let i2 = extract(&price_rows(&base_units, 100, Some(22)));
+        let ratios: Vec<f64> = i1
+            .iter()
+            .zip(i2.iter())
+            .map(|(x, y)| y.unit_price.unwrap() / x.unit_price.unwrap())
+            .collect();
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        let spread = ratios.iter().map(|r| (r - mean).abs()).fold(0.0f64, f64::max);
+        assert!(spread > 0.02, "独立组比值应离散（无线性关系），实得最大偏离 {spread:.4}");
     }
 
     /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。

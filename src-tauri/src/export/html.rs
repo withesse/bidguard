@@ -335,6 +335,161 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 商务标数值证据（附录 A numeric 节；无清单数据不渲染——§1.5 不留空表沉默背书）
+    if let Some(nm) = &data.numeric {
+        h.push_str("<h2>商务标数值证据</h2>");
+        let _ = write!(
+            h,
+            "<p class=\"muted\">报价清单逐项比对：共识别清单条目 {} 条、跨文档对齐 {} 条；\
+             雷同率告警线 {:.0}%，可比条目不足 {} 项的文档对不出结论。</p>",
+            nm.item_count, nm.aligned_item_count, nm.identical_rate_alarm * 100.0, nm.min_comparable
+        );
+        for note in &nm.notes {
+            let _ = write!(h, "<p class=\"muted\">{}</p>", e(note));
+        }
+        // 逐项单价雷同率表
+        h.push_str(
+            "<table><tr><th>文档对</th><th>可比条目</th><th>单价相同</th><th>逐项雷同率</th><th>告警</th></tr>",
+        );
+        for p in &nm.pairs {
+            let rate = match p.identical_rate {
+                Some(r) => format!("{:.1}%", r * 100.0),
+                None => format!("—（{}）", numeric_reason_cn(p.reason.as_deref())),
+            };
+            let flag = if p.alarm {
+                "<span class=\"chip\">达告警线 · 需重点核查</span>"
+            } else {
+                "—"
+            };
+            let _ = write!(
+                h,
+                "<tr><td>{} ↔ {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                e(&p.a), e(&p.b), p.comparable, p.identical, rate, flag
+            );
+        }
+        h.push_str("</table>");
+        // 规律性差异 / 相关性结论（逐对，仅列已出结论者）
+        let has_stat = nm.pairs.iter().any(|p| p.pattern.is_some() || p.correlation.is_some());
+        if has_stat {
+            h.push_str("<p style=\"margin-top:14px\"><b>规律性差异与相关性</b></p>");
+            h.push_str("<table><tr><th>文档对</th><th>规律性</th><th>相关性</th></tr>");
+            for p in &nm.pairs {
+                if p.pattern.is_none() && p.correlation.is_none() {
+                    continue;
+                }
+                let pat = match &p.pattern {
+                    Some(x) => format!(
+                        "{}（a={:.4}、b={:.2} 元、R²={:.4}、n={}{}）",
+                        numeric_pattern_cn(&x.kind),
+                        x.a,
+                        x.b,
+                        x.r2,
+                        x.n,
+                        if x.corroborated { "、辅证成立" } else { "" }
+                    ),
+                    None => "—（未达门槛）".to_string(),
+                };
+                let cor = match &p.correlation {
+                    Some(c) => format!(
+                        "Pearson r={:.4}、Spearman ρ={:.4}、比值 CV={}",
+                        c.pearson,
+                        c.spearman,
+                        match c.ratio_cv {
+                            Some(cv) => format!("{:.3}%", cv * 100.0),
+                            None => "—".to_string(),
+                        }
+                    ),
+                    None => "—（可比条目不足或方差为 0）".to_string(),
+                };
+                let _ = write!(
+                    h,
+                    "<tr><td>{} ↔ {}</td><td style=\"text-align:left\">{}</td><td style=\"text-align:left\">{}</td></tr>",
+                    e(&p.a), e(&p.b), e(&pat), e(&cor)
+                );
+            }
+            h.push_str("</table>");
+            // §1.5 强制文案（随数据下发，去重后原样引用）：规律性只是线索、相关性须与比值 CV 同屏
+            let mut notes: Vec<&str> = Vec::new();
+            for p in &nm.pairs {
+                for n in [
+                    p.pattern.as_ref().map(|x| x.note.as_str()),
+                    p.correlation.as_ref().map(|c| c.note.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !n.is_empty() && !notes.contains(&n) {
+                        notes.push(n);
+                    }
+                }
+            }
+            for n in notes {
+                let _ = write!(h, "<p class=\"muted\">{}</p>", e(n));
+            }
+        }
+        // 共享算术错误清单（逐条 + §1.5 人工核对提示）
+        let errs: Vec<(&str, &str, &crate::export::data::NumericArithError)> = nm
+            .pairs
+            .iter()
+            .flat_map(|p| p.shared_arith_errors.iter().map(move |x| (p.a.as_str(), p.b.as_str(), x)))
+            .collect();
+        if !errs.is_empty() {
+            let _ = write!(h, "<p style=\"margin-top:14px\"><b>共享算术错误清单（{} 条）</b></p>", errs.len());
+            h.push_str(
+                "<p class=\"muted\">同一清单项在两份文件中工程量、综合单价与（算错的）合价三者到分全等。\
+                 检测已排除可由常见舍入规则解释的差值；请核对是否源自同一计价软件舍入惯例或招标文件，\
+                 单条命中不构成串通投标认定。</p>",
+            );
+            h.push_str(
+                "<table><tr><th>文档对</th><th>清单项</th><th>工程量</th><th>综合单价</th><th>报出合价</th><th>应为</th><th>原文锚点</th></tr>",
+            );
+            for (a, b, x) in errs {
+                let _ = write!(
+                    h,
+                    "<tr><td>{} ↔ {}</td><td style=\"text-align:left\">{}</td><td>{}</td><td>{:.2}</td><td style=\"background:#F7D4D4;color:#8B2E2E\">{:.2}</td><td>{:.2}</td><td class=\"muted\" style=\"text-align:left;font-size:11px\">{}</td></tr>",
+                    e(a),
+                    e(b),
+                    e(&numeric_item_label(x.name.as_deref(), &x.align_key)),
+                    x.qty,
+                    x.unit_price,
+                    x.total,
+                    x.expected_total,
+                    e(&x.chunk_ids.join(" / "))
+                );
+            }
+            h.push_str("</table>");
+        }
+        // 逐文档单价尾数分布（Benford 首位检验已砍，仅分位/角位均匀性 + 0/5 尾占比）
+        if nm.docs.iter().any(|d| d.digit_stats.is_some()) {
+            h.push_str("<p style=\"margin-top:14px\"><b>逐文档单价尾数分布</b></p>");
+            h.push_str(
+                "<table><tr><th>编号</th><th>样本</th><th>分位 χ²</th><th>角位 χ²</th><th>临界值</th><th>0/5 尾占比</th><th>结论</th></tr>",
+            );
+            for d in &nm.docs {
+                let Some(ds) = &d.digit_stats else { continue };
+                let g = |k: &str| ds.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+                let clustered =
+                    ds.get("clustered").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                let _ = write!(
+                    h,
+                    "<tr><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{:.3}</td><td>{:.0}%</td><td>{}</td></tr>",
+                    d.tag,
+                    g("n") as i64,
+                    g("centChiSquare"),
+                    g("jiaoChiSquare"),
+                    g("critical"),
+                    g("zeroFiveRatio") * 100.0,
+                    if clustered { "尾数聚集" } else { "未见聚集" }
+                );
+            }
+            h.push_str("</table>");
+            h.push_str(
+                "<p class=\"muted\">尾数聚集反映报价的取整习惯（如统一取整到角/元），单独不构成串通认定，\
+                 需结合取证类证据；本工具未做 Benford 首位检验（单价通常只跨 2–3 个数量级，前提不成立）。</p>",
+            );
+        }
+    }
+
     // 取证证据（附录 A forensic 节；无命中不渲染——§1.5 不留空表沉默背书）
     if let Some(f) = &data.forensic {
         h.push_str("<h2>取证证据</h2>");
@@ -416,6 +571,33 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     );
     h.push_str("</body></html>");
     std::fs::write(path, h).map_err(|e| e.to_string())
+}
+
+/// 规律性差异形态的中文标签（numeric.pairs[].pattern.kind）。
+fn numeric_pattern_cn(kind: &str) -> &str {
+    match kind {
+        "arith_seq" => "等差（各项差额恒定）",
+        "geo_discount" => "等比 / 恒定折扣（各项系数恒定）",
+        "affine" => "仿射（系数与差额均非平凡）",
+        other => other,
+    }
+}
+
+/// 雷同率缺席原因的中文标签（numeric.pairs[].reason）。
+fn numeric_reason_cn(reason: Option<&str>) -> &str {
+    match reason {
+        Some("insufficient") => "可比条目不足，不出结论",
+        Some(other) => other,
+        None => "无可比条目",
+    }
+}
+
+/// 清单项可读标签：优先项目名称，回落对齐键（编码/名称+单位）。
+fn numeric_item_label(name: Option<&str>, align_key: &str) -> String {
+    match name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => format!("{n}（{align_key}）"),
+        None => align_key.to_string(),
+    }
 }
 
 /// 取证命中类型中文标签（forensic.hits[].kind）。

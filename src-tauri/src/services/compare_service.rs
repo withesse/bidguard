@@ -3,13 +3,13 @@
 // 并查集聚类 → 八类分类 + 分级 diff → 单事务落库 → 矩阵/围标/共有词/章节热力聚合。
 // 取消或失败时清掉本任务的全部半成品。
 use crate::db::repo::compare_repo::{self, NewCluster, NewDiff, NewEdge, NewMember};
-use crate::db::repo::{chunk_repo, document_repo, embedding_repo, image_repo, job_repo};
+use crate::db::repo::{boq_repo, chunk_repo, document_repo, embedding_repo, image_repo, job_repo};
 use crate::db::repo::document_repo::DocumentRow;
 use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
 use crate::engine::{
-    align, background, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring,
+    align, background, boq, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring,
     verbatim, winnow,
 };
 use crate::error::{AppError, AppErrorCode, AppResult};
@@ -54,10 +54,23 @@ pub struct CompareRunConfig {
     /// （新增证据层，不替代聚类）。CompareSetup 暂不暴露，走默认开启。旧任务无此键 → serde 默认 true。
     #[serde(default = "default_true")]
     pub enable_alignment: bool,
+    /// 商务标数值层（W5-1，M6）：报价清单识别 + 跨文档行对齐 → boq_items。
+    /// 固定读 paragraph 级 table_row（不受 chunk_level/scope 影响），无清单表时空转。
+    /// 旧任务 config_json 无此键 → serde 默认 true（口径与新任务一致）。
+    #[serde(default = "default_true")]
+    pub enable_numeric: bool,
+    /// 逐项单价雷同率告警线（W5-2，M6）。默认 0.80，随 config_json 快照持久化，保证报告可复现
+    /// （改了全局默认后重开旧任务，仍按当时的线渲染告警）。旧任务无此键 → serde 默认 0.80。
+    #[serde(default = "default_identical_rate_alarm")]
+    pub identical_rate_alarm: f64,
 }
 
 fn default_embedding_model() -> String {
     "bge-zh".to_string()
+}
+
+pub fn default_identical_rate_alarm() -> f64 {
+    0.80
 }
 
 pub fn default_verbatim_min_chars() -> usize {
@@ -98,6 +111,17 @@ pub struct CompareSummary {
     pub zone_tech_count: usize,
     pub zone_business_count: usize,
     pub zone_other_count: usize,
+    // —— 商务标数值层（W5-1，M6）：无清单表（纯技术标/扫描件 PDF）时全为 0，前端据此隐藏面板。
+    /// 解析出的报价清单条目总数（各家之和）。
+    pub boq_item_count: usize,
+    /// 归入跨文档对齐组（≥2 份文档共有）的条目数。
+    pub boq_aligned_item_count: usize,
+    /// 对齐率 = 对齐条目数 / 条目总数。对齐率本身即证据：连非标措施项的拆分方式都一致，
+    /// 是「同一单位编制」的结构性信号（判读仍需结合取证类证据，不单独定性）。
+    pub boq_align_rate: f64,
+    /// 识别为报价清单的表数 / 因表头未识别或列数不一致被跳过的表数。
+    pub boq_table_count: usize,
+    pub boq_skipped_table_count: usize,
 }
 
 /// 每 chunk 的可选语义向量（None=该 chunk 无嵌入，如模型缺失或文本为空）。
@@ -655,6 +679,20 @@ fn run_inner(
         apply_fact_conflicts(&comparable, &raw, &mut new_clusters, &mut fact_rows);
     }
 
+    // 6.7) 商务标数值层地基（W5-1，M6）：报价清单识别与跨文档行对齐。
+    //   固定读 paragraph 级 table_row（不走 cfg.chunk_level 与 scope 过滤——技术标比对时数值层
+    //   仍要能跑），与文本层完全解耦：不消费 edges/聚类，也不改动 M4 的 price 区表格行聚类通道
+    //   （fact.rs 的金额事实冲突照旧）。扫描件 PDF 走 OCR 不产表格行 → 此处自然为空，静默跳过。
+    let boq_out = if cfg.enable_numeric {
+        ctx.progress("boq", 0, 1, "报价清单识别与行对齐");
+        compute_boq(ctx, &docs, cfg.identical_rate_alarm)?
+    } else {
+        BoqOutcome::default()
+    };
+    let (boq_rows, boq_stats, boq_pairs, boq_digits) =
+        (boq_out.rows, boq_out.stats, boq_out.pairs, boq_out.digits);
+    ctx.check()?;
+
     // 基准模式：基准文档中无任何近似命中的分块 → deleted 单块条目
     let deleted = if let Some(bi) = base_idx {
         build_deleted(&comparable, &docs, &raw, &best, bi)
@@ -683,6 +721,7 @@ fn run_inner(
         compare_repo::insert_exemptions(&tx, &ctx.job_id, &exemptions)?;
         compare_repo::insert_verbatim_matches(&tx, &ctx.job_id, &verbatim_rows)?;
         compare_repo::insert_segments(&tx, &ctx.job_id, &segment_rows)?;
+        boq_repo::insert_items(&tx, &ctx.job_id, &boq_rows)?;
         crate::db::repo::fact_repo::replace_for_chunks(&tx, &fact_rows)?;
         tx.commit()?;
     }
@@ -795,8 +834,18 @@ fn run_inner(
         })
         .collect();
     let r_shared: Vec<SharedTerm> = shared.clone();
-    // 报价梯度信号：金额接近但不同 + 多处条款雷同（典型陪标价特征）
-    let price_pairs = price_proximity(&comparable, docs.len(), &raw);
+    // 商务标数值层证据（W5-6，M6）：由 W5-2/3/4 产物聚合。拿不到任何清单条目（纯技术标 /
+    // 扫描件 PDF 的 OCR 路径 / 数值层关闭）→ None，此时旧「报价梯度」回落信号照常触发。
+    let numeric_evidence = (boq_stats.item_count > 0).then(|| {
+        numeric_evidence_of(&boq_pairs, cfg.identical_rate_alarm)
+    });
+    // 报价梯度信号（M6 起为回落信号）：仅在无任何 BOQ 数据时计算——有清单时由数值层取代，
+    // 连启发式扫描都省掉（PRICE_EXCLUDE 排除法易被业绩金额劫持，白算还多一份误导性中间态）。
+    let price_pairs = if numeric_evidence.is_none() {
+        price_proximity(&comparable, docs.len(), &raw)
+    } else {
+        Vec::new()
+    };
     // M2 规避：各文档规避特征摘要（与 doc_infos/docs 同序），独立信号在 FORENSIC_CAP 之外
     let evasion: Vec<Option<EvasionSummary>> = doc_infos.iter().map(|d| d.evasion.clone()).collect();
     let collusion = collusion::assess_with(collusion::CollusionInputs {
@@ -813,6 +862,7 @@ fn run_inner(
         // 条件化硬命中 floor 启用前提（§1.5）：招标文件已导入且豁免对减已生效
         // （tender_refs=Some ⇒ 上述三处豁免均已作用于本轮信号提取）。
         tender_exemption_active: tender_refs.is_some(),
+        numeric: numeric_evidence.as_ref(),
     });
 
     let mut summary = CompareSummary {
@@ -822,6 +872,11 @@ fn run_inner(
         semantic_degraded,
         tender_ref_chunk_count: exemptions.iter().filter(|e| e.kind == "tender").count(),
         background_exempt_chunk_count: background_exempt_count,
+        boq_item_count: boq_stats.item_count,
+        boq_aligned_item_count: boq_stats.aligned_item_count,
+        boq_align_rate: boq_stats.align_rate,
+        boq_table_count: boq_stats.table_count,
+        boq_skipped_table_count: boq_stats.skipped_table_count,
         ..Default::default()
     };
     for c in new_clusters.iter().chain(deleted.iter()) {
@@ -881,6 +936,39 @@ fn run_inner(
         "segmentPeak": seg_peak,
         "mode": matrix_mode,
     });
+    // 商务标数值证据（W5-2，M6）：逐项单价雷同率矩阵 + 共享算术错误明细。
+    // 无任何清单条目（纯技术标 / 扫描件 PDF 的 OCR 路径 / 数值层关闭）→ 写 NULL，前端隐藏面板。
+    // 措辞随数据一起落库（notes）：§1.5 要求告警文案与「需人工核对」提示不得在任何呈现层被丢掉。
+    let numeric_json: Option<String> = (boq_stats.item_count > 0).then(|| {
+        serde_json::json!({
+            "documentIds": cfg.document_ids,
+            "identicalRateAlarm": cfg.identical_rate_alarm,
+            "minComparable": boq::MIN_COMPARABLE,
+            "itemCount": boq_stats.item_count,
+            "alignedItemCount": boq_stats.aligned_item_count,
+            "pairs": boq_pairs,
+            // 单文档尾数分布（W5-3）：docIndex 与 documentIds 同序，缺席=单价样本不足不出结论。
+            "docs": docs
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    serde_json::json!({
+                        "docIndex": i,
+                        "documentId": d.id,
+                        "digitStats": boq_digits.get(i).and_then(|s| s.as_ref()),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "notes": {
+                "identicalRate": "逐项单价雷同率（参照地方雷同认定口径，针对逐项单价相同率）。\
+达到告警线仅表示需重点核查，不构成串通投标认定。",
+                "sharedArithError": "共享算术错误：请核对是否源自同一计价软件舍入惯例或招标文件。",
+                "coverage": "数值层仅覆盖 xlsx / docx / 文本 PDF 中可识别的报价清单表；\
+扫描件 PDF 走 OCR 不产表格行，不在覆盖范围内。",
+            },
+        })
+        .to_string()
+    });
     // 罕见词 + 共同错误指纹并入同一 shared_terms_json 通道（错误条目 kind="sharedErrors"）
     let mut shared_out = shared;
     shared_out.extend(shared_errors);
@@ -894,6 +982,7 @@ fn run_inner(
             &serde_json::to_string(&collusion).unwrap_or_default(),
             &serde_json::to_string(&shared_out).unwrap_or_default(),
             &serde_json::to_string(&sections).unwrap_or_default(),
+            numeric_json.as_deref(),
         )?;
     }
     ctx.progress("done", 1, 1, "完成");
@@ -949,6 +1038,157 @@ fn compute_verbatim(
         })
         .collect();
     Ok(rows)
+}
+
+/// 数值层落库前的统计（进 CompareSummary，前端据此决定是否展示数值面板）。
+#[derive(Debug, Clone, Default)]
+struct BoqStats {
+    item_count: usize,
+    aligned_item_count: usize,
+    align_rate: f64,
+    table_count: usize,
+    skipped_table_count: usize,
+}
+
+/// 报价清单识别与跨文档行对齐（W5-1，M6）：为每份参评文档加载 paragraph 级表格行
+/// （chunk_repo::load_table_rows，不受 cfg.chunk_level/scope 影响），交 boq::extract_document
+/// 解析成条目、boq::align 跨文档对齐，产出待落库行与统计。
+/// 无表格行（纯文本标书 / 扫描件 PDF 的 OCR 路径）时逐份返回空，整体静默跳过。
+/// compute_boq 的产物：待落库条目行、摘要统计、文档对统计（W5-2/3/4）与单文档尾数分布（W5-3）。
+#[derive(Default)]
+struct BoqOutcome {
+    rows: Vec<boq_repo::NewBoqItem>,
+    stats: BoqStats,
+    pairs: Vec<boq::PairStats>,
+    /// 与 docs 同序；单价样本不足 boq::DIGIT_MIN_N 的文档为 None（不出结论）。
+    digits: Vec<Option<boq::DigitStats>>,
+}
+
+fn compute_boq(
+    ctx: &JobCtx,
+    docs: &[DocumentRow],
+    identical_rate_alarm: f64,
+) -> AppResult<BoqOutcome> {
+    let extracts: Vec<boq::DocExtract> = {
+        let conn = ctx.db.get()?;
+        docs.iter()
+            .map(|d| {
+                let rows: Vec<boq::TableRowInput> = chunk_repo::load_table_rows(&conn, &d.id)?
+                    .into_iter()
+                    .map(|r| boq::TableRowInput {
+                        chunk_id: r.id,
+                        text: r.text,
+                        page: r.page,
+                        order_index: r.order_index,
+                    })
+                    .collect();
+                Ok(boq::extract_document(&rows))
+            })
+            .collect::<AppResult<Vec<_>>>()?
+    };
+    let per_doc: Vec<Vec<boq::BoqItem>> = extracts.iter().map(|e| e.items.clone()).collect();
+    let aligned = boq::align(&per_doc);
+    let item_count: usize = per_doc.iter().map(|i| i.len()).sum();
+    let stats = BoqStats {
+        item_count,
+        aligned_item_count: aligned.aligned_item_count(),
+        align_rate: aligned.align_rate(item_count),
+        table_count: extracts.iter().map(|e| e.tables).sum(),
+        skipped_table_count: extracts.iter().map(|e| e.skipped.len()).sum(),
+    };
+    let mut rows: Vec<boq_repo::NewBoqItem> = Vec::with_capacity(item_count);
+    for (di, items) in per_doc.iter().enumerate() {
+        for (ii, it) in items.iter().enumerate() {
+            rows.push(boq_repo::NewBoqItem {
+                doc_index: di as i64,
+                document_id: docs[di].id.clone(),
+                chunk_id: it.chunk_id.clone(),
+                align_key: aligned.keys[di][ii].clone(),
+                code: it.code.clone(),
+                name: it.name.clone(),
+                unit: it.unit.clone(),
+                qty: it.qty,
+                unit_price: it.unit_price,
+                total_price: it.total_price,
+                row_index: ii as i64,
+                page: it.page,
+                flags: it.flags.clone(),
+            });
+        }
+    }
+    // 文档对数值统计（W5-2/3/4）：逐项单价雷同率 + 共享算术错误 + 规律性差异 + 相关性 + 散点。
+    // 纯函数、无 IO，与落库解耦。
+    let pairs = boq::pair_stats(&per_doc, &aligned, identical_rate_alarm);
+    // 单文档尾数分布（W5-3）：只取非暂估价/信息价类的单价——招标人给定价的取整习惯不是投标人的。
+    let digits: Vec<Option<boq::DigitStats>> = per_doc
+        .iter()
+        .map(|items| boq::digit_stats(&boq::bidder_unit_prices(items)))
+        .collect();
+    Ok(BoqOutcome { rows, stats, pairs, digits })
+}
+
+/// 把逐对数值统计（W5-2/3/4）聚合成围标判定用的数值证据（W5-6）。
+///
+/// 聚合口径（与其余信号一致：同类证据只记一次，取全文档集最强值）：
+/// - 雷同率取跨对最大值及其文档对；
+/// - 共享算术错误按【清单项 align_key 跨对去重】计数——「相互独立」= 不同清单项，
+///   同一项在多对里重复命中只算一条（§1.5：≥2 条独立才给满档）；
+/// - 规律性优先取有辅证（比值 CV / 差值极差达强佐证线）的那一对，其次取首个命中；
+/// - 相关性只收【r>0.99 且比值 CV<0.5%】双条件同时成立的对——单看 r 高是噪声（投标人
+///   单价天然同源）；
+/// - mechanism_flip_prob 恒 None（W5-5 后置二期，缺席 ⇒ 该信号不出）。
+///
+/// pairs 由 boq::pair_stats 按 (a,b) 升序产出，故并列时「先到先得」是确定性的。
+pub(crate) fn numeric_evidence_of(
+    pairs: &[boq::PairStats],
+    alarm_line: f64,
+) -> collusion::NumericEvidence {
+    let mut ev = collusion::NumericEvidence {
+        identical_alarm_line: alarm_line as f32,
+        ..Default::default()
+    };
+    let mut error_keys: BTreeSet<&str> = BTreeSet::new();
+    let mut best_pattern_corroborated = false;
+    for p in pairs {
+        if let Some(rate) = p.identical_rate {
+            if ev.max_identical_rate.is_none_or(|m| rate as f32 > m) {
+                ev.max_identical_rate = Some(rate as f32);
+                ev.max_identical_pair = Some((p.a, p.b));
+            }
+        }
+        if !p.shared_arith_errors.is_empty() {
+            ev.shared_arith_error_pairs.push((p.a, p.b));
+            for e in &p.shared_arith_errors {
+                error_keys.insert(e.align_key.as_str());
+            }
+        }
+        if let Some(pat) = &p.pattern {
+            if ev.regularity_kind.is_none() || (pat.corroborated && !best_pattern_corroborated) {
+                ev.regularity_kind = Some(pat.kind.as_str().to_string());
+                ev.regularity_pair = Some((p.a, p.b));
+                ev.regularity_coeff = Some(match pat.kind {
+                    boq::PatternKind::ArithSeq => pat.b,
+                    _ => pat.a,
+                });
+                best_pattern_corroborated = pat.corroborated;
+            }
+        }
+        if let Some(c) = &p.correlation {
+            let cv_ok = c
+                .ratio_cv
+                .is_some_and(|cv| cv < collusion::NUMERIC_CORRELATION_CV_MAX);
+            if cv_ok
+                && c.pearson > collusion::NUMERIC_CORRELATION_R_MIN
+                && ev.max_pearson_with_low_ratio_cv.is_none_or(|m| c.pearson as f32 > m)
+            {
+                ev.max_pearson_with_low_ratio_cv = Some(c.pearson as f32);
+                ev.correlation_pair = Some((p.a, p.b));
+                ev.correlation_ratio_cv = c.ratio_cv;
+            }
+        }
+    }
+    ev.shared_arith_error_count = error_keys.len();
+    ev
 }
 
 /// 语义向量：唯一 normalized_hash 查缓存 → 缺失的批量嵌入并回写。
@@ -1748,6 +1988,8 @@ mod tests {
             allow_model_download: false,
             verbatim_min_chars: 30,
             enable_alignment: true,
+            enable_numeric: true,
+            identical_rate_alarm: default_identical_rate_alarm(),
         }
     }
 
@@ -2440,6 +2682,403 @@ mod tests {
         assert!(detail.members.iter().any(|m| m.text.contains("核心交换机")));
         let cj = detail.conflict_json.as_deref().unwrap();
         assert!(cj.contains("amount") && cj.contains("64000") && cj.contains("78000"), "{cj}");
+    }
+
+    /// 三份 xlsx 报价清单（真实解析器 + 真实分块）→ 跑完整比对。
+    /// 工作表名各带投标人名——否则三份文件字节全同会被导入期按 file_hash 去重成一份。
+    fn boq_e2e_docs(dir: &std::path::Path, prices: &[&str; 3]) -> Vec<String> {
+        [("甲方清单.xlsx", "甲工程量清单"), ("乙方清单.xlsx", "乙工程量清单"), ("丙方清单.xlsx", "丙工程量清单")]
+            .iter()
+            .zip(prices)
+            .map(|((name, sheet), p)| {
+                crate::test_fixtures::write_xlsx_rows(
+                    dir,
+                    name,
+                    sheet,
+                    &[
+                        &["项目编码", "项目名称", "计量单位", "工程量", "综合单价", "合价"],
+                        &["010101001001", "挖一般土方", "m3", "1200", p, "30600.00"],
+                        &["010401003001", "实心砖墙砌筑", "m3", "96", "486.20", "46675.20"],
+                        &["", "夜间施工增加费用", "项", "1", "8600.00", "8600.00"],
+                        &["", "本页小计", "", "", "", "85875.20"],
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn boq_items_land_with_chunk_anchor_and_alignment_e2e() {
+        // 验收 (5)：run_compare 后 boq_items 有行、chunk_id 能 JOIN 回 chunks 取回原文；
+        // 三文档同编码 → 对齐；缺编码的措施项行凭「名称+单位」对齐；小计行不入条目。
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_boq_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = boq_e2e_docs(&dir, &["25.50", "25.50", "26.10"]);
+
+        let jieba = Arc::new(Jieba::new());
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let docs = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap()
+        };
+        assert_eq!(docs.len(), 3);
+        let ids: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_with(ids, 0.5)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let conn = pool.get().unwrap();
+        let items = boq_repo::list_by_job(&conn, &cctx.job_id).unwrap();
+        assert_eq!(items.len(), 9, "三份 × 三条清单项（小计行不入条目）：{items:?}");
+        // 六字段解析到位
+        let first = &items[0];
+        assert_eq!(first.code.as_deref(), Some("010101001001"));
+        assert_eq!(first.name.as_deref(), Some("挖一般土方"));
+        assert_eq!(first.unit.as_deref(), Some("m3"));
+        assert_eq!(first.qty, Some(1200.0));
+        assert_eq!(first.unit_price, Some(25.5));
+        assert_eq!(first.total_price, Some(30600.0));
+        assert!(items.iter().all(|i| i.name.as_deref() != Some("本页小计")));
+
+        // chunk_id 能 JOIN 回 chunks 取原文（下钻举证的锚点）
+        let text: String = conn
+            .query_row("SELECT text FROM chunks WHERE id = ?1", [&first.chunk_id], |r| r.get(0))
+            .unwrap();
+        assert!(text.contains("挖一般土方") && text.contains("010101001001"), "原文锚点：{text}");
+
+        // 全部条目跨三份文档对齐：编码两条 + 无码措施项一条（名称+单位召回）
+        assert!(items.iter().all(|i| i.align_key.is_some()), "全部条目都应对齐：{items:?}");
+        let by_key: std::collections::HashMap<&str, usize> =
+            items.iter().fold(std::collections::HashMap::new(), |mut m, i| {
+                *m.entry(i.align_key.as_deref().unwrap()).or_insert(0) += 1;
+                m
+            });
+        assert_eq!(by_key.len(), 3, "三条清单项各一组：{by_key:?}");
+        assert!(by_key.values().all(|&n| n == 3), "每组三份文档各一条：{by_key:?}");
+        assert!(by_key.keys().any(|k| k.starts_with("n:")), "无码措施项应靠名称+单位召回");
+        let doc_indexes: std::collections::HashSet<i64> =
+            items.iter().map(|i| i.doc_index).collect();
+        assert_eq!(doc_indexes.len(), 3, "doc_index 应覆盖三份文档");
+
+        // 摘要透出条目数与对齐率
+        let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+        let s: CompareSummary = serde_json::from_str(&r.summary_json.unwrap()).unwrap();
+        assert_eq!(s.boq_item_count, 9);
+        assert_eq!(s.boq_aligned_item_count, 9);
+        assert!((s.boq_align_rate - 1.0).abs() < 1e-9);
+        assert_eq!(s.boq_table_count, 3);
+        assert_eq!(s.boq_skipped_table_count, 0);
+    }
+
+    #[test]
+    fn boq_disabled_and_non_boq_docs_produce_no_items() {
+        // enableNumeric=false → 不落任何清单条目；纯文本标书（无表格行）→ 数值层静默空转
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_boq_off_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = boq_e2e_docs(&dir, &["25.50", "25.50", "26.10"]);
+        let jieba = Arc::new(Jieba::new());
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        let cfg = CompareRunConfig { enable_numeric: false, ..cfg_with(ids, 0.5) };
+        run_compare(&cctx, jieba.clone(), Arc::new(Mutex::new(None)), &ws, &cfg).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let conn = pool.get().unwrap();
+            assert!(boq_repo::list_by_job(&conn, &cctx.job_id).unwrap().is_empty());
+            let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+            let s: CompareSummary = serde_json::from_str(&r.summary_json.unwrap()).unwrap();
+            assert_eq!(s.boq_item_count, 0);
+        }
+
+        // 纯文本标书：无 table_row 块 → 数值层空转，比对本身照常完成
+        let ws2 = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w2").unwrap().id
+        };
+        let files = [
+            ("甲.txt", "本技术方案由甲公司编制并对全部条款作出实质性响应与承诺事项。".to_string()),
+            ("乙.txt", "本技术方案由乙公司编制并对全部条款作出实质性响应与承诺事项。".to_string()),
+        ];
+        let (job2, _) = import_and_compare(&pool, &ws2, &files, 0.5);
+        let conn = pool.get().unwrap();
+        assert!(boq_repo::list_by_job(&conn, &job2).unwrap().is_empty());
+        let r = job_repo::get_result_jsons(&conn, &job2).unwrap();
+        let s: CompareSummary = serde_json::from_str(&r.summary_json.unwrap()).unwrap();
+        assert_eq!(s.boq_table_count, 0);
+        assert_eq!(s.boq_skipped_table_count, 0, "无表格行不算「被跳过的表」");
+        assert!(
+            r.numeric_json.is_none(),
+            "无清单条目 → numeric_json 落 NULL（前端隐藏数值面板）"
+        );
+    }
+
+    /// 一份 12 条清单项 + 1 条暂估价行的报价 xlsx。wrong=(行序, 错误合价) 用于制造算术错误。
+    fn numeric_e2e_doc(
+        dir: &std::path::Path,
+        file: &str,
+        sheet: &str,
+        prices: &[f64],
+        wrong: Option<(usize, f64)>,
+    ) -> String {
+        let head: Vec<String> = ["项目编码", "项目名称", "计量单位", "工程量", "综合单价", "合价"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let mut rows: Vec<Vec<String>> = vec![head];
+        for (i, p) in prices.iter().enumerate() {
+            let total = match wrong {
+                Some((w, t)) if w == i => t,
+                _ => 100.0 * p,
+            };
+            rows.push(vec![
+                format!("0101010010{i:02}"),
+                format!("分项工程{i}"),
+                "m3".to_string(),
+                "100".to_string(),
+                format!("{p:.2}"),
+                format!("{total:.2}"),
+            ]);
+        }
+        // 暂估价行：招标人给定单价，各家必然相同 —— 不得进雷同率分母
+        rows.push(
+            ["010101001099", "电梯设备（暂估价）", "台", "2", "300000.00", "600000.00"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        );
+        let refs: Vec<Vec<&str>> =
+            rows.iter().map(|r| r.iter().map(|s| s.as_str()).collect()).collect();
+        let slices: Vec<&[&str]> = refs.iter().map(|r| r.as_slice()).collect();
+        crate::test_fixtures::write_xlsx_rows(dir, file, sheet, &slices)
+    }
+
+    #[test]
+    fn numeric_json_lands_with_identical_rate_and_shared_arith_error_e2e() {
+        // 验收 e2e：run_compare 后 jobs.numeric_json 落库；甲乙 12 项中 11 项单价相同 → alarm；
+        // 暂估价行不进分母（每份 13 条条目、可比数仍为 12）；甲乙同一项合价错得一样 →
+        // sharedArithErrors 命中且携带双方 chunk_id；丙算得对 → 与甲/乙不命中。
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_num_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 甲：第 4 项 100×25.50 应为 2550，错写成 2505
+        let mut pa = [20.0f64; 12];
+        for (i, p) in pa.iter_mut().enumerate() {
+            *p = 20.0 + i as f64;
+        }
+        pa[4] = 25.5;
+        let mut pb = pa;
+        pb[11] += 2.0; // 乙仅末项单价不同 → 11/12 = 0.9167
+        let pc: [f64; 12] = std::array::from_fn(|i| pa[i] + 3.0); // 丙全不同
+        let paths = vec![
+            numeric_e2e_doc(&dir, "甲方清单.xlsx", "甲工程量清单", &pa, Some((4, 2505.0))),
+            numeric_e2e_doc(&dir, "乙方清单.xlsx", "乙工程量清单", &pb, Some((4, 2505.0))),
+            numeric_e2e_doc(&dir, "丙方清单.xlsx", "丙工程量清单", &pc, None),
+        ];
+
+        let jieba = Arc::new(Jieba::new());
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let (ids, names): (Vec<String>, Vec<String>) = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws)
+                .unwrap()
+                .iter()
+                .map(|d| (d.id.clone(), d.file_name.clone()))
+                .unzip()
+        };
+        assert_eq!(ids.len(), 3);
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_with(ids.clone(), 0.5))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let conn = pool.get().unwrap();
+        assert_eq!(boq_repo::list_by_job(&conn, &cctx.job_id).unwrap().len(), 39, "3×13 条条目");
+        let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+        let numeric: serde_json::Value =
+            serde_json::from_str(&r.numeric_json.expect("numeric_json 应落库")).unwrap();
+        assert_eq!(numeric["identicalRateAlarm"], 0.80, "告警线随配置快照落库");
+        assert_eq!(numeric["minComparable"], 10);
+        assert_eq!(numeric["documentIds"].as_array().unwrap().len(), 3);
+        // §1.5：措辞随数据落库，任何呈现层都丢不掉
+        assert!(numeric["notes"]["identicalRate"].as_str().unwrap().contains("参照地方雷同认定口径"));
+        assert!(numeric["notes"]["identicalRate"].as_str().unwrap().contains("不构成串通投标认定"));
+        assert!(numeric["notes"]["sharedArithError"]
+            .as_str()
+            .unwrap()
+            .contains("请核对是否源自同一计价软件舍入惯例或招标文件"));
+
+        let pairs = numeric["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 3, "3 份文档 → 3 个文档对");
+        // pairs 的 a/b 是文档在请求次序里的位次（run_compare 按 cfg.document_ids 装载）
+        let at = |prefix: char| names.iter().position(|n| n.starts_with(prefix)).unwrap();
+        let (ia, ib, ic) = (at('甲'), at('乙'), at('丙'));
+        assert_eq!(numeric["documentIds"][ia].as_str(), Some(ids[ia].as_str()));
+        let ab = pairs
+            .iter()
+            .find(|p| p["a"] == ia.min(ib) && p["b"] == ia.max(ib))
+            .unwrap();
+        assert_eq!(ab["comparable"], 12, "暂估价行不进分母（每份 13 条条目）");
+        assert_eq!(ab["identical"], 11);
+        assert!((ab["identicalRate"].as_f64().unwrap() - 11.0 / 12.0).abs() < 1e-9);
+        assert_eq!(ab["alarm"], true);
+        assert!(ab["reason"].is_null());
+        let errs = ab["sharedArithErrors"].as_array().unwrap();
+        assert_eq!(errs.len(), 1, "唯一一条错得一样的行：{errs:?}");
+        assert_eq!(errs[0]["qty"], 100.0);
+        assert_eq!(errs[0]["unitPrice"], 25.5);
+        assert_eq!(errs[0]["total"], 2505.0);
+        assert_eq!(errs[0]["expectedTotal"], 2550.0);
+        let chunk_ids = errs[0]["chunkIds"].as_array().unwrap();
+        assert_eq!(chunk_ids.len(), 2, "双方 chunk_id 都要带（举证下钻锚点）");
+        for cid in chunk_ids {
+            let text: String = conn
+                .query_row("SELECT text FROM chunks WHERE id = ?1", [cid.as_str().unwrap()], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(text.contains("分项工程4") && text.contains("2505"), "锚回原文行：{text}");
+        }
+        // 丙：单价全不同、合价算得对 → 无雷同告警、无共享算术错误
+        for p in pairs.iter().filter(|p| p["a"] == ic || p["b"] == ic) {
+            assert_eq!(p["identical"], 0);
+            assert_eq!(p["alarm"], false);
+            assert!(p["sharedArithErrors"].as_array().unwrap().is_empty());
+        }
+
+        // —— W5-6 接入围标判定：数值信号进 collusion_json，旧「报价梯度」退场 ——
+        let collusion: crate::engine::report::Collusion =
+            serde_json::from_str(&r.collusion_json.unwrap()).unwrap();
+        let kinds: Vec<&str> = collusion.signals.iter().map(|s| s.kind.as_str()).collect();
+        assert!(kinds.contains(&"numericIdentical"), "雷同率达线应出数值信号：{kinds:?}");
+        let ident = collusion.signals.iter().find(|s| s.kind == "numericIdentical").unwrap();
+        assert!(ident.detail.contains("逐项单价相同率"), "§1.5 口径措辞：{}", ident.detail);
+        assert!(ident.detail.contains("不构成串通投标认定"));
+        let arith = collusion
+            .signals
+            .iter()
+            .find(|s| s.kind == "numericArithError")
+            .expect("唯一一条共享算术错误应出信号");
+        assert!(arith.weight < 0.35, "仅 1 条独立错误 → 单条降档，实际 {}", arith.weight);
+        assert!(arith.detail.contains("计价软件"), "§1.5 人工核对提示：{}", arith.detail);
+        assert!(
+            !kinds.contains(&"facts"),
+            "有 BOQ 数据时旧报价梯度信号应降级退场：{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_json_carries_pattern_correlation_scatter_and_digit_stats_e2e() {
+        // 验收 e2e（W5-3/W5-4）：乙 = 甲×0.97 → 等比/恒定折扣；丙 = 甲+5 → 等差；
+        // 相关性与归一化散点随 pairs 落库（散点以三家中位价归一 → 甲乙点恒为 (1, 0.97)）；
+        // docs[].digitStats 出单文档尾数分布（甲全 0 尾 → 聚集命中）。
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_pat_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pa: Vec<f64> = (0..24).map(|i| 20.0 + i as f64).collect();
+        let pb: Vec<f64> = pa.iter().map(|p| p * 0.97).collect();
+        let pc: Vec<f64> = pa.iter().map(|p| p + 5.0).collect();
+        let paths = vec![
+            numeric_e2e_doc(&dir, "甲方清单.xlsx", "甲工程量清单", &pa, None),
+            numeric_e2e_doc(&dir, "乙方清单.xlsx", "乙工程量清单", &pb, None),
+            numeric_e2e_doc(&dir, "丙方清单.xlsx", "丙工程量清单", &pc, None),
+        ];
+
+        let jieba = Arc::new(Jieba::new());
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let (ids, names): (Vec<String>, Vec<String>) = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws)
+                .unwrap()
+                .iter()
+                .map(|d| (d.id.clone(), d.file_name.clone()))
+                .unzip()
+        };
+        let cctx = ctx_for(&pool, &ws, "compare", false);
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), &ws, &cfg_with(ids.clone(), 0.5))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let conn = pool.get().unwrap();
+        let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+        let numeric: serde_json::Value =
+            serde_json::from_str(&r.numeric_json.expect("numeric_json 应落库")).unwrap();
+        let at = |prefix: char| names.iter().position(|n| n.starts_with(prefix)).unwrap();
+        let (ia, ib, ic) = (at('甲'), at('乙'), at('丙'));
+        let pairs = numeric["pairs"].as_array().unwrap();
+        let pair_of = |x: usize, y: usize| {
+            pairs.iter().find(|p| p["a"] == x.min(y) && p["b"] == x.max(y)).unwrap()
+        };
+
+        // 甲乙：等比/恒定折扣，系数 0.97，比值 CV 佐证成立
+        let ab = pair_of(ia, ib);
+        assert_eq!(ab["pattern"]["kind"], "geo_discount");
+        assert!((ab["pattern"]["a"].as_f64().unwrap() - 0.97).abs() < 1e-6);
+        assert!(ab["pattern"]["r2"].as_f64().unwrap() >= 0.999);
+        assert_eq!(ab["pattern"]["n"], 24);
+        assert_eq!(ab["pattern"]["corroborated"], true);
+        assert!(
+            ab["pattern"]["note"].as_str().unwrap().contains("统一下浮"),
+            "§1.5：规律性线索定位文案必须随数据落库"
+        );
+        // 相关性：r≈1 且比值 CV≈0 —— 文案要求两者同屏判读
+        assert!((ab["correlation"]["pearson"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!((ab["correlation"]["spearman"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!(ab["correlation"]["ratioCv"].as_f64().unwrap() < 1e-9);
+        assert!(ab["correlation"]["note"].as_str().unwrap().contains("比值 CV≈0"));
+        // 散点：以三家中位价（=甲价）归一 → 甲乙点恒为 (1, 0.97)
+        let scatter = ab["scatter"].as_array().unwrap();
+        assert_eq!(scatter.len(), 24, "可比 24 项、未到下采样上限");
+        assert!(scatter.iter().all(|p| {
+            (p["x"].as_f64().unwrap() - 1.0).abs() < 1e-9
+                && (p["y"].as_f64().unwrap() - 0.97).abs() < 1e-9
+        }));
+        assert!(scatter[0]["alignKey"].as_str().is_some_and(|k| !k.is_empty()));
+
+        // 甲丙：等差，差额 5 元
+        let ac = pair_of(ia, ic);
+        assert_eq!(ac["pattern"]["kind"], "arith_seq");
+        assert!((ac["pattern"]["b"].as_f64().unwrap() - 5.0).abs() < 1e-6);
+
+        // docs[].digitStats：甲单价全为整元（0 尾）→ 尾数聚集命中
+        let docs_json = numeric["docs"].as_array().unwrap();
+        assert_eq!(docs_json.len(), 3);
+        assert_eq!(docs_json[ia]["docIndex"], ia);
+        assert_eq!(docs_json[ia]["documentId"].as_str(), Some(ids[ia].as_str()));
+        let ds = &docs_json[ia]["digitStats"];
+        assert_eq!(ds["n"], 24, "暂估价行不进尾数样本");
+        assert_eq!(ds["clustered"], true);
+        assert!((ds["zeroFiveRatio"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+        assert!(ds["note"].as_str().unwrap().contains("不构成串通认定"));
     }
 
     #[test]

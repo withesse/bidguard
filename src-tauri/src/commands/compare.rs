@@ -32,6 +32,10 @@ pub struct CompareRequest {
     pub detect_moved_paragraph: Option<bool>,
     pub scope: Option<String>,
     pub subtract_tender: Option<bool>,
+    /// 商务标数值层（W5-1，M6）：报价清单识别与跨文档行对齐。默认 true（走四层配置合并）。
+    pub enable_numeric: Option<bool>,
+    /// 逐项单价雷同率告警线（W5-2，M6），默认 0.80，取值 clamp 到 0.5–1.0。
+    pub identical_rate_alarm: Option<f64>,
     pub embedding_model: Option<String>,
 }
 
@@ -92,6 +96,11 @@ pub async fn start_compare(
             .unwrap_or(d.detect_moved_paragraph),
         scope,
         subtract_tender: request.subtract_tender.unwrap_or(d.subtract_tender),
+        enable_numeric: request.enable_numeric.unwrap_or(d.enable_numeric),
+        identical_rate_alarm: request
+            .identical_rate_alarm
+            .unwrap_or(d.identical_rate_alarm)
+            .clamp(0.5, 1.0),
         embedding_model: request.embedding_model.unwrap_or(d.embedding_model),
         allow_model_download: cfg_all.security.allow_cloud_model,
         // 逐字层最小字符数（W4-1）：CompareSetup 暂不暴露，走默认 30 汉字。
@@ -158,7 +167,7 @@ fn ensure_participants_are_bid(conn: &rusqlite::Connection, ids: &[String]) -> A
     Ok(())
 }
 
-/// 总览：任务行 + 参评文档（按位次）+ 五块聚合 JSON。
+/// 总览：任务行 + 参评文档（按位次）+ 六块聚合 JSON。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompareSummaryDto {
@@ -170,6 +179,8 @@ pub struct CompareSummaryDto {
     pub collusion: Option<serde_json::Value>,
     pub shared_terms: Option<serde_json::Value>,
     pub sections: Option<serde_json::Value>,
+    /// 商务标数值证据（W5-2，M6）；旧任务/无清单表为 null，前端隐藏数值面板。
+    pub numeric: Option<serde_json::Value>,
 }
 
 #[tauri::command]
@@ -200,6 +211,7 @@ pub async fn get_compare_summary(
         collusion: parse(r.collusion_json),
         shared_terms: parse(r.shared_terms_json),
         sections: parse(r.sections_json),
+        numeric: parse(r.numeric_json),
     })
 }
 

@@ -25,6 +25,7 @@ import { JobsList } from "../screens/JobsList";
 import { ClustersScreen } from "../screens/ClustersScreen";
 import { ClusterDetail } from "../screens/ClusterDetail";
 import { PairSegments } from "../screens/PairSegments";
+import { BusinessNumeric } from "../screens/BusinessNumeric";
 import { DocPreview } from "../screens/DocPreview";
 import { Library } from "../screens/Library";
 import { Tools } from "../screens/Tools";
@@ -98,6 +99,7 @@ function JobView({ view }: { view: "matrix" | "compare" | "export" }) {
       compare: `${base}/compare`,
       clusters: `${base}/clusters`,
       segments: `${base}/segments`,
+      numeric: `${base}/numeric`,
       export: `${base}/export`,
       scan: `${base}/running`,
       tasks: "/starred",
@@ -245,6 +247,7 @@ export const router = createHashRouter([
       { path: "/workspace/:wsId/job/:jobId/compare", element: <JobView view="compare" /> },
       { path: "/workspace/:wsId/job/:jobId/clusters", element: <ClustersScreen /> },
       { path: "/workspace/:wsId/job/:jobId/segments", element: <PairSegments /> },
+      { path: "/workspace/:wsId/job/:jobId/numeric", element: <BusinessNumeric /> },
       { path: "/workspace/:wsId/job/:jobId/cluster/:cid", element: <ClusterDetail /> },
       { path: "/workspace/:wsId/job/:jobId/export", element: <JobView view="export" /> },
       { path: "*", element: <WorkspaceList /> },

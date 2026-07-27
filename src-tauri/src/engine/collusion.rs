@@ -70,6 +70,16 @@ pub fn image_pairs(per_doc: &[Vec<ImageFp>], exempt_hashes: &HashSet<String>) ->
     hits
 }
 
+/// 规律性差异形态的中文标签（boq::PatternKind::as_str 的展示侧映射）。
+fn pattern_kind_cn(kind: &str) -> &str {
+    match kind {
+        "arith_seq" => "等差（各项差额恒定）",
+        "geo_discount" => "等比 / 恒定折扣（各项系数恒定）",
+        "affine" => "仿射（系数与差额均非平凡）",
+        other => other,
+    }
+}
+
 /// 同源图片位置文案：PDF 用页码，docx 内嵌图无页码。
 fn img_loc(page: Option<u32>) -> String {
     match page {
@@ -107,6 +117,10 @@ const SHARED_TERMS_WEIGHT: f32 = 0.1;
 const SHARED_ERRORS_WEIGHT: f32 = 0.25;
 const SHARED_ERRORS_SATURATION: f32 = 5.0; // 加权错误数达 5 即满档
 const SHARED_ERRORS_SHOW_MAX: usize = 3; // detail 最多列出几条疑似错误
+// 报价梯度（旧第 5 信号）——M6 起【降级为回落信号】：仅当本次比对拿不到任何报价清单数据
+// （CollusionInputs.numeric = None：纯技术标 / 扫描件 PDF 的 OCR 路径 / 数值层关闭）时才计权。
+// 有 BOQ 时由数值层四类信号取代：全文最大金额差 <3% 的启发式易被业绩金额劫持，证明力远低于
+// 逐项单价雷同率与共享算术错误（scheme §8.4 已列为已知短板）。
 const PRICE_WEIGHT: f32 = 0.15;
 const PRICE_SHOW_MAX: usize = 3; // 报价梯度对最多列出几对
 // rsid 信号（M1 取证，连续特征）：贡献 = RSID_WEIGHT × x，
@@ -159,6 +173,82 @@ const HARD_HIT_FLOOR_DETAIL: &str = "已扣除招标文件统一下发模板（r
 const EVASION_WEIGHT: f32 = 0.25;
 const EVASION_SHOW_MAX: usize = 5; // detail 最多列出几份命中文档
 
+// —— M6 商务标数值层信号（W5-6，连续特征 x∈[0,1]）——
+// ⚠️ 未经实证校准：以下权重同为经验初值，随其余信号一起进 M7 的统一回测拟合。
+//
+// 共享算术错误：单条【降档】（§1.5 审查修正——同款计价软件的舍入惯例足以让两家在同一行
+// 算出同样的错值），要求 ≥2 条【相互独立】（不同清单项）的错误才给满档 0.35。
+// 检测侧（boq::pair_stats）已先排除可由常见舍入规则解释的差值，此处只做档位。
+const NUMERIC_ARITH_ERROR_WEIGHT: f32 = 0.35;
+const NUMERIC_ARITH_ERROR_SINGLE_WEIGHT: f32 = 0.15;
+/// 给满档所需的相互独立错误条数（§1.5 硬约束）。
+const NUMERIC_ARITH_ERROR_MIN_INDEPENDENT: usize = 2;
+/// 逐项单价雷同率：达告警线起 NUMERIC_IDENTICAL_BASE，按超出幅度线性至 NUMERIC_IDENTICAL_MAX
+/// （满档在 rate=1.0，即逐项单价完全一致）。告警线本身可配（默认 0.80，随任务配置快照）。
+const NUMERIC_IDENTICAL_BASE: f32 = 0.20;
+const NUMERIC_IDENTICAL_MAX: f32 = 0.30;
+/// 规律性差异（等差/等比/仿射）：定位为【线索】，detail 强制附「统一下浮」提示。
+const NUMERIC_PATTERN_WEIGHT: f32 = 0.15;
+/// 相关性：只有 r>0.99 且比值 CV<0.5% 双条件同时成立才计权——投标人单价天然同源
+/// （同一定额库/信息价）会让 r 普遍 0.9+，单看 r 是噪声。
+const NUMERIC_CORRELATION_WEIGHT: f32 = 0.10;
+pub const NUMERIC_CORRELATION_R_MIN: f64 = 0.99;
+pub const NUMERIC_CORRELATION_CV_MAX: f64 = 0.005;
+/// 机制感知反事实（W5-5，【后置二期】）：mechanism_flip_prob 缺席时该信号不出。
+const NUMERIC_MECHANISM_WEIGHT: f32 = 0.15;
+const NUMERIC_MECHANISM_FLIP_MIN: f32 = 0.5;
+/// 数值类信号（雷同率/共享算术错误/规律性/相关性/机制）对总分的合计封顶，【独立于
+/// FORENSIC_CAP】：五类各自满档相加可达 1.05，且逐项雷同的清单行本身已抬高文本相似峰值与
+/// 聚类数（数值证据与文本证据存在结构性双重计数），不封顶则数值层单独即可定案。
+/// ⚠️ 0.45 未经语料校准。各信号 detail 仍呈现原始权重（证明力不受封顶影响）。
+const NUMERIC_CAP: f32 = 0.45;
+/// 共享算术错误 detail 最多列出几对。
+const NUMERIC_ARITH_SHOW_MAX: usize = 3;
+/// §1.5 强制措辞：雷同率口径声明——避免越权定性。
+const NUMERIC_IDENTICAL_NOTE: &str = "该指标为逐项单价相同率（参照地方雷同认定口径，针对逐项单价相同率）；\
+     达到告警线仅表示需重点核查，不构成串通投标认定，最终认定权属评标委员会";
+/// §1.5 强制措辞：共享算术错误须先排除计价软件/招标文件来源。
+const NUMERIC_ARITH_NOTE: &str = "请核对是否源自同一计价软件舍入惯例或招标文件；\
+     检测已排除可由常见舍入规则解释的差值，但仍需人工核对原文";
+/// §1.5 强制措辞：规律性差异只是线索。
+const NUMERIC_PATTERN_NOTE: &str = "规律性差异属线索而非认定：可能源于对同一控制价/定额库的统一下浮，\
+     需结合取证类证据综合判断";
+/// §1.5 强制措辞：相关系数须与比值 CV、散点形态同屏判读。
+const NUMERIC_CORRELATION_NOTE: &str = "投标人单价天然同源会使相关系数普遍偏高：\
+     只有 r>0.99 且比值 CV≈0 才是强证据，须结合散点形态判读";
+
+/// 商务标数值层证据（M6 / W5-6）：由 compare_service 从 boq::PairStats 聚合而来。
+/// 全部字段均为「已聚合到文档集层面」的最强值——数值信号与其它信号一样，同类证据只记一次。
+/// 缺席（None / 0）即该子信号不出，不产生任何分数。
+#[derive(Debug, Clone, Default)]
+pub struct NumericEvidence {
+    /// 跨全部文档对的最大逐项单价雷同率；None = 所有对的可比条目都不足，不出结论。
+    pub max_identical_rate: Option<f32>,
+    /// 上述最大雷同率所在文档对（docs 下标，a<b）。
+    pub max_identical_pair: Option<(usize, usize)>,
+    /// 本次任务生效的雷同率告警线（默认 0.80，可配；随任务配置快照落库，保证报告可复现）。
+    pub identical_alarm_line: f32,
+    /// 【相互独立】的共享算术错误条数：跨全部文档对按清单项（align_key）去重后的条数。
+    /// 同一清单项在多个文档对里重复命中只算一条——独立性口径是「不同清单项」。
+    pub shared_arith_error_count: usize,
+    /// 共享算术错误命中的文档对（去重，按 (a,b) 升序），供 detail 列出。
+    pub shared_arith_error_pairs: Vec<(usize, usize)>,
+    /// 规律性差异形态（"arith_seq" | "geo_discount" | "affine"）；None = 未达门槛。
+    pub regularity_kind: Option<String>,
+    pub regularity_pair: Option<(usize, usize)>,
+    /// 规律性系数：等比取斜率 a（折扣系数），等差取截距 b（恒定差额，元）。仅供 detail 文案。
+    pub regularity_coeff: Option<f64>,
+    /// 【双条件已在构造侧过滤】的最大 Pearson：r>NUMERIC_CORRELATION_R_MIN
+    /// 且比值 CV<NUMERIC_CORRELATION_CV_MAX。单看 r 高不入此字段。
+    pub max_pearson_with_low_ratio_cv: Option<f32>,
+    pub correlation_pair: Option<(usize, usize)>,
+    /// 比值 CV（与上一字段同一对），detail 与 r 同屏展示（§1.5）。
+    pub correlation_ratio_cv: Option<f64>,
+    /// 机制感知反事实基准价的中标翻转概率（W5-5）。【W5-5 已后置二期】：当前恒为 None，
+    /// 该信号不出；字段先行定义以免二期再改 assess_with 签名（§1.2 裁决）。
+    pub mechanism_flip_prob: Option<f32>,
+}
+
 /// assess_with 的统一入参（执行方案 §1.2 裁决：签名只改这一次）。
 /// 后续里程碑将按「连续特征 x∈[0,1]」往此结构体追加字段组——M1 取证 forensic、
 /// M2 规避 evasion、M6 数值 numeric——各工作流只加字段、不再改 assess_with 签名。
@@ -175,7 +265,8 @@ pub struct CollusionInputs<'a> {
     pub docs: &'a [DocInfo],
     /// 多份标书共有的罕见特征词
     pub shared_terms: &'a [SharedTerm],
-    /// 报价梯度接近对（金额接近但条款雷同的「陪标价」候选）
+    /// 报价梯度接近对（金额接近但条款雷同的「陪标价」候选）。
+    /// M6 起为【回落信号】：仅在 numeric = None（拿不到任何清单数据）时计权。
     pub price_pairs: &'a [PriceProximity],
     /// —— M1 取证：rsid 修订标识交集命中对（fingerprint::rsid_pairs 输出，
     /// 已按「共享 ≥3 或 rsidRoot 相同」过滤；豁免减法在 rsid_pairs 侧完成）——
@@ -197,6 +288,10 @@ pub struct CollusionInputs<'a> {
     /// 仅当为 true 时启用条件化硬命中 floor（见 HARD_HIT_FLOOR_LEVEL）；Default=false ⇒
     /// 招标文件不存在/未开对减时硬命中只作信号展示、不设等级下限——
     pub tender_exemption_active: bool,
+    /// —— M6 数值：商务标数值层证据（compare_service 由 boq::PairStats 聚合）。
+    /// None = 本次拿不到任何报价清单数据（纯技术标 / 扫描件 PDF / 数值层关闭）⇒ 数值四类信号
+    /// 全不出，且旧「报价梯度」回落信号照常触发（保证无清单场景行为不回退）——
+    pub numeric: Option<&'a NumericEvidence>,
 }
 
 pub fn assess_with(inputs: CollusionInputs) -> Collusion {
@@ -212,6 +307,7 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         shared_errors,
         evasion,
         tender_exemption_active,
+        numeric,
     } = inputs;
     let mut signals = Vec::new();
     let mut score = 0.0f32;
@@ -310,9 +406,11 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         });
     }
 
-    // 5) 报价梯度雷同：金额仅差几个百分点 + 多处条款雷同，是典型的围标陪标特征。
-    // 多对接近时全部列出（最多 3 对），权重记一次（同一类证据不叠加）。
-    if !price_pairs.is_empty() {
+    // 5) 报价梯度雷同（【M6 起为回落信号】）：金额仅差几个百分点 + 多处条款雷同，是典型的围标
+    // 陪标特征。仅当拿不到任何报价清单数据（numeric=None）时才计权——有 BOQ 时由数值层的逐项
+    // 雷同率/共享算术错误取代（证明力更高且不会被业绩金额劫持）。多对接近时全部列出（最多 3 对），
+    // 权重记一次（同一类证据不叠加）。
+    if numeric.is_none() && !price_pairs.is_empty() {
         let shown: Vec<String> = price_pairs
             .iter()
             .take(PRICE_SHOW_MAX)
@@ -519,8 +617,145 @@ pub fn assess_with(inputs: CollusionInputs) -> Collusion {
         });
     }
 
+    // 11) 商务标数值层（M6 / W5-6）：四类数值证据 + 后置的机制反事实。合计【独立封顶】
+    //     NUMERIC_CAP 后并入 score（见常量注释：与文本信号存在结构性双重计数）。
+    //     §1.5：每条 detail 都强制携带口径说明/线索定位/人工核对提示，呈现层丢不掉。
+    let mut numeric_total = 0.0f32;
+    if let Some(nm) = numeric {
+        // 11.1 共享算术错误（最强单证据，但单条降档）
+        if nm.shared_arith_error_count > 0 {
+            let independent = nm.shared_arith_error_count >= NUMERIC_ARITH_ERROR_MIN_INDEPENDENT;
+            let w = if independent {
+                NUMERIC_ARITH_ERROR_WEIGHT
+            } else {
+                NUMERIC_ARITH_ERROR_SINGLE_WEIGHT
+            };
+            let pairs_txt: Vec<String> = nm
+                .shared_arith_error_pairs
+                .iter()
+                .take(NUMERIC_ARITH_SHOW_MAX)
+                .map(|(a, b)| format!("「{}」「{}」", stem(*a), stem(*b)))
+                .collect();
+            let grade = if independent {
+                format!(
+                    "共 {} 处【相互独立】的清单项（不同清单项）出现共享算术错误",
+                    nm.shared_arith_error_count
+                )
+            } else {
+                "仅 1 处清单项出现共享算术错误，已按单条降档计权（单条可能源自同款计价软件的舍入惯例）"
+                    .to_string()
+            };
+            numeric_total += w;
+            signals.push(CollusionSignal {
+                kind: "numericArithError".into(),
+                detail: format!(
+                    "报价清单共享算术错误：{}{}——同一清单项的工程量、单价与（算错的）合价三者到分全等。{}；\
+                     未命中不代表清白",
+                    grade,
+                    if pairs_txt.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", pairs_txt.join("、"))
+                    },
+                    NUMERIC_ARITH_NOTE
+                ),
+                weight: w,
+            });
+        }
+
+        // 11.2 逐项单价雷同率（达告警线才计；线性至满档）
+        if let Some(rate) = nm.max_identical_rate {
+            let line = nm.identical_alarm_line;
+            if rate >= line && line < 1.0 {
+                let x = ((rate - line) / (1.0 - line)).clamp(0.0, 1.0);
+                let w = NUMERIC_IDENTICAL_BASE + (NUMERIC_IDENTICAL_MAX - NUMERIC_IDENTICAL_BASE) * x;
+                let who = match nm.max_identical_pair {
+                    Some((a, b)) => format!("「{}」「{}」", stem(a), stem(b)),
+                    None => "参评标书".to_string(),
+                };
+                numeric_total += w;
+                signals.push(CollusionSignal {
+                    kind: "numericIdentical".into(),
+                    detail: format!(
+                        "{}逐项单价雷同率 {:.0}%，已达本次告警线 {:.0}%。{}",
+                        who,
+                        rate * 100.0,
+                        line * 100.0,
+                        NUMERIC_IDENTICAL_NOTE
+                    ),
+                    weight: w,
+                });
+            }
+        }
+
+        // 11.3 规律性差异（等差/等比/仿射）——线索级
+        if let Some(kind) = nm.regularity_kind.as_deref() {
+            let who = match nm.regularity_pair {
+                Some((a, b)) => format!("「{}」「{}」", stem(a), stem(b)),
+                None => "参评标书".to_string(),
+            };
+            let coeff = match (kind, nm.regularity_coeff) {
+                ("geo_discount", Some(a)) => format!("（系数 {a:.4}）"),
+                ("arith_seq", Some(b)) => format!("（恒定差额 {b:.2} 元）"),
+                _ => String::new(),
+            };
+            numeric_total += NUMERIC_PATTERN_WEIGHT;
+            signals.push(CollusionSignal {
+                kind: "numericPattern".into(),
+                detail: format!(
+                    "{}的清单单价呈{}规律{}：逐项差异高度可由单一公式解释。{}",
+                    who,
+                    pattern_kind_cn(kind),
+                    coeff,
+                    NUMERIC_PATTERN_NOTE
+                ),
+                weight: NUMERIC_PATTERN_WEIGHT,
+            });
+        }
+
+        // 11.4 相关性（双条件：r>0.99 且比值 CV<0.5%——构造侧已过滤，此处再防御一次）
+        if let Some(r) = nm
+            .max_pearson_with_low_ratio_cv
+            .filter(|r| *r as f64 > NUMERIC_CORRELATION_R_MIN)
+        {
+            let who = match nm.correlation_pair {
+                Some((a, b)) => format!("「{}」「{}」", stem(a), stem(b)),
+                None => "参评标书".to_string(),
+            };
+            let cv = match nm.correlation_ratio_cv {
+                Some(cv) => format!("、比值变异系数 {:.2}%", cv * 100.0),
+                None => String::new(),
+            };
+            numeric_total += NUMERIC_CORRELATION_WEIGHT;
+            signals.push(CollusionSignal {
+                kind: "numericCorrelation".into(),
+                detail: format!(
+                    "{}的清单单价向量相关系数 r={:.4}{}，同时满足强证据双条件。{}",
+                    who, r, cv, NUMERIC_CORRELATION_NOTE
+                ),
+                weight: NUMERIC_CORRELATION_WEIGHT,
+            });
+        }
+
+        // 11.5 机制感知反事实（W5-5 后置二期）：flip_prob 缺席 ⇒ 本信号不出。
+        if let Some(p) = nm.mechanism_flip_prob.filter(|p| *p >= NUMERIC_MECHANISM_FLIP_MIN) {
+            numeric_total += NUMERIC_MECHANISM_WEIGHT;
+            signals.push(CollusionSignal {
+                kind: "numericMechanism".into(),
+                detail: format!(
+                    "评标机制反事实：剔除嫌疑组后，中标结果在 {:.0}% 的系数取值下发生改变。\
+                     此为反事实解释性证据，不替代评标人判断，最终认定权属评标委员会",
+                    p * 100.0
+                ),
+                weight: NUMERIC_MECHANISM_WEIGHT,
+            });
+        }
+    }
+
     // 取证四类合计封顶后并入总分（防叠满直接 high；各信号 detail 权重不受此影响）
     score += forensic.min(FORENSIC_CAP);
+    // 数值五类合计【独立封顶】后并入总分（同上：detail 权重仍是原始证明力）
+    score += numeric_total.min(NUMERIC_CAP);
     let score = score.clamp(0.0, 1.0);
     let mut level = if score >= LEVEL_HIGH {
         "high"
@@ -1229,6 +1464,253 @@ mod tests {
             c.score
         );
         assert_eq!(c.level, "high", "0.70 ≥ LEVEL_HIGH");
+    }
+
+    // —— M6 数值层信号（W5-6）——
+
+    /// 造一份数值证据：默认告警线 0.80、其余字段缺席（缺席 ⇒ 该子信号不出）。
+    fn numeric_ev() -> NumericEvidence {
+        NumericEvidence { identical_alarm_line: 0.80, ..Default::default() }
+    }
+
+    #[test]
+    fn numeric_single_arith_error_is_downgraded_not_full_weight() {
+        // §1.5 审查修正：1 条共享算术错误可能是同款计价软件的舍入惯例 → 降档，绝不给 0.35。
+        let nm = NumericEvidence {
+            shared_arith_error_count: 1,
+            shared_arith_error_pairs: vec![(0, 1)],
+            ..numeric_ev()
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "numericArithError").expect("应有 numericArithError 信号");
+        assert!(
+            (s.weight - NUMERIC_ARITH_ERROR_SINGLE_WEIGHT).abs() < 1e-6,
+            "单条应降档到 {NUMERIC_ARITH_ERROR_SINGLE_WEIGHT}，实际 {}",
+            s.weight
+        );
+        assert!((s.weight - NUMERIC_ARITH_ERROR_WEIGHT).abs() > 1e-6, "单条不得给满档 0.35");
+        assert!(s.detail.contains("降档"), "detail 应说明已降档：{}", s.detail);
+        assert!(s.detail.contains("计价软件"), "detail 应附计价软件舍入惯例核对提示：{}", s.detail);
+        assert!(s.detail.contains("招标文件"), "detail 应附招标文件来源核对提示");
+        assert!(s.detail.contains("未命中不代表清白"));
+    }
+
+    #[test]
+    fn numeric_two_independent_arith_errors_take_full_weight_and_reach_medium() {
+        // ≥2 条相互独立（不同清单项）→ 满档 0.35 ≥ LEVEL_MEDIUM(0.35) → level ≥ medium。
+        let nm = NumericEvidence {
+            shared_arith_error_count: 2,
+            shared_arith_error_pairs: vec![(0, 1)],
+            ..numeric_ev()
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "numericArithError").expect("应有 numericArithError 信号");
+        assert!((s.weight - NUMERIC_ARITH_ERROR_WEIGHT).abs() < 1e-6, "≥2 条独立 → 满档，实际 {}", s.weight);
+        assert!(s.detail.contains("相互独立"), "detail 应点明独立性口径：{}", s.detail);
+        assert!(matches!(c.level.as_str(), "medium" | "high"), "满档 0.35 → level ≥ medium，实际 {}", c.level);
+    }
+
+    #[test]
+    fn numeric_identical_rate_ramps_from_alarm_line_to_max() {
+        let w_of = |rate: f32| {
+            let nm = NumericEvidence {
+                max_identical_rate: Some(rate),
+                max_identical_pair: Some((0, 1)),
+                ..numeric_ev()
+            };
+            let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+            weight_of(&c, "numericIdentical")
+        };
+        assert!(w_of(0.79).is_none(), "未达告警线不出信号");
+        let at = w_of(0.80).expect("刚好达线应出信号");
+        assert!((at - NUMERIC_IDENTICAL_BASE).abs() < 1e-6, "达线取起档 0.20，实际 {at}");
+        let full = w_of(1.0).unwrap();
+        assert!((full - NUMERIC_IDENTICAL_MAX).abs() < 1e-6, "逐项全等取满档 0.30，实际 {full}");
+        let mid = w_of(0.90).unwrap();
+        assert!((mid - 0.25).abs() < 1e-6, "0.90 → 0.20 + 0.10×0.5 = 0.25，实际 {mid}");
+    }
+
+    #[test]
+    fn numeric_identical_detail_carries_local_criterion_wording() {
+        // §1.5：必须写明「参照地方雷同认定口径，针对逐项单价相同率」，且不得表述为「认定串通」。
+        let nm = NumericEvidence {
+            max_identical_rate: Some(0.92),
+            max_identical_pair: Some((0, 1)),
+            ..numeric_ev()
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "numericIdentical").expect("应有 numericIdentical 信号");
+        assert!(s.detail.contains("逐项单价相同率"), "detail 应写明口径：{}", s.detail);
+        assert!(s.detail.contains("地方雷同认定口径"));
+        assert!(s.detail.contains("不构成串通投标认定"), "§1.5 禁止越权定性：{}", s.detail);
+        assert!(s.detail.contains("评标委员会"));
+        assert!(s.detail.contains("甲") && s.detail.contains("乙"), "detail 应含天干文档对");
+    }
+
+    #[test]
+    fn numeric_identical_with_shared_metadata_reaches_high() {
+        // 验收 (2)：逐项单价雷同率 0.9 + 元数据同源 → high。
+        // 0.9 雷同率意味着单价向量近乎重合，相关性双条件（r>0.99 且比值 CV≈0）必然同时成立——
+        // 这两项是同一事实的两个刻度，构造证据时一并给出才是真实形态。
+        // 0.25（雷同率）+ 0.10（相关性）+ 0.25（元数据）= 0.60 ≥ LEVEL_HIGH。
+        let nm = NumericEvidence {
+            max_identical_rate: Some(0.90),
+            max_identical_pair: Some((0, 1)),
+            max_pearson_with_low_ratio_cv: Some(0.9985),
+            correlation_pair: Some((0, 1)),
+            correlation_ratio_cv: Some(0.001),
+            ..numeric_ev()
+        };
+        let two = vec![doc(vec!["作者相同"]), doc(vec!["作者相同"])];
+        let c = assess_with(CollusionInputs {
+            docs: &two,
+            numeric: Some(&nm),
+            ..Default::default()
+        });
+        assert_eq!(c.level, "high", "score={:.4} 应达 high", c.score);
+    }
+
+    #[test]
+    fn numeric_correlation_requires_both_conditions() {
+        // 只有 r>0.99 才计权：r=0.95（投标人单价天然同源的常态）不出信号。
+        let weak = NumericEvidence {
+            max_pearson_with_low_ratio_cv: Some(0.95),
+            correlation_pair: Some((0, 1)),
+            ..numeric_ev()
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&weak), ..Default::default() });
+        assert!(weight_of(&c, "numericCorrelation").is_none(), "r≤0.99 不计权");
+        let strong = NumericEvidence {
+            max_pearson_with_low_ratio_cv: Some(0.995),
+            correlation_pair: Some((0, 1)),
+            correlation_ratio_cv: Some(0.002),
+            ..numeric_ev()
+        };
+        let c2 = assess_with(CollusionInputs { numeric: Some(&strong), ..Default::default() });
+        let s = c2.signals.iter().find(|s| s.kind == "numericCorrelation").expect("应有相关性信号");
+        assert!((s.weight - NUMERIC_CORRELATION_WEIGHT).abs() < 1e-6);
+        assert!(s.detail.contains("比值变异系数"), "detail 必须与比值 CV 同屏：{}", s.detail);
+        assert!(s.detail.contains("r>0.99 且比值 CV≈0 才是强证据"), "detail 应写明强证据条件");
+    }
+
+    #[test]
+    fn numeric_pattern_signal_is_clue_level_with_uniform_discount_note() {
+        let nm = NumericEvidence {
+            regularity_kind: Some("geo_discount".into()),
+            regularity_pair: Some((0, 2)),
+            regularity_coeff: Some(0.97),
+            ..numeric_ev()
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        let s = c.signals.iter().find(|s| s.kind == "numericPattern").expect("应有 numericPattern 信号");
+        assert!((s.weight - NUMERIC_PATTERN_WEIGHT).abs() < 1e-6);
+        assert!(s.detail.contains("等比"), "detail 应含形态中文标签：{}", s.detail);
+        assert!(s.detail.contains("0.9700"), "detail 应含折扣系数：{}", s.detail);
+        assert!(s.detail.contains("统一下浮"), "§1.5：必须附统一下浮提示：{}", s.detail);
+        assert!(s.detail.contains("线索"), "§1.5：定位为线索而非认定");
+        assert!(s.weight < LEVEL_HIGH, "单信号不得独自达 high 线");
+    }
+
+    #[test]
+    fn numeric_mechanism_signal_absent_when_flip_prob_is_none() {
+        // W5-5 后置二期：mechanism_flip_prob 缺席 ⇒ 该信号不出（不得凭空造分）。
+        let nm = numeric_ev();
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        assert!(weight_of(&c, "numericMechanism").is_none());
+        assert_eq!(c.level, "none");
+        // 二期填入 flip_prob 后信号才出（接口预留有效性验证）
+        let with = NumericEvidence { mechanism_flip_prob: Some(0.83), ..numeric_ev() };
+        let c2 = assess_with(CollusionInputs { numeric: Some(&with), ..Default::default() });
+        let s = c2.signals.iter().find(|s| s.kind == "numericMechanism").expect("flip_prob≥0.5 应出信号");
+        assert!((s.weight - NUMERIC_MECHANISM_WEIGHT).abs() < 1e-6);
+        assert!(s.detail.contains("不替代评标人判断"));
+    }
+
+    #[test]
+    fn numeric_cap_limits_combined_numeric_contribution() {
+        // 验收 (3)：五类数值信号全满（0.35+0.30+0.15+0.10+0.15 = 1.05）时，
+        // 对 score 的合计贡献封顶 NUMERIC_CAP(0.45)，且 score ≤ 1。
+        let nm = NumericEvidence {
+            max_identical_rate: Some(1.0),
+            max_identical_pair: Some((0, 1)),
+            identical_alarm_line: 0.80,
+            shared_arith_error_count: 4,
+            shared_arith_error_pairs: vec![(0, 1)],
+            regularity_kind: Some("geo_discount".into()),
+            regularity_pair: Some((0, 1)),
+            regularity_coeff: Some(0.95),
+            max_pearson_with_low_ratio_cv: Some(0.999),
+            correlation_pair: Some((0, 1)),
+            correlation_ratio_cv: Some(0.0001),
+            mechanism_flip_prob: Some(1.0),
+        };
+        let c = assess_with(CollusionInputs { numeric: Some(&nm), ..Default::default() });
+        let raw: f32 = c
+            .signals
+            .iter()
+            .filter(|s| s.kind.starts_with("numeric"))
+            .map(|s| s.weight)
+            .sum();
+        assert!(raw > NUMERIC_CAP, "各信号 detail 应保留原始权重（合计 {raw} > 封顶）");
+        assert!((c.score - NUMERIC_CAP).abs() < 1e-6, "数值合计应封顶到 {NUMERIC_CAP}，实际 {}", c.score);
+        assert!(c.score <= 1.0);
+    }
+
+    #[test]
+    fn numeric_cap_is_independent_of_forensic_cap() {
+        // 数值封顶与取证封顶各自独立：取证四类叠满(0.45) + 数值五类叠满(0.45) = 0.90。
+        let rsid = [rsid_hit(0, true)];
+        let lineage = [lineage_hit(true, &[])];
+        let images = [
+            ImageHit { a: 0, b: 1, page_a: None, page_b: None, exact: true },
+            ImageHit { a: 0, b: 2, page_a: None, page_b: None, exact: true },
+            ImageHit { a: 1, b: 2, page_a: None, page_b: None, exact: true },
+        ];
+        let errs: Vec<SharedTerm> = (0..5).map(|i| shared_error(&format!("错{i}"), 1.0, None)).collect();
+        let nm = NumericEvidence {
+            max_identical_rate: Some(1.0),
+            max_identical_pair: Some((0, 1)),
+            identical_alarm_line: 0.80,
+            shared_arith_error_count: 3,
+            shared_arith_error_pairs: vec![(0, 1)],
+            regularity_kind: Some("arith_seq".into()),
+            regularity_pair: Some((0, 1)),
+            regularity_coeff: Some(500.0),
+            max_pearson_with_low_ratio_cv: Some(0.999),
+            correlation_pair: Some((0, 1)),
+            correlation_ratio_cv: Some(0.0001),
+            mechanism_flip_prob: Some(0.9),
+        };
+        let c = assess_with(CollusionInputs {
+            rsid_hits: &rsid,
+            lineage_hits: &lineage,
+            image_hits: &images,
+            shared_errors: &errs,
+            numeric: Some(&nm),
+            ..Default::default()
+        });
+        assert!(
+            (c.score - (FORENSIC_CAP + NUMERIC_CAP)).abs() < 1e-6,
+            "两个封顶各自独立：0.45+0.45=0.90，实际 {}",
+            c.score
+        );
+    }
+
+    #[test]
+    fn price_proximity_falls_back_only_without_boq_data() {
+        // 验收 (4)：无 BOQ（numeric=None）→ 旧报价梯度信号照常触发；
+        // 有 BOQ（哪怕数值证据全空）→ 旧信号退场，由数值层接管。
+        let pp = [PriceProximity { a: 0, b: 1, amount_a: 1_000_000, amount_b: 1_020_000, gap_pct: 0.02 }];
+        let without = assess_with(CollusionInputs { price_pairs: &pp, ..Default::default() });
+        assert!((weight_of(&without, "facts").unwrap() - PRICE_WEIGHT).abs() < 1e-6, "无 BOQ 时回落信号照常");
+        let nm = numeric_ev();
+        let with = assess_with(CollusionInputs {
+            price_pairs: &pp,
+            numeric: Some(&nm),
+            ..Default::default()
+        });
+        assert!(weight_of(&with, "facts").is_none(), "有 BOQ 时旧报价梯度信号降级退场");
+        assert_eq!(with.level, "none", "空数值证据不得凭空造分");
     }
 
     #[test]

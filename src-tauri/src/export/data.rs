@@ -39,9 +39,98 @@ pub struct ExportData {
     /// None = 本次比对无任何对齐区段/逐字铁证（旧任务或未开对齐）：不渲染空章节，避免沉默背书。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<SegmentsSection>,
+    /// 商务标数值证据节（附录 A numeric；M6 填充）：逐项单价雷同率、规律性/相关性结论、
+    /// 共享算术错误清单、逐文档尾数分布。None = 本次无任何报价清单数据（纯技术标 / 扫描件
+    /// PDF 的 OCR 路径 / 数值层关闭）：不渲染空章节，避免沉默背书。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub numeric: Option<NumericSection>,
     /// 「检查方法与局限」节：§1.5 硬约束——无论是否命中恒常驻，列已执行检查项 +
     /// 可清除性说明 + 「未命中不构成清白证明」声明，堵住沉默背书。
     pub methods_and_limitations: MethodsAndLimitations,
+}
+
+/// 商务标数值证据节（附录 A numeric：pairs + docs digitStats）。
+/// 数据源是 jobs.numeric_json（比对期落库的事实快照），此处只做天干标签化与结构化，不重算。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericSection {
+    /// 本次任务生效的雷同率告警线（配置快照，报告可复现）。
+    pub identical_rate_alarm: f64,
+    /// 出雷同率结论所需的最小可比条目数。
+    pub min_comparable: usize,
+    pub item_count: usize,
+    pub aligned_item_count: usize,
+    pub pairs: Vec<NumericPairEntry>,
+    pub docs: Vec<NumericDocEntry>,
+    /// §1.5 强制措辞（雷同率口径 / 共享算术错误人工核对 / 数值层覆盖范围声明）：
+    /// 随节下发，任何格式的写器都不得省略。
+    pub notes: Vec<String>,
+}
+
+/// 一对参评文档的数值比对结果（a/b 为天干标签）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericPairEntry {
+    pub a: String,
+    pub b: String,
+    /// 可比条目数（双方均有单价、且非暂估价/信息价类的对齐项）。
+    pub comparable: usize,
+    pub identical: usize,
+    /// None = 可比条目不足，不出结论（reason 给原因）。
+    pub identical_rate: Option<f64>,
+    pub alarm: bool,
+    pub reason: Option<String>,
+    pub pattern: Option<NumericPattern>,
+    pub correlation: Option<NumericCorrelation>,
+    pub shared_arith_errors: Vec<NumericArithError>,
+}
+
+/// 规律性差异（等差/等比/仿射）。note 是 §1.5「统一下浮」线索文案，随数据下发。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericPattern {
+    pub kind: String,
+    pub a: f64,
+    pub b: f64,
+    pub r2: f64,
+    pub n: usize,
+    pub corroborated: bool,
+    pub note: String,
+}
+
+/// 单价向量相关性。ratio_cv 必须与 pearson 同屏（§1.5：只有 r>0.99 且 CV≈0 才是强证据）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericCorrelation {
+    pub n: usize,
+    pub pearson: f64,
+    pub spearman: f64,
+    pub ratio_cv: Option<f64>,
+    pub note: String,
+}
+
+/// 一条共享算术错误（同一清单项双方工程量/单价/算错的合价三者全等）。
+/// chunk_ids 为双方原文锚点，供人工回原文核对。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericArithError {
+    pub align_key: String,
+    pub name: Option<String>,
+    pub qty: f64,
+    pub unit_price: f64,
+    pub total: f64,
+    pub expected_total: f64,
+    pub chunk_ids: Vec<String>,
+}
+
+/// 逐文档数值画像（附录 A docs[]：docId + digitStats）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericDocEntry {
+    pub doc_id: String,
+    pub tag: String,
+    /// 尾数分布检验；None = 单价样本不足，不出结论（原样透传比对期快照）。
+    pub digit_stats: Option<serde_json::Value>,
 }
 
 /// 对齐区段与逐字证据节（附录 A：pairs[{a,b,segments}]，M5 按证据层扩 verbatims 子清单）。

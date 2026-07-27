@@ -4,6 +4,7 @@
 // 矩阵(matrix) + 事实冲突(fact) + 围标判定(collusion) + 指纹(fingerprint)。
 pub mod align;
 pub mod background;
+pub mod boq;
 pub mod candidate;
 pub mod chunker;
 pub mod clustering;

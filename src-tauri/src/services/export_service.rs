@@ -9,7 +9,8 @@ use crate::engine::fingerprint;
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::export::data::{
     EvasionDoc, EvasionSection, ExportCluster, ExportData, ExportDoc, ExportMember, ForensicDoc,
-    ForensicHit, ForensicSection, MethodsAndLimitations, SegmentEntry, SegmentPair,
+    ForensicHit, ForensicSection, MethodsAndLimitations, NumericArithError, NumericCorrelation,
+    NumericDocEntry, NumericPairEntry, NumericPattern, NumericSection, SegmentEntry, SegmentPair,
     SegmentsSection, VerbatimEntry,
 };
 use crate::export::{self};
@@ -198,6 +199,9 @@ pub fn assemble(
     // M5「对齐区段与逐字证据」节：从 segment_repo 取区段摘要 + 逐字区间清单（含页码），
     // 逐对装配为天干标签口径。无区段/逐字 → None（不渲染空章节）。
     let segments = build_segments(conn, job_id, &doc_ids)?;
+    // M6「商务标数值证据」节：原样消费比对期落库的 jobs.numeric_json（不重算，保证报告与
+    // 屏幕、与围标判定同源）。无清单数据 → None（不渲染空章节）。
+    let numeric = build_numeric(r.numeric_json.as_deref(), &doc_ids);
     let methods_and_limitations = MethodsAndLimitations::standard();
 
     let mut data = ExportData {
@@ -220,6 +224,7 @@ pub fn assemble(
         forensic,
         evasion,
         segments,
+        numeric,
         methods_and_limitations,
     };
     apply_export_prefs(conn, &mut data, include_raw_text, include_config)?;
@@ -364,6 +369,124 @@ fn fmt_range(section: Option<&str>, p_start: Option<i64>, p_end: Option<i64>) ->
         (Some(s), None) => s.to_string(),
         (None, Some(p)) => p,
         (None, None) => "—".to_string(),
+    }
+}
+
+/// 装配「商务标数值证据」节（附录 A numeric）：原样消费比对期落库的 jobs.numeric_json，
+/// 只做天干标签化与结构化，【不重算任何指标】——报告与屏幕、与围标判定必须同源同值。
+/// numeric_json 缺失/损坏/无文档对 → None（不渲染空章节，§1.5 避免沉默背书）。
+fn build_numeric(numeric_json: Option<&str>, doc_ids: &[String]) -> Option<NumericSection> {
+    let v: serde_json::Value = serde_json::from_str(numeric_json?).ok()?;
+    let num = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+    let usz = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let pairs: Vec<NumericPairEntry> = v
+        .get("pairs")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().map(numeric_pair_entry).collect())
+        .unwrap_or_default();
+    if pairs.is_empty() {
+        return None;
+    }
+    let docs: Vec<NumericDocEntry> = v
+        .get("docs")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, d)| NumericDocEntry {
+                    doc_id: d
+                        .get("documentId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| doc_ids.get(i).cloned())
+                        .unwrap_or_default(),
+                    tag: crate::export::data_tag(
+                        d.get("docIndex").and_then(serde_json::Value::as_u64).unwrap_or(i as u64)
+                            as usize,
+                    ),
+                    digit_stats: d.get("digitStats").filter(|s| !s.is_null()).cloned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // §1.5 措辞随数据落库（notes 三条），报告原样引用；键序固定以保证导出可复现。
+    let notes: Vec<String> = ["identicalRate", "sharedArithError", "coverage"]
+        .iter()
+        .filter_map(|k| {
+            v.get("notes")?.get(k).and_then(serde_json::Value::as_str).map(str::to_string)
+        })
+        .collect();
+    Some(NumericSection {
+        identical_rate_alarm: num("identicalRateAlarm").unwrap_or(0.0),
+        min_comparable: usz("minComparable"),
+        item_count: usz("itemCount"),
+        aligned_item_count: usz("alignedItemCount"),
+        pairs,
+        docs,
+        notes,
+    })
+}
+
+/// numeric_json 的单个 pair → 导出条目（天干标签化；缺字段按缺省容错，旧任务不炸）。
+fn numeric_pair_entry(p: &serde_json::Value) -> NumericPairEntry {
+    let idx = |k: &str| p.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let usz = |k: &str| p.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let f = |o: &serde_json::Value, k: &str| o.get(k).and_then(serde_json::Value::as_f64);
+    let s = |o: &serde_json::Value, k: &str| {
+        o.get(k).and_then(serde_json::Value::as_str).map(str::to_string)
+    };
+    let pattern = p.get("pattern").filter(|x| !x.is_null()).map(|x| NumericPattern {
+        kind: s(x, "kind").unwrap_or_default(),
+        a: f(x, "a").unwrap_or(0.0),
+        b: f(x, "b").unwrap_or(0.0),
+        r2: f(x, "r2").unwrap_or(0.0),
+        n: x.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        corroborated: x.get("corroborated").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        note: s(x, "note").unwrap_or_default(),
+    });
+    let correlation = p.get("correlation").filter(|x| !x.is_null()).map(|x| NumericCorrelation {
+        n: x.get("n").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize,
+        pearson: f(x, "pearson").unwrap_or(0.0),
+        spearman: f(x, "spearman").unwrap_or(0.0),
+        ratio_cv: f(x, "ratioCv"),
+        note: s(x, "note").unwrap_or_default(),
+    });
+    let shared_arith_errors: Vec<NumericArithError> = p
+        .get("sharedArithErrors")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|e| NumericArithError {
+                    align_key: s(e, "alignKey").unwrap_or_default(),
+                    name: s(e, "name"),
+                    qty: f(e, "qty").unwrap_or(0.0),
+                    unit_price: f(e, "unitPrice").unwrap_or(0.0),
+                    total: f(e, "total").unwrap_or(0.0),
+                    expected_total: f(e, "expectedTotal").unwrap_or(0.0),
+                    chunk_ids: e
+                        .get("chunkIds")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|c| c.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    NumericPairEntry {
+        a: crate::export::data_tag(idx("a")),
+        b: crate::export::data_tag(idx("b")),
+        comparable: usz("comparable"),
+        identical: usz("identical"),
+        identical_rate: f(p, "identicalRate"),
+        alarm: p.get("alarm").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        reason: s(p, "reason"),
+        pattern,
+        correlation,
+        shared_arith_errors,
     }
 }
 
@@ -543,6 +666,8 @@ mod tests {
             allow_model_download: false,
             verbatim_min_chars: 30,
             enable_alignment: true,
+            enable_numeric: true,
+            identical_rate_alarm: 0.80,
         };
         // 与 start_compare 一致：运行配置存入任务行（assemble 从这里取 documentIds）
         let cctx = {
@@ -702,6 +827,7 @@ mod tests {
                 }],
             }),
             segments: None,
+            numeric: None,
             methods_and_limitations: MethodsAndLimitations::standard(),
         };
 
@@ -785,6 +911,7 @@ mod tests {
             forensic: None,
             evasion: None,
             segments,
+            numeric: None,
             methods_and_limitations: MethodsAndLimitations::standard(),
         };
         let data = base(Some(SegmentsSection {
@@ -877,6 +1004,172 @@ mod tests {
         let edp = dir.join("empty.docx");
         crate::export::write(&empty, "docx", edp.to_str().unwrap()).unwrap();
         assert!(!read_docx_xml(&edp).contains("对齐区段与逐字证据"), "空态 DOCX 不含该章节");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 附录 A numeric 节 golden（HTML/DOCX/JSON）：从比对期落库的 numeric_json 原样装配
+    /// 「商务标数值证据」章——雷同率表 + 规律性/相关性结论 + 共享算术错误清单（含 §1.5 提示）
+    /// + 逐文档尾数分布；空态整章省略；两次导出内容一致。
+    #[test]
+    fn numeric_section_renders_in_html_docx_json_and_omits_when_empty() {
+        use crate::engine::report::Collusion;
+        let dir = std::env::temp_dir().join(format!("bg_numexp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 与 compare_service 落库的 numeric_json 同形（含 §1.5 三条 notes）
+        let numeric_json = serde_json::json!({
+            "documentIds": ["d1", "d2"],
+            "identicalRateAlarm": 0.80,
+            "minComparable": 10,
+            "itemCount": 24,
+            "alignedItemCount": 24,
+            "pairs": [{
+                "a": 0, "b": 1,
+                "comparable": 12, "identical": 11,
+                "identicalRate": 11.0 / 12.0,
+                "alarm": true,
+                "reason": null,
+                "sharedArithErrors": [{
+                    "alignKey": "c:010101001004",
+                    "name": "分项工程4",
+                    "qty": 100.0, "unitPrice": 25.5, "total": 2505.0, "expectedTotal": 2550.0,
+                    "chunkIds": ["ck-a", "ck-b"],
+                }],
+                "pattern": {
+                    "kind": "geo_discount", "a": 0.97, "b": 0.0, "r2": 0.9999, "n": 12,
+                    "ratioCv": 0.0001, "diffRange": 3.2, "corroborated": true,
+                    "note": crate::engine::boq::PATTERN_NOTE,
+                },
+                "correlation": {
+                    "n": 12, "pearson": 0.9993, "spearman": 1.0, "ratioCv": 0.0001,
+                    "note": crate::engine::boq::CORRELATION_NOTE,
+                },
+                "scatter": [],
+            }],
+            "docs": [
+                { "docIndex": 0, "documentId": "d1", "digitStats": {
+                    "n": 24, "centChiSquare": 216.0, "jiaoChiSquare": 216.0, "critical": 27.877,
+                    "zeroFiveRatio": 1.0, "clustered": true, "note": crate::engine::boq::DIGIT_NOTE,
+                } },
+                { "docIndex": 1, "documentId": "d2", "digitStats": null },
+            ],
+            "notes": {
+                "identicalRate": "逐项单价雷同率（参照地方雷同认定口径，针对逐项单价相同率）。达到告警线仅表示需重点核查，不构成串通投标认定。",
+                "sharedArithError": "共享算术错误：请核对是否源自同一计价软件舍入惯例或招标文件。",
+                "coverage": "数值层仅覆盖 xlsx / docx / 文本 PDF 中可识别的报价清单表；扫描件 PDF 走 OCR 不产表格行，不在覆盖范围内。",
+            },
+        })
+        .to_string();
+        let section = build_numeric(Some(&numeric_json), &["d1".into(), "d2".into()])
+            .expect("有清单数据应装配出 numeric 节");
+        assert_eq!(section.pairs.len(), 1);
+        assert_eq!(section.pairs[0].a, "甲");
+        assert_eq!(section.pairs[0].b, "乙");
+        assert_eq!(section.notes.len(), 3, "§1.5 三条措辞须原样带出");
+
+        let doc = |tag: &str, name: &str| ExportDoc {
+            tag: tag.into(),
+            name: name.into(),
+            file_type: "xlsx".into(),
+            pages: 1,
+            char_count: 900,
+            parse_method: Some("xlsx".into()),
+            risk_flags: vec![],
+        };
+        let base = |numeric: Option<crate::export::data::NumericSection>| ExportData {
+            report_version: "2.0",
+            app_version: "test",
+            generated_at: "2026-07-11T00:00:00.000Z".into(),
+            workspace_id: "w1".into(),
+            job_id: "j1".into(),
+            job_name: Some("数值导出".into()),
+            documents: vec![doc("甲", "甲方清单.xlsx"), doc("乙", "乙方清单.xlsx")],
+            config: serde_json::json!({}),
+            summary: None,
+            matrix: vec![vec![1.0, 0.9], vec![0.9, 1.0]],
+            peak: 0.9,
+            collusion: Collusion::default(),
+            shared_terms: vec![],
+            sections: vec![],
+            clusters: vec![],
+            pairs: vec![],
+            forensic: None,
+            evasion: None,
+            segments: None,
+            numeric,
+            methods_and_limitations: MethodsAndLimitations::standard(),
+        };
+        let data = base(Some(section));
+
+        let hp = dir.join("n.html");
+        crate::export::write(&data, "html", hp.to_str().unwrap()).unwrap();
+        let html = std::fs::read_to_string(&hp).unwrap();
+        assert!(html.contains("商务标数值证据"), "HTML 应含章节标题");
+        assert!(html.contains("91.7%"), "HTML 应含逐项雷同率");
+        assert!(html.contains("达告警线"), "HTML 应标注告警");
+        assert!(html.contains("参照地方雷同认定口径"), "§1.5 雷同率口径措辞必须出现");
+        assert!(html.contains("不构成串通投标认定"), "§1.5 不得越权定性");
+        assert!(html.contains("等比 / 恒定折扣"), "HTML 应含规律性形态");
+        assert!(html.contains("统一下浮"), "§1.5 规律性线索文案必须出现");
+        assert!(html.contains("只有 r&gt;0.99 且比值 CV≈0 才是强证据"), "§1.5 强证据条件必须出现");
+        assert!(html.contains("共享算术错误清单"), "HTML 应含共享算术错误清单");
+        assert!(html.contains("2505.00") && html.contains("2550.00"), "清单应含报出合价与应为值");
+        assert!(html.contains("ck-a"), "清单应带原文锚点 chunk_id");
+        assert!(
+            html.contains("请核对是否源自同一计价软件舍入惯例或招标文件"),
+            "§1.5 计价软件舍入提示必须随清单出现"
+        );
+        assert!(html.contains("扫描件 PDF"), "§1.5 覆盖范围声明必须出现");
+        assert!(html.contains("尾数聚集"), "HTML 应含逐文档尾数分布结论");
+
+        let hp2 = dir.join("n2.html");
+        crate::export::write(&data, "html", hp2.to_str().unwrap()).unwrap();
+        assert_eq!(html, std::fs::read_to_string(&hp2).unwrap(), "同数据两次导出 HTML 应一致");
+
+        let read_docx_xml = |path: &std::path::Path| {
+            let f = std::fs::File::open(path).unwrap();
+            let mut z = zip::ZipArchive::new(f).unwrap();
+            let mut xml = String::new();
+            std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut xml)
+                .unwrap();
+            xml
+        };
+        let dp = dir.join("n.docx");
+        crate::export::write(&data, "docx", dp.to_str().unwrap()).unwrap();
+        let dxml = read_docx_xml(&dp);
+        assert!(dxml.contains("商务标数值证据"), "DOCX 应含章节标题");
+        assert!(dxml.contains("共享算术错误清单"), "DOCX 应含共享算术错误清单");
+        assert!(dxml.contains("请核对是否源自同一计价软件舍入惯例或招标文件"), "§1.5 提示必须进 DOCX");
+        assert!(dxml.contains("统一下浮"), "§1.5 规律性线索文案必须进 DOCX");
+        assert!(dxml.contains("参照地方雷同认定口径"), "§1.5 雷同率口径必须进 DOCX");
+
+        let jp = dir.join("n.json");
+        crate::export::write(&data, "json", jp.to_str().unwrap()).unwrap();
+        let json = std::fs::read_to_string(&jp).unwrap();
+        assert!(json.contains("\"numeric\""), "JSON 应含 numeric 节");
+        assert!(json.contains("\"identicalRate\""), "numeric.pairs 应含 identicalRate");
+        assert!(json.contains("\"sharedArithErrors\""), "numeric.pairs 应含共享算术错误明细");
+        assert!(json.contains("\"chunkIds\""), "共享算术错误应含 chunk 定位信息");
+        assert!(json.contains("\"digitStats\""), "numeric.docs 应含 digitStats");
+
+        // 空态：无清单数据 → 整章省略、JSON 不含 numeric 键，方法与局限仍常驻。
+        assert!(build_numeric(None, &[]).is_none(), "numeric_json 缺失 → None");
+        assert!(build_numeric(Some("{bad json"), &[]).is_none(), "损坏 JSON 不得炸导出");
+        let empty = base(None);
+        let ehp = dir.join("empty.html");
+        crate::export::write(&empty, "html", ehp.to_str().unwrap()).unwrap();
+        let ehtml = std::fs::read_to_string(&ehp).unwrap();
+        assert!(!ehtml.contains("商务标数值证据"), "无清单数据不渲染该章节");
+        assert!(ehtml.contains("检查方法与局限"), "方法与局限仍常驻");
+        let ejp = dir.join("empty.json");
+        crate::export::write(&empty, "json", ejp.to_str().unwrap()).unwrap();
+        assert!(
+            !std::fs::read_to_string(&ejp).unwrap().contains("\"numeric\""),
+            "空态 JSON 不含 numeric 节"
+        );
+        let edp = dir.join("empty.docx");
+        crate::export::write(&empty, "docx", edp.to_str().unwrap()).unwrap();
+        assert!(!read_docx_xml(&edp).contains("商务标数值证据"), "空态 DOCX 不含该章节");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

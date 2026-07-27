@@ -25,6 +25,13 @@ pub struct CompareDefaults {
     /// 剔除招标文件内容（W3-2 招标对减）：工作区存在招标/补遗文档时，识别投标对招标条款的
     /// 合法逐字应答并从残差比对中剥离；风险分级与围标信号采用剔除后口径。默认开。
     pub subtract_tender: bool,
+    /// 商务标数值层（W5-1，M6）：识别报价清单表、跨文档行对齐并落库为数值证据。
+    /// 无清单表（纯技术标/扫描件 PDF）时自然空转。默认开。
+    pub enable_numeric: bool,
+    /// 逐项单价雷同率告警线（W5-2，M6）。默认 0.80——参照地方（青岛/贵州等）雷同认定口径，
+    /// 但该口径原文针对「电子投标文件相同内容占比」，此处落到「逐项单价相同率」，
+    /// 故仅作告警提示，不作串通认定（§1.5 产品纪律）。可配（0.5–1.0）。
+    pub identical_rate_alarm: f64,
     /// 分词语言：auto（按 CJK 占比逐块判定）| zh（恒 jieba）| en（恒单词切分）。
     pub language: String,
     /// 语义模型：bge-zh（默认）| bge-large-zh | e5-large | e5-small | e5-base（见 engine::embed::MODELS）。
@@ -46,6 +53,8 @@ impl Default for CompareDefaults {
             scope: "full".into(),
             ignore_templates: true,
             subtract_tender: true,
+            enable_numeric: true,
+            identical_rate_alarm: 0.80,
             language: "auto".into(),
             embedding_model: "bge-zh".into(),
         }

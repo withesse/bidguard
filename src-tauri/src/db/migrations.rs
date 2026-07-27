@@ -24,6 +24,8 @@ const MIGRATIONS: &[&str] = &[
     VERBATIM_MATCHES_V18,
     ALIGNED_SEGMENTS_V19,
     SEGMENT_DIFFS_V20,
+    BOQ_ITEMS_V21,
+    JOB_NUMERIC_JSON_V22,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -522,6 +524,46 @@ CREATE TABLE segment_diffs (
 CREATE INDEX idx_segment_diffs_segment ON segment_diffs(segment_id);
 ";
 
+// V21：报价清单条目表（W5-1，M6 商务标数值层地基）。每行是一份参评文档里被识别为报价清单
+// （工程量清单/BOQ）数据行的一个条目：规范六字段（编码/名称/单位/工程量/综合单价/合价）+
+// chunk_id 原文锚点（供下钻 DocPreview 举证、JOIN 回 chunks 取原文）+ align_key 跨文档对齐键
+// （编码前 12/9 位精确 或 名称+单位相似度召回；未跨文档对齐的条目为 NULL）。doc_index 是该
+// 文档在本次任务里的位次（十天干标签口径），row_index 是文档内解析次序（稳定排序用）。
+// 迁移台账（§1 全局裁决 1）：V21=boq_items 表、V22=jobs.numeric_json。
+// job_id/document_id 外键均 ON DELETE CASCADE：删任务/删文档自动清空；delete_job_results
+// 保留 job 行只清结果，故仍需显式 DELETE（与 chunk_exemptions/verbatim_matches 同理）。
+// 纯新表，向后兼容（旧任务无行，前端按空数据隐藏数值面板）。
+const BOQ_ITEMS_V21: &str = "
+CREATE TABLE boq_items (
+  id          TEXT PRIMARY KEY,
+  job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  doc_index   INTEGER NOT NULL,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  chunk_id    TEXT NOT NULL,
+  align_key   TEXT,
+  code        TEXT,
+  name        TEXT,
+  unit        TEXT,
+  qty         REAL,
+  unit_price  REAL,
+  total_price REAL,
+  row_index   INTEGER NOT NULL,
+  page        INTEGER,
+  flags       TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX idx_boq_items_job ON boq_items(job_id);
+CREATE INDEX idx_boq_items_align ON boq_items(job_id, align_key);
+";
+
+// V22：jobs 增 numeric_json（W5-2，M6 商务标数值证据聚合列）。与既有五个结果 JSON 列同性质：
+// 一次比对的数值层结论整体落一列（pairs[]：逐项雷同率、可比/相同条目数、告警标记、共享算术错误
+// 明细含双方 chunk_id）。旧任务该列为 NULL，前端按缺省隐藏数值面板，向后兼容。
+// 迁移台账（§1 全局裁决 1）：V21=boq_items 表、V22=jobs.numeric_json 列。
+const JOB_NUMERIC_JSON_V22: &str = "
+ALTER TABLE jobs ADD COLUMN numeric_json TEXT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1057,112 @@ mod tests {
         let after: i64 =
             conn.query_row("SELECT COUNT(*) FROM segment_diffs", [], |r| r.get(0)).unwrap();
         assert_eq!(after, 0, "删区段后 segment_diffs 应随 FK 级联清空");
+
+        // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn boq_items_migration_cascades_and_is_idempotent() {
+        // 老库（V20：boq_items 出现之前）升级补 V21，表可写；删任务/删文档均级联清空。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..20] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 20).unwrap();
+            tx.commit().unwrap();
+        }
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for id in ["d1", "d2"] {
+            conn.execute(
+                "INSERT INTO documents (id, workspace_id, file_name, file_path, file_hash, file_type,
+                 status, created_at, updated_at)
+                 VALUES (?1, 'w1', 'f', 'p', 'h', 'xlsx', 'parsed', 't', 't')",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j1', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        let ins = "INSERT INTO boq_items (id, job_id, doc_index, document_id, chunk_id, align_key,
+             code, name, unit, qty, unit_price, total_price, row_index, page, flags, created_at)
+             VALUES (?1, 'j1', ?2, ?3, ?4, 'c12:010101001001#0', '010101001001', '挖一般土方',
+             'm3', 100.0, 25.5, 2550.0, 0, 1, NULL, 't')";
+        conn.execute(ins, rusqlite::params!["b1", 0, "d1", "c1"]).unwrap();
+        conn.execute(ins, rusqlite::params!["b2", 1, "d2", "c2"]).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM boq_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+
+        // 删文档 → 该文档的清单条目级联清空
+        conn.execute("DELETE FROM documents WHERE id='d1'", []).unwrap();
+        let after_doc: i64 =
+            conn.query_row("SELECT COUNT(*) FROM boq_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_doc, 1, "删文档后其 boq_items 应级联清空");
+
+        // 删任务 → 全部清单条目级联清空
+        conn.execute("DELETE FROM jobs WHERE id='j1'", []).unwrap();
+        let after_job: i64 =
+            conn.query_row("SELECT COUNT(*) FROM boq_items", [], |r| r.get(0)).unwrap();
+        assert_eq!(after_job, 0, "删任务后 boq_items 应级联清空");
+
+        // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn numeric_json_column_migration_is_idempotent_and_defaults_null() {
+        // 老库（V21：numeric_json 出现之前）升级补 V22：旧任务行该列为 NULL，新值可写可读。
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..21] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 21).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j_old', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        let old: Option<String> = conn
+            .query_row("SELECT numeric_json FROM jobs WHERE id='j_old'", [], |r| r.get(0))
+            .unwrap();
+        assert!(old.is_none(), "旧任务行 numeric_json 应为 NULL（前端据此隐藏数值面板）");
+
+        conn.execute("UPDATE jobs SET numeric_json = ?1 WHERE id='j_old'", ["{\"pairs\":[]}"])
+            .unwrap();
+        let now: Option<String> = conn
+            .query_row("SELECT numeric_json FROM jobs WHERE id='j_old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(now.as_deref(), Some("{\"pairs\":[]}"));
 
         // 幂等
         run(&mut conn).unwrap();
