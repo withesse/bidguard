@@ -54,3 +54,77 @@ export const ZONE_UI: Record<string, { label: string; fg: string; bg: string }> 
 export function zoneUi(s: string | null | undefined) {
   return (s && ZONE_UI[s]) || ZONE_UI.other;
 }
+
+// 复核路由三带（W6-4）：文案是产品硬约束（方案 §1.5-1），三处必须一字不差——
+// 「低优先级抽查 / 需人工复核 / 重点标红」。【禁用「自动放行」「漏检保证」字样】：
+// 共形保证只在合成校准语料的分布上成立，真实标书分布漂移时失效，在监管场景把统计假设
+// 讲成对评标方的承诺有法律暴露。band=null（旧任务/未校准）走 uncalibrated 档，
+// 显示「未校准」而不是留空——空白会被读成「没问题」。
+export const BAND_UI: Record<string, { label: string; fg: string; bg: string; hint: string }> = {
+  flag: {
+    label: "重点标红",
+    fg: "#B54545",
+    bg: "rgba(181,69,69,0.14)",
+    hint: "校准概率高于高位阈值：建议优先复核",
+  },
+  review: {
+    label: "需人工复核",
+    fg: "#6B73C9",
+    bg: "rgba(107,115,201,0.12)",
+    hint: "校准概率位于两条阈值之间：判读不确定，需人工复核",
+  },
+  pass: {
+    label: "低优先级抽查",
+    fg: "#75646C",
+    bg: "rgba(117,100,108,0.10)",
+    hint: "校准概率低于低位阈值：默认排在最后并折叠，条款仍完整保留、可展开可导出，建议抽查",
+  },
+  uncalibrated: {
+    label: "未校准",
+    fg: "#75646C",
+    bg: "rgba(117,100,108,0.08)",
+    hint: "本次比对未启用概率校准（旧任务或校准文件不可用）：按既有风险等级复核",
+  },
+};
+
+export function bandUi(band: string | null | undefined) {
+  return BAND_UI[band ?? "uncalibrated"] ?? BAND_UI.uncalibrated;
+}
+
+// cross-encoder 复核建议（W6-2）：【这是排序建议，不是判读结论】。产品纪律 §1.5-3——
+// cross-encoder 是黑盒模型且训练目标是「检索相关性」，「相关」≠「同源改写」，因此它【不改判
+// 分类】：簇仍是「待复核」，UI 只展示倾向与分数，人工确认后才改分类。文案里一律不出现
+// 「判定 / 认定 / 确认为」这类断言词。
+export const RERANK_DISCLAIMER = "仅为复核排序建议，不改变条款分类，结论需人工确认";
+
+/** 复核建议分 → 倾向徽标（label 形如「AI 复核倾向：洗稿（0.83）」）。null = 未复核。 */
+export function rerankUi(
+  score: number | null | undefined,
+): { label: string; fg: string; bg: string; hint: string } | null {
+  if (score == null || !Number.isFinite(score)) return null;
+  const lean = score >= 0.5 ? "洗稿" : "无关";
+  const strong = score >= 0.5;
+  return {
+    label: `AI 复核倾向：${lean}（${score.toFixed(2)}）`,
+    fg: strong ? "#8A5BA6" : "#75646C",
+    bg: strong ? "rgba(138,91,166,0.12)" : "rgba(117,100,108,0.10)",
+    hint: `交叉编码器复核建议分 ${score.toFixed(2)}：${RERANK_DISCLAIMER}`,
+  };
+}
+
+/** 三带/置信度相关文案的强制限定语（§1.5-1/2）：一处定义，各屏引用。 */
+export const CALIBRATION_QUALIFIER =
+  "在合成校准语料上校准，仅用于复核排序参考，不是串通概率";
+
+/** 分流模式说明（review-all = 本版语料不足以支撑分带，全部按需人工复核）。 */
+export function routingNote(routing: string | undefined, alpha?: number, beta?: number): string {
+  if (routing === "three-band") {
+    const a = Math.round((alpha ?? 0) * 100);
+    const b = Math.round((beta ?? 0) * 100);
+    return `三带分流已启用：低优先级抽查带漏检率目标 α=${a}%、重点标红带误报率目标 β=${b}%，均为在合成校准语料上测得的带内错误率，不是对真实标书的承诺；低优先级抽查带只排序与折叠，不隐藏任何条款。`;
+  }
+  if (routing === "review-all") {
+    return "三带分流未启用：本版校准语料不含「独立编制但表面相似」的难负样本，相似度分在簇的分数区间内无分辨力，据此分流会把几乎所有条款推进同一条带。全部条款按「需人工复核」处理，置信度仅作参考。";
+  }
+  return "本次比对未启用概率校准（旧任务或校准文件不可用）：条款按既有风险等级复核。";
+}

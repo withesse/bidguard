@@ -9,8 +9,8 @@ use crate::engine::clustering::{self, ScoredEdge};
 use crate::engine::corpus::{self, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
 use crate::engine::{
-    align, background, boq, candidate, collusion, diff, embed, fact, fingerprint, matrix, scoring,
-    verbatim, winnow,
+    align, background, boq, calibrate, candidate, collusion, diff, embed, fact, fingerprint, matrix,
+    rerank, scoring, verbatim, winnow,
 };
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
@@ -63,6 +63,18 @@ pub struct CompareRunConfig {
     /// （改了全局默认后重开旧任务，仍按当时的线渲染告警）。旧任务无此键 → serde 默认 0.80。
     #[serde(default = "default_identical_rate_alarm")]
     pub identical_rate_alarm: f64,
+    /// cross-encoder 复核带（W6-2，M7）：对 uncertain 簇跑复核模型产出【复核建议分】。
+    /// 【默认关闭】——模型需按需下载（默认档 int8 ~300MB）、每簇推理有明显延迟，且它只影响
+    /// 复核排序、不影响判读结论。关闭时管线与 M6 逐字节一致。旧任务无此键 → serde 默认 false。
+    #[serde(default)]
+    pub enable_rerank: bool,
+    /// 复核模型档位（见 engine::rerank::RERANK_MODELS）。旧任务无此键 → 默认 int8 基础档。
+    #[serde(default = "default_rerank_model")]
+    pub rerank_model: String,
+}
+
+fn default_rerank_model() -> String {
+    "bge-reranker-base-int8".to_string()
 }
 
 fn default_embedding_model() -> String {
@@ -82,8 +94,13 @@ fn default_true() -> bool {
 }
 
 /// 总览统计（jobs.summary_json）。
+///
+/// serde(default) 是【向后兼容硬要求】：本结构每个里程碑都在加字段，而 summary_json 是历史
+/// 任务落库的快照。没有 default 时，旧任务的 JSON 少一个键就整体反序列化失败 —— 导出侧
+/// `.ok()` 会把它静默吞成 None，旧任务的报告凭空少一节总览。缺键一律取零值（前端与报告按
+/// 「该里程碑未落地」渲染）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct CompareSummary {
     pub document_count: usize,
     pub chunk_count: usize,
@@ -122,6 +139,32 @@ pub struct CompareSummary {
     /// 识别为报价清单的表数 / 因表头未识别或列数不一致被跳过的表数。
     pub boq_table_count: usize,
     pub boq_skipped_table_count: usize,
+    // —— 复核路由三带（W6-4，M7）：四个计数之和恒等于落库簇数（含 deleted）。
+    //    旧任务缺这些键 → 前端按「未校准」渲染（serde default 归零）。
+    /// 低优先级抽查带簇数。【只排序与折叠，不隐藏】：该带的簇一样可筛、可展开、可导出。
+    pub band_pass_count: usize,
+    /// 需人工复核带簇数。
+    pub band_review_count: usize,
+    /// 重点标红带簇数。
+    pub band_flag_count: usize,
+    /// 未校准簇数（校准文件不可用时为全部簇）。
+    pub band_uncalibrated_count: usize,
+    /// 生效校准版本号（随包文件；未校准为空串）——设置页与报告脚注据此追溯。
+    pub calibration_version: String,
+    /// 校准来源标签（experimental-synthetic = 合成语料拟合；空 = 未校准）。
+    pub calibration_kind: String,
+    /// 分流模式：three-band = 三带生效；review-all = 分流未启用（全部落需人工复核）；
+    /// 空 = 本次未校准。文案统一走 engine::calibrate::routing_note。
+    pub calibration_routing: String,
+    /// 目标漏检率 α / 误报率 β（【在合成校准语料上测得】，不是对真实标书的承诺）。
+    pub calibration_alpha: f32,
+    pub calibration_beta: f32,
+    // —— cross-encoder 复核带（W6-2，M7）：默认关闭 ⇒ 两项恒为 false/0。
+    /// 开了复核但模型不可用（未缓存 + 离线）→ true：比对【照常完成】，前端提示去工具屏预下载。
+    /// 【不静默失败】：没跑就说没跑，不能让用户以为复核倾向缺失是"没有嫌疑"。
+    pub rerank_degraded: bool,
+    /// 实际拿到复核建议分的簇数（仅 uncertain 带，且封顶 RERANK_MAX_CLUSTERS）。
+    pub rerank_reviewed_count: usize,
 }
 
 /// 每 chunk 的可选语义向量（None=该 chunk 无嵌入，如模型缺失或文本为空）。
@@ -203,6 +246,16 @@ const ANOMALY_SUMMARY_SUFFIX: &str =
     " · 涉嫌多家异常一致（招标文件与行业范本库均无出处），此为线索级提示、非定性结论，需评标委员会依法认定";
 /// 查证质量闸门未过（招标件 OCR/扫描件 或 覆盖率抽样过低）时的中性提示——不引法条、不升 severity。
 const NEUTRAL_SUMMARY_SUFFIX: &str = " · 多家共有段落，出处未能核实";
+
+// —— cross-encoder 复核带（W6-2，M7）常量集中区 ——
+/// 只复核 uncertain 带的簇：diff::classify_cluster 把 avg 落在 [0.55,0.70) 的簇判 uncertain，
+/// 这一带是人工复核的瓶颈；其余七类已有明确判读，不该被一个黑盒模型二次搅动。
+const RERANK_TARGET_TYPE: &str = "uncertain";
+/// 单次比对最多复核的簇数（成本封顶）。超出部分保持 rerank_score=None（前端显示「未复核」），
+/// 【不是】「已复核且无嫌疑」——两者在 UI 上必须可区分。
+const RERANK_MAX_CLUSTERS: usize = 200;
+/// 每簇最多取的跨文档 primary 成员对（C(5,2)=10）。
+const RERANK_MAX_PAIRS: usize = 10;
 
 pub fn run_compare(
     ctx: &JobCtx,
@@ -694,11 +747,30 @@ fn run_inner(
     ctx.check()?;
 
     // 基准模式：基准文档中无任何近似命中的分块 → deleted 单块条目
-    let deleted = if let Some(bi) = base_idx {
+    let mut deleted = if let Some(bi) = base_idx {
         build_deleted(&comparable, &docs, &raw, &best, bi)
     } else {
         Vec::new()
     };
+
+    // 6.8) cross-encoder 复核带（W6-2，M7）：对 uncertain 簇产出【复核建议分】。
+    //   【不自动改判】：cluster_type 保持 uncertain，rerank_score 只作复核队列排序与 UI 倾向
+    //   徽标，人工确认后才改分类（§1.5-3：cross-encoder 是黑盒且为检索相关性训练，
+    //   「相关」≠「同源改写」）。默认关闭 ⇒ 本段整体跳过，管线与 M6 逐字节一致。
+    //   deleted 条目是单文档「基准独有」，无跨文档对可复核，不参与本层。
+    let (rerank_degraded, rerank_reviewed) = if cfg.enable_rerank {
+        apply_rerank(ctx, embedder, &comparable, &raw, &mut new_clusters, cfg)?
+    } else {
+        (false, 0)
+    };
+    ctx.check()?;
+
+    // 6.9) 概率校准与复核路由三带（W6-4，M7）——【管线末位，固定顺序】：分类 → 豁免/异常
+    //   → 事实冲突 → （W6-2 rerank 复核建议）→ 校准。校准必须最后跑：它消费的是最终 score
+    //   与 rerank 建议分，顺序一变同配置结果就不可复现（§8 风险④）。
+    //   八类 cluster_type 与 severity 一概不动：三带是【复核路由的正交维度】。
+    apply_calibration(&mut new_clusters);
+    apply_calibration(&mut deleted);
 
     // 7) 单事务落库（边在打分阶段已按阈值过滤）
     ctx.progress("persist", 0, 1, "保存比对结果");
@@ -877,6 +949,23 @@ fn run_inner(
         boq_align_rate: boq_stats.align_rate,
         boq_table_count: boq_stats.table_count,
         boq_skipped_table_count: boq_stats.skipped_table_count,
+        // 校准台账（W6-4）：随比对快照落库，报告与设置页据此说明「这份结论出自哪一版校准」。
+        // 校准未启用 → 三个字符串为空、α/β 为 0，前端按「未校准」渲染。
+        calibration_version: calibrate::active_calibration()
+            .map(|m| m.version.clone())
+            .unwrap_or_default(),
+        calibration_kind: calibrate::active_calibration()
+            .map(|m| m.calibration_kind.clone())
+            .unwrap_or_default(),
+        calibration_routing: calibrate::active_calibration()
+            .map(|m| m.routing.as_str().to_string())
+            .unwrap_or_default(),
+        calibration_alpha: calibrate::active_calibration().map(|m| m.alpha).unwrap_or(0.0),
+        calibration_beta: calibrate::active_calibration().map(|m| m.beta).unwrap_or(0.0),
+        // 复核带台账（W6-2）：默认关闭 ⇒ false/0。降级要显式说出来，不能让缺失的倾向分
+        // 被读成「已复核且无嫌疑」。
+        rerank_degraded,
+        rerank_reviewed_count: rerank_reviewed,
         ..Default::default()
     };
     for c in new_clusters.iter().chain(deleted.iter()) {
@@ -901,6 +990,13 @@ fn run_inner(
             2 => summary.zone_tech_count += 1,
             3 => summary.zone_business_count += 1,
             _ => summary.zone_other_count += 1,
+        }
+        // 三带计数（W6-4）：四者之和恒等于 cluster_count（未校准单列一档，不并进任何带）。
+        match c.band.as_deref() {
+            Some(calibrate::BAND_PASS) => summary.band_pass_count += 1,
+            Some(calibrate::BAND_REVIEW) => summary.band_review_count += 1,
+            Some(calibrate::BAND_FLAG) => summary.band_flag_count += 1,
+            _ => summary.band_uncalibrated_count += 1,
         }
     }
 
@@ -1412,6 +1508,12 @@ fn build_clusters(
                 base_page,
                 exempt_reason: None,
                 multi_doc_anomaly: false,
+                // 置信度与三带在分类完成后由 apply_calibration 统一填（管线顺序固定：
+                // 分类 → 豁免/异常标记 → 事实冲突 → rerank 复核建议(W6-2) → 校准，
+                // 顺序变了同配置结果就不可复现，§8 风险④）。
+                confidence: None,
+                band: None,
+                rerank_score: None,
                 members,
                 diffs,
             }
@@ -1465,6 +1567,196 @@ fn apply_shared_exemptions(
             let base = nc.summary.take().unwrap_or_default();
             nc.summary = Some(format!("{base}{NEUTRAL_SUMMARY_SUFFIX}"));
         }
+    }
+}
+
+/// 复核带的一条计划项：目标簇下标 + 该簇要送模型的跨文档文本对（已截断）。
+type RerankPlanItem = (usize, Vec<(String, String)>);
+
+/// 复核带筛选与配对（纯函数，离线单测覆盖）：
+///   · 只取 cluster_type == "uncertain" 的簇（复核瓶颈带）；
+///   · 每簇取各文档 primary 成员，两两组【跨文档】对（同文档内的重复段不是交叉比对的证据）；
+///   · 每簇封顶 RERANK_MAX_PAIRS 对、全局封顶 RERANK_MAX_CLUSTERS 簇；
+///   · 文本按 rerank::truncate_for_rerank 截断（与 tokenizer max_length=256 双保险）。
+/// 配对顺序按 (doc, rel_pos, chunk_id) 全序固定 —— 同输入两次比对必须得到同一批对，
+/// 否则均值随机漂移、结果不可复现（§8 风险④）。
+fn plan_rerank(
+    chunks: &[CmpChunk],
+    raw: &[clustering::RawCluster],
+    clusters: &[NewCluster],
+) -> Vec<RerankPlanItem> {
+    let mut plan: Vec<RerankPlanItem> = Vec::new();
+    for (idx, (rc, nc)) in raw.iter().zip(clusters.iter()).enumerate() {
+        if plan.len() >= RERANK_MAX_CLUSTERS {
+            break;
+        }
+        if nc.cluster_type != RERANK_TARGET_TYPE {
+            continue;
+        }
+        let mut primaries: Vec<&CmpChunk> = rc
+            .members
+            .iter()
+            .filter(|m| rc.roles.get(m) == Some(&"primary"))
+            .map(|&i| &chunks[i as usize])
+            .collect();
+        primaries.sort_by(|a, b| {
+            a.doc
+                .cmp(&b.doc)
+                .then(a.rel_pos.total_cmp(&b.rel_pos))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut pairs = Vec::new();
+        'outer: for (i, a) in primaries.iter().enumerate() {
+            for b in primaries.iter().skip(i + 1) {
+                if a.doc == b.doc {
+                    continue;
+                }
+                pairs.push((
+                    rerank::truncate_for_rerank(&a.text),
+                    rerank::truncate_for_rerank(&b.text),
+                ));
+                if pairs.len() >= RERANK_MAX_PAIRS {
+                    break 'outer;
+                }
+            }
+        }
+        if !pairs.is_empty() {
+            plan.push((idx, pairs));
+        }
+    }
+    plan
+}
+
+/// 复核建议分的写回结果。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct RerankOutcome {
+    /// 拿到建议分的簇数。
+    scored: usize,
+    /// 推理中途失败 → 整层降级（已写入的分保留，未跑到的保持 None）。
+    failed: bool,
+}
+
+/// 按计划打分并写回（纯逻辑，scorer 可注入假分数供离线单测）。
+///
+/// 【本函数只写 rerank_score】：cluster_type / severity / summary 一概不动。cross-encoder
+/// 训练目标是检索相关性，「相关 ≠ 同源改写」，把它的输出翻成 rewrite 是拿黑盒分数下指控性
+/// 结论（§1.5-3）。簇保持 uncertain，人工确认后才改分类。
+fn score_plan(
+    clusters: &mut [NewCluster],
+    plan: &[RerankPlanItem],
+    mut scorer: impl FnMut(&str, &[String]) -> Option<Vec<f32>>,
+    mut check: impl FnMut() -> AppResult<()>,
+) -> AppResult<RerankOutcome> {
+    let mut out = RerankOutcome::default();
+    for (ci, pairs) in plan {
+        check()?;
+        let mut scores: Vec<f32> = Vec::with_capacity(pairs.len());
+        // 同一左侧文本的多个右侧一次成批，减少推理调用次数（分数与逐对调用等价）。
+        let mut i = 0;
+        while i < pairs.len() {
+            let left = pairs[i].0.as_str();
+            let mut rights = Vec::new();
+            while i < pairs.len() && pairs[i].0 == left {
+                rights.push(pairs[i].1.clone());
+                i += 1;
+            }
+            let Some(batch) = scorer(left, &rights) else {
+                out.failed = true;
+                return Ok(out);
+            };
+            if batch.len() != rights.len() {
+                out.failed = true;
+                return Ok(out);
+            }
+            scores.extend(batch);
+        }
+        if scores.is_empty() {
+            continue;
+        }
+        clusters[*ci].rerank_score = Some(mean_rerank(&scores));
+        out.scored += 1;
+    }
+    Ok(out)
+}
+
+/// 簇内建议分取均值并定点化到 1e-6——浮点求和顺序已由 plan_rerank 固定，
+/// 定点化再消掉尾数噪声，保证「同输入两次比对逐字节一致」。
+fn mean_rerank(scores: &[f32]) -> f32 {
+    if scores.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = scores.iter().map(|s| *s as f64).sum();
+    ((sum / scores.len() as f64 * 1e6).round() / 1e6) as f32
+}
+
+/// 复核带执行（W6-2）：加载复核模型 → 按计划打分 → 写回 rerank_score。
+///
+/// 【串行加载纪律】（决策 2）：加载复核模型前【无条件卸载语义模型】——8GB 办公机上
+/// embedder(bge-large-zh ~1.3GB) 与 reranker 同时常驻会顶爆内存。这是默认行为不是可选项；
+/// 复核模型也不常驻，本函数返回即释放（下次比对重新加载，opt-in 的窄带层可以接受）。
+///
+/// 降级：模型未缓存且离线（比对路径恒不隐式下载）→ 返回 degraded=true，比对照常完成。
+fn apply_rerank(
+    ctx: &JobCtx,
+    embedder: &Arc<Mutex<LoadedEmbedder>>,
+    chunks: &[CmpChunk],
+    raw: &[clustering::RawCluster],
+    clusters: &mut [NewCluster],
+    cfg: &CompareRunConfig,
+) -> AppResult<(bool, usize)> {
+    let plan = plan_rerank(chunks, raw, clusters);
+    if plan.is_empty() {
+        return Ok((false, 0)); // 无 uncertain 簇：不加载模型，不算降级
+    }
+    let spec = rerank::resolve(&cfg.rerank_model);
+    ctx.progress("rerank", 0, plan.len(), format!("交叉复核 {} 个待复核条款", plan.len()));
+    // 串行加载：先释放语义模型再拉复核模型（见上方说明）
+    {
+        let mut guard = embedder.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    let mut slot: rerank::LoadedReranker = None;
+    // allow_download=false：比对期禁隐式下载（下载可达数分钟且不可取消，会让「取消比对」卡死）
+    let Some(model) = rerank::ensure(&mut slot, spec, false) else {
+        ctx.progress(
+            "rerank",
+            plan.len(),
+            plan.len(),
+            "复核模型未缓存，已跳过交叉复核；可在工具屏预下载后重跑",
+        );
+        return Ok((true, 0));
+    };
+    let done = AtomicUsize::new(0);
+    let total = plan.len();
+    let outcome = score_plan(
+        clusters,
+        &plan,
+        |left, rights| rerank::score_against(model, left, rights),
+        || {
+            ctx.check()?;
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            ctx.progress("rerank", n, total, format!("交叉复核 {n} / {total}"));
+            Ok(())
+        },
+    )?;
+    Ok((outcome.failed, outcome.scored))
+}
+
+/// 概率校准与三带路由（W6-4，M7）：为每簇算 confidence = Calibrator(校准输入分)，并派生 band。
+///
+/// 校准输入分 = calibrate::calibration_input(score, rerank_score)：有 cross-encoder 复核建议分
+/// 时按凸组合融合（W6-2 默认关闭 → 就是 score 本身）。
+///
+/// 校准文件不可用 → 三列一律保持 None（落 NULL）：与旧任务同一条渲染路径「未校准」，
+/// 【不编造一个校准值】。分流未启用（routing=review-all）时 band 恒为「需人工复核」，
+/// 置信度照常给出——见 calibrate::Routing 的说明。
+fn apply_calibration(clusters: &mut [NewCluster]) {
+    let Some(model) = calibrate::active_calibration() else { return };
+    for c in clusters.iter_mut() {
+        let input = calibrate::calibration_input(c.score, c.rerank_score);
+        let (p, band) = model.evaluate(input);
+        c.confidence = Some(p);
+        c.band = Some(band.to_string());
     }
 }
 
@@ -1633,6 +1925,11 @@ fn build_deleted(
                 base_page: c.page.map(|p| p as i64),
                 exempt_reason: None,
                 multi_doc_anomaly: false,
+                // 三带与置信度由 apply_calibration 统一填（deleted 条目同样过校准：
+                // 它们也进复核队列，缺带会在三带统计里凭空少一块）。
+                confidence: None,
+                band: None,
+                rerank_score: None,
                 members: vec![NewMember {
                     document_id: docs[base_idx].id.clone(),
                     chunk_id: c.id.clone(),
@@ -1990,6 +2287,9 @@ mod tests {
             enable_alignment: true,
             enable_numeric: true,
             identical_rate_alarm: default_identical_rate_alarm(),
+            // 复核带默认关闭：测试基线口径 = M6，开启由个别用例显式覆盖
+            enable_rerank: false,
+            rerank_model: default_rerank_model(),
         }
     }
 
@@ -2029,6 +2329,50 @@ mod tests {
         (cctx.job_id, ids)
     }
 
+    /// 同 import_and_compare，但允许用例改运行配置（如打开 W6-2 复核带）。
+    fn import_and_compare_tweaked(
+        pool: &DbPool,
+        ws: &str,
+        files: &[(&str, String)],
+        threshold: f32,
+        tweak: impl FnOnce(&mut CompareRunConfig),
+    ) -> String {
+        let jieba = Arc::new(Jieba::new());
+        let dir = std::env::temp_dir().join(format!("bg_cmp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<String> = files
+            .iter()
+            .map(|(name, content)| {
+                let p = dir.join(name);
+                std::fs::write(&p, content).unwrap();
+                p.to_string_lossy().into_owned()
+            })
+            .collect();
+        let ictx = ctx_for(pool, ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            let docs = document_repo::list(&conn, ws).unwrap();
+            files
+                .iter()
+                .map(|(name, _)| docs.iter().find(|d| d.file_name == *name).unwrap().id.clone())
+                .collect()
+        };
+        let cctx = ctx_for(pool, ws, "compare", false);
+        let mut cfg = cfg_with(ids, threshold);
+        tweak(&mut cfg);
+        run_compare(&cctx, jieba, Arc::new(Mutex::new(None)), ws, &cfg).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        cctx.job_id
+    }
+
+    fn summary_of(pool: &DbPool, job_id: &str) -> CompareSummary {
+        let conn = pool.get().unwrap();
+        let r = job_repo::get_result_jsons(&conn, job_id).unwrap();
+        serde_json::from_str(&r.summary_json.unwrap()).unwrap()
+    }
+
     fn matrix_peak(pool: &DbPool, job_id: &str) -> (Vec<Vec<f32>>, f32) {
         let conn = pool.get().unwrap();
         let r = job_repo::get_result_jsons(&conn, job_id).unwrap();
@@ -2043,6 +2387,316 @@ mod tests {
     ) -> Vec<crate::db::repo::compare_repo::ClusterSummaryRow> {
         let conn = pool.get().unwrap();
         compare_repo::list_clusters(&conn, job_id, &Default::default(), 0, 500).unwrap()
+    }
+
+    /// 旧任务向后兼容（验收④）：M7 之前落库的 summary_json 没有三带/校准键，必须仍能反序列化
+    /// （缺键取零值 → 报告与前端按「未校准」渲染），而不是整体失败被 `.ok()` 静默吞掉。
+    #[test]
+    fn legacy_summary_json_without_band_keys_still_deserializes() {
+        let legacy = r#"{"documentCount":3,"chunkCount":120,"clusterCount":7,"sameCount":2,
+            "minorChangeCount":1,"rewriteCount":0,"changedCount":3,"addedCount":0,"deletedCount":1,
+            "conflictCount":0,"uncertainCount":0,"highRiskCount":1,"semanticDegraded":false,
+            "tenderRefChunkCount":0,"backgroundExemptChunkCount":0,"zoneLegalCount":1,
+            "zonePriceCount":1,"zoneTechCount":4,"zoneBusinessCount":1,"zoneOtherCount":0}"#;
+        let sm: CompareSummary = serde_json::from_str(legacy).expect("旧快照必须仍可反序列化");
+        assert_eq!(sm.cluster_count, 7);
+        assert_eq!(sm.band_pass_count + sm.band_review_count + sm.band_flag_count, 0);
+        assert_eq!(sm.band_uncalibrated_count, 0, "旧快照无三带键 → 计数取零，前端按未校准渲染");
+        assert!(sm.calibration_version.is_empty() && sm.calibration_routing.is_empty());
+        // M5/M6 的字段同理（本 default 也把它们的旧快照兼容问题一并收口）。
+        assert_eq!(sm.boq_item_count, 0);
+    }
+
+    /// 概率校准与三带端到端（W6-4，M7）：跑两次同输入同配置的比对 →
+    ///   ① 每个簇的 confidence/band 都落库（非 NULL）且与生效校准模型逐字节一致；
+    ///   ② 两次比对的 (confidence, band) 序列【逐字节一致】（验收⑥ 可复现）；
+    ///   ③ 三带计数之和 == cluster_count，且 summary 带上校准版本/分流模式台账；
+    ///   ④ band 只取三带码值之一，中文名不含「自动放行 / 漏检保证」（§1.5-1）。
+    #[test]
+    fn calibration_bands_persisted_and_reproducible_end_to_end() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "校准三带").unwrap().id
+        };
+        let shared = "投标人承诺按照招标文件规定的工期完成全部施工任务并承担相应质量责任。";
+        let files = |tail: &str| {
+            vec![
+                ("甲.txt", format!("{shared}\n\n各方另行约定的补充条款如下。{tail}")),
+                ("乙.txt", format!("{shared}\n\n本项目实施细则另见附件。{tail}")),
+            ]
+        };
+        let run = |suffix: &str| -> Vec<(Option<f64>, Option<String>)> {
+            let f = files(suffix);
+            let refs: Vec<(&str, String)> = f.iter().map(|(n, c)| (*n, c.clone())).collect();
+            let (job, _) = import_and_compare(&pool, &ws, &refs, 0.7);
+            let mut rows: Vec<(Option<f64>, Option<String>)> =
+                clusters_of(&pool, &job).into_iter().map(|c| (c.confidence, c.band)).collect();
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            rows
+        };
+        let first = run("");
+        assert!(!first.is_empty(), "应至少产出一个跨文档雷同簇");
+
+        let model = crate::engine::calibrate::active_calibration()
+            .expect("随包校准文件应可用（否则本用例的前提不成立）");
+        for (conf, band) in &first {
+            let conf = conf.expect("校准可用时 confidence 不得为 NULL");
+            let band = band.as_deref().expect("校准可用时 band 不得为 NULL");
+            assert!((0.0..=1.0).contains(&conf), "置信度须在 [0,1]：{conf}");
+            assert!(
+                matches!(
+                    band,
+                    crate::engine::calibrate::BAND_PASS
+                        | crate::engine::calibrate::BAND_REVIEW
+                        | crate::engine::calibrate::BAND_FLAG
+                ),
+                "band 只能是三带码值之一：{band}"
+            );
+            let cn = crate::engine::calibrate::band_cn(band);
+            assert!(
+                !cn.contains("自动放行") && !cn.contains("漏检保证"),
+                "§1.5-1：三带命名禁用「自动放行/漏检保证」：{cn}"
+            );
+            // 未启用分流时（本版语料不足以支撑分带）一律「需人工复核」。
+            if model.routing == crate::engine::calibrate::Routing::ReviewAll {
+                assert_eq!(band, crate::engine::calibrate::BAND_REVIEW, "review-all 下不得分流");
+            }
+        }
+
+        // 同输入同配置再跑一次：逐字节一致（f64 位模式比较，不容忍任何漂移）。
+        let second = run("");
+        assert_eq!(first.len(), second.len(), "两次比对簇数应一致");
+        for ((c1, b1), (c2, b2)) in first.iter().zip(second.iter()) {
+            assert_eq!(
+                c1.map(f64::to_bits),
+                c2.map(f64::to_bits),
+                "同输入同配置两次比对 confidence 必须逐字节一致"
+            );
+            assert_eq!(b1, b2, "同输入同配置两次比对 band 必须一致");
+        }
+
+        // summary 台账：三带计数之和 == cluster_count，校准版本/分流模式随快照落库。
+        let (job, _) = import_and_compare(&pool, &ws, &files("尾注"), 0.7);
+        let conn = pool.get().unwrap();
+        let r = job_repo::get_result_jsons(&conn, &job).unwrap();
+        let sm: CompareSummary = serde_json::from_str(&r.summary_json.unwrap()).unwrap();
+        assert_eq!(
+            sm.band_pass_count + sm.band_review_count + sm.band_flag_count + sm.band_uncalibrated_count,
+            sm.cluster_count,
+            "三带计数（含未校准档）之和必须等于簇总数"
+        );
+        assert_eq!(sm.calibration_version, model.version);
+        assert_eq!(sm.calibration_routing, model.routing.as_str());
+        assert_eq!(sm.band_uncalibrated_count, 0, "校准可用时不应有未校准簇");
+    }
+
+    // —— cross-encoder 复核带（W6-2，M7）：真实模型推理走 #[ignore]，以下全部离线秒级 ——
+
+    /// 造一个指定类型的入库簇（只填本层关心的字段）。
+    fn ncl(cluster_type: &str) -> NewCluster {
+        NewCluster {
+            cluster_type: cluster_type.into(),
+            topic: None,
+            summary: None,
+            severity: "review".into(),
+            score: 0.6,
+            section_kind: None,
+            conflict_json: None,
+            base_section_path: None,
+            base_page: None,
+            exempt_reason: None,
+            multi_doc_anomaly: false,
+            confidence: None,
+            band: None,
+            rerank_score: None,
+            members: vec![],
+            diffs: vec![],
+        }
+    }
+
+    /// 造一个所有成员皆 primary 的原始簇（members 为 chunks 下标）。
+    fn rawc(members: &[u32]) -> clustering::RawCluster {
+        clustering::RawCluster {
+            members: members.to_vec(),
+            roles: members.iter().map(|&m| (m, "primary")).collect(),
+            avg: 0.6,
+            peak: 0.6,
+            min_pair: 0.6,
+            lex_avg: 0.6,
+            sem_avg: None,
+            pair_scores: HashMap::new(),
+        }
+    }
+
+    /// 筛带与配对（W6-2）：只碰 uncertain 簇、只取跨文档 primary 对、每簇封顶 RERANK_MAX_PAIRS、
+    /// 文本按 rerank::MAX_CHARS 截断。其余七类已有明确判读，不该被黑盒模型二次搅动。
+    #[test]
+    fn rerank_plan_targets_uncertain_only_and_caps_pairs() {
+        let long = "条".repeat(rerank::MAX_CHARS + 200);
+        // 簇0：uncertain，5 份文档各一 primary → C(5,2)=10 对（正好封顶）
+        let mut chunks: Vec<CmpChunk> = (0..5).map(|d| ecmp(d, &long, &[], vec![], vec![])).collect();
+        // 簇1：uncertain，但两块【同一文档】→ 无跨文档对 → 不进计划
+        chunks.push(ecmp(7, "同文档甲段", &[], vec![], vec![]));
+        chunks.push(ecmp(7, "同文档乙段", &[], vec![], vec![]));
+        // 簇2：rewrite（非目标带）→ 不进计划
+        chunks.push(ecmp(0, "改写甲", &[], vec![], vec![]));
+        chunks.push(ecmp(1, "改写乙", &[], vec![], vec![]));
+        let raw = vec![rawc(&[0, 1, 2, 3, 4]), rawc(&[5, 6]), rawc(&[7, 8])];
+        let clusters = vec![ncl("uncertain"), ncl("uncertain"), ncl("rewrite")];
+
+        let plan = plan_rerank(&chunks, &raw, &clusters);
+        assert_eq!(plan.len(), 1, "只有簇0 有跨文档对且属 uncertain 带");
+        assert_eq!(plan[0].0, 0);
+        assert_eq!(plan[0].1.len(), RERANK_MAX_PAIRS, "每簇配对必须封顶");
+        for (a, b) in &plan[0].1 {
+            assert_eq!(a.chars().count(), rerank::MAX_CHARS, "左侧文本须截断");
+            assert_eq!(b.chars().count(), rerank::MAX_CHARS, "右侧文本须截断");
+        }
+        // 同输入两次规划必须完全一致（配对顺序固定 ⇒ 均值可复现）
+        assert_eq!(plan, plan_rerank(&chunks, &raw, &clusters));
+    }
+
+    /// 【负例断言 · 本步最硬的一条】（§1.5-3）：复核建议分再高，cluster_type 也必须【仍是
+    /// uncertain】——cross-encoder 是黑盒且为检索相关性训练，「相关」≠「同源改写」，
+    /// 自动改判 rewrite 等于用不可解释的分数下指控性结论。本层只写 rerank_score。
+    #[test]
+    fn rerank_writes_suggestion_and_never_reclassifies() {
+        let chunks: Vec<CmpChunk> =
+            (0..3).map(|d| ecmp(d, "待复核条款正文", &[], vec![], vec![])).collect();
+        let raw = vec![rawc(&[0, 1, 2])];
+        let mut clusters = vec![ncl("uncertain")];
+        let before = ncl("uncertain");
+        // 注入「极高」的假倾向分：0.99 / 0.97 / 0.95（均值 0.97）
+        let mut feed = [0.99f32, 0.97, 0.95].into_iter();
+        let plan = plan_rerank(&chunks, &raw, &clusters);
+        let out = score_plan(
+            &mut clusters,
+            &plan,
+            |_, rights| Some(rights.iter().map(|_| feed.next().unwrap()).collect()),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(out, RerankOutcome { scored: 1, failed: false });
+        assert_eq!(clusters[0].rerank_score, Some(0.97), "簇内建议分取均值");
+        assert_eq!(clusters[0].cluster_type, "uncertain", "【绝不自动改判】：仍须是 uncertain");
+        assert_ne!(clusters[0].cluster_type, "rewrite", "复核建议不得升格为指控性分类");
+        assert_eq!(clusters[0].severity, before.severity, "severity 不得被本层改动");
+        assert_eq!(clusters[0].summary, before.summary, "summary 不得被本层改动");
+        assert_eq!(clusters[0].score, before.score, "原始相似度分不得被本层覆盖");
+    }
+
+    /// 推理失败（模型半途报错）→ 整层降级：failed=true，未跑到的簇保持 None（「未复核」），
+    /// 【不写半套建议分】——缺失必须可与「已复核且倾向低」区分。
+    #[test]
+    fn rerank_inference_failure_degrades_without_partial_scores() {
+        let chunks: Vec<CmpChunk> =
+            (0..2).map(|d| ecmp(d, "待复核条款正文", &[], vec![], vec![])).collect();
+        let raw = vec![rawc(&[0, 1])];
+        let mut clusters = vec![ncl("uncertain")];
+        let plan = plan_rerank(&chunks, &raw, &clusters);
+        let out = score_plan(&mut clusters, &plan, |_, _| None, || Ok(())).unwrap();
+        assert!(out.failed && out.scored == 0);
+        assert_eq!(clusters[0].rerank_score, None, "失败时不得留下半套分数");
+        assert_eq!(clusters[0].cluster_type, "uncertain");
+    }
+
+    #[test]
+    fn mean_rerank_is_fixed_point_and_reproducible() {
+        assert_eq!(mean_rerank(&[]), 0.0);
+        assert_eq!(mean_rerank(&[0.5]), 0.5);
+        // 1/3 定点到 1e-6：两次求值逐位一致（可复现承诺）
+        let m = mean_rerank(&[0.1, 0.2, 0.4]);
+        assert_eq!(m, mean_rerank(&[0.1, 0.2, 0.4]));
+        assert!((m - 0.233333).abs() < 1e-6, "实测 {m}");
+    }
+
+    /// 验收：enable_rerank 默认 false ⇒ 行为与 M6 逐字节一致——不加载模型、不写 rerank_score、
+    /// 不置降级位（「没开」不是「降级」）。
+    #[test]
+    fn rerank_disabled_by_default_leaves_pipeline_untouched() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "复核默认关").unwrap().id
+        };
+        assert!(!crate::config::CompareDefaults::default().enable_rerank, "复核带默认必须关闭");
+        let (job, _) = import_and_compare(
+            &pool,
+            &ws,
+            &[
+                ("甲.txt", "投标人承诺按照招标文件规定的工期完成全部施工任务。\n\n甲方独有补充说明段落。".into()),
+                ("乙.txt", "投标人承诺按照招标文件规定的工期完成全部施工任务。\n\n乙方另行约定的实施细则。".into()),
+            ],
+            0.5,
+        );
+        let sm = summary_of(&pool, &job);
+        assert!(!sm.rerank_degraded, "未开启复核不等于降级");
+        assert_eq!(sm.rerank_reviewed_count, 0);
+        for c in clusters_of(&pool, &job) {
+            assert_eq!(c.rerank_score, None, "复核带关闭时 rerank_score 必须落 NULL");
+        }
+    }
+
+    /// 验收（硬断言）：有 uncertain 簇 + 复核模型未缓存 + 离线（比对路径恒不隐式下载）
+    /// ⇒ apply_rerank 返回 degraded=true 且不写任何建议分——【不静默失败】。
+    /// 直接驱动 apply_rerank：不依赖「造一对恰好落在 [0.55,0.70) 的真实文本」这种脆弱前提。
+    #[test]
+    fn rerank_degrades_when_model_unavailable_offline() {
+        let spec = rerank::resolve(&default_rerank_model());
+        if rerank::model_cached_for(spec) {
+            return; // 本机已缓存复核模型 → 降级路径不成立，跳过（CI/常规开发机不会命中）
+        }
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "复核降级").unwrap().id
+        };
+        let ctx = ctx_for(&pool, &ws, "compare", false);
+        let chunks: Vec<CmpChunk> =
+            (0..2).map(|d| ecmp(d, "待复核条款正文内容", &[], vec![], vec![])).collect();
+        let raw = vec![rawc(&[0, 1])];
+        let mut clusters = vec![ncl("uncertain")];
+        let mut cfg = cfg_with(vec![], 0.5);
+        cfg.enable_rerank = true;
+        let embedder: Arc<Mutex<LoadedEmbedder>> = Arc::new(Mutex::new(None));
+
+        let (degraded, scored) =
+            apply_rerank(&ctx, &embedder, &chunks, &raw, &mut clusters, &cfg).unwrap();
+        assert!(degraded, "模型未缓存 + 离线 ⇒ 必须显式降级");
+        assert_eq!(scored, 0);
+        assert_eq!(clusters[0].rerank_score, None, "降级时不得写入任何建议分");
+        assert_eq!(clusters[0].cluster_type, "uncertain", "降级也不改判");
+    }
+
+    /// 开启复核带跑完整比对：无论模型是否可用，比对都必须【正常完成】、结果照常落库，
+    /// 且拿到建议分的簇仍是 uncertain（本层不改判）。
+    #[test]
+    fn rerank_enabled_end_to_end_still_completes() {
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "复核端到端").unwrap().id
+        };
+        let job = import_and_compare_tweaked(
+            &pool,
+            &ws,
+            &[
+                ("甲.txt", "投标人承诺按照招标文件规定的工期完成全部施工任务并承担相应质量责任。\n\n各方另行约定的补充条款如下。".into()),
+                ("乙.txt", "投标人承诺按照招标文件规定的工期完成全部施工任务并承担相应质量责任。\n\n本项目实施细则另见附件。".into()),
+            ],
+            0.7,
+            |cfg| cfg.enable_rerank = true,
+        );
+        let sm = summary_of(&pool, &job);
+        assert!(sm.cluster_count > 0, "比对必须正常产出结果");
+        for c in clusters_of(&pool, &job) {
+            assert!(
+                c.rerank_score.is_none() || c.cluster_type == "uncertain",
+                "拿到复核建议分的簇必须仍是 uncertain（本层不改判）"
+            );
+        }
     }
 
     /// 逐字铁证层端到端（W4-1 + M5a 接线）：导入两份共享一整段 120 字逐字文本、前后段落各异的
@@ -2982,7 +3636,8 @@ mod tests {
             .iter()
             .find(|s| s.kind == "numericArithError")
             .expect("唯一一条共享算术错误应出信号");
-        assert!(arith.weight < 0.35, "仅 1 条独立错误 → 单条降档，实际 {}", arith.weight);
+        let arith_full = crate::engine::collusion::expected_contribution("numericArithError", 1.0);
+        assert!(arith.weight < arith_full, "仅 1 条独立错误 → 单条降档，实际 {}", arith.weight);
         assert!(arith.detail.contains("计价软件"), "§1.5 人工核对提示：{}", arith.detail);
         assert!(
             !kinds.contains(&"facts"),
@@ -3254,7 +3909,8 @@ mod tests {
             serde_json::from_str(&r.collusion_json.unwrap()).unwrap()
         };
         let rsid = collusion.signals.iter().find(|s| s.kind == "rsid").expect("应有 rsid 信号");
-        assert!((rsid.weight - 0.35).abs() < 1e-6, "rsidRoot 相同 → 满权重 0.35");
+        let expect_rsid = crate::engine::collusion::expected_contribution("rsid", 1.0);
+        assert!((rsid.weight - expect_rsid).abs() < 1e-6, "rsidRoot 相同 → x=1 满档");
         assert!(rsid.detail.contains("另存为"), "免责语：{}", rsid.detail);
         assert!(rsid.detail.contains("未命中不代表清白"));
         let meta = collusion.signals.iter().find(|s| s.kind == "metadata").expect("应有 metadata 信号");
@@ -3745,8 +4401,9 @@ mod tests {
             .iter()
             .find(|s| s.kind == "evasion")
             .expect("应含 evasion 信号");
-        // 零宽注入 → suspect → 半权重 0.125（EVASION_WEIGHT 0.25 × 0.5）
-        assert!((ev.weight - 0.125).abs() < 1e-6, "零宽 suspect → 0.125，实际 {}", ev.weight);
+        // 零宽注入 → suspect → 半档（x=0.5）
+        let expect_ev = crate::engine::collusion::expected_contribution("evasion", 0.5);
+        assert!((ev.weight - expect_ev).abs() < 1e-6, "零宽 suspect → 半档，实际 {}", ev.weight);
         assert!(ev.detail.contains("检测到疑似规避特征，请人工复核"), "§1.5 线索级措辞：{}", ev.detail);
         assert!(ev.detail.contains('甲'), "detail 应含命中文档天干：{}", ev.detail);
         assert!(ev.detail.contains("隐形码点"), "detail 应含证据种类：{}", ev.detail);

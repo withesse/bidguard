@@ -134,6 +134,8 @@ pub fn run() {
             commands::tools::get_model_status,
             commands::tools::download_embedding_model,
             commands::tools::clear_embedding_model,
+            commands::tools::download_reranker_model,
+            commands::tools::clear_reranker_model,
             commands::tools::download_ocr_model,
             commands::tools::clear_ocr_model,
             commands::tools::get_storage_info,

@@ -113,6 +113,11 @@ export const downloadEmbeddingModel = (modelKey: string) =>
   call<void>("download_embedding_model", { modelKey });
 export const clearEmbeddingModel = (modelKey: string) =>
   call<number>("clear_embedding_model", { modelKey });
+/** 按需下载某复核模型（cross-encoder，W6-2）。返回本地占用字节数。 */
+export const downloadRerankerModel = (modelKey: string) =>
+  call<number>("download_reranker_model", { modelKey });
+export const clearRerankerModel = (modelKey: string) =>
+  call<number>("clear_reranker_model", { modelKey });
 /** 按需下载某 OCR 高精档（medium）。返回写入字节数。 */
 export const downloadOcrModel = (modelKey: string) =>
   call<number>("download_ocr_model", { modelKey });

@@ -66,6 +66,20 @@ export function useClearModel() {
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
   });
 }
+export function useDownloadRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.downloadRerankerModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useClearRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearRerankerModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
 export function useDownloadOcrModel() {
   const qc = useQueryClient();
   return useMutation({

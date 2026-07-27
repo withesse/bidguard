@@ -36,6 +36,12 @@ pub struct CompareDefaults {
     pub language: String,
     /// 语义模型：bge-zh（默认）| bge-large-zh | e5-large | e5-small | e5-base（见 engine::embed::MODELS）。
     pub embedding_model: String,
+    /// cross-encoder 复核带（W6-2，M7）：对 uncertain 簇产出【复核建议分】用于排序复核队列。
+    /// 【默认关闭】：模型需按需下载（默认档 int8 ~300MB）且每簇推理有明显延迟；它只影响
+    /// 复核顺序、不改判分类（§1.5-3），因此不该是默认成本。
+    pub enable_rerank: bool,
+    /// 复核模型：bge-reranker-base-int8（默认）| bge-reranker-v2-m3（见 engine::rerank::RERANK_MODELS）。
+    pub rerank_model: String,
 }
 
 impl Default for CompareDefaults {
@@ -57,6 +63,8 @@ impl Default for CompareDefaults {
             identical_rate_alarm: 0.80,
             language: "auto".into(),
             embedding_model: "bge-zh".into(),
+            enable_rerank: false,
+            rerank_model: "bge-reranker-base-int8".into(),
         }
     }
 }

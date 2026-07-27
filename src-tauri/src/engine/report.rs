@@ -318,8 +318,23 @@ pub struct CollusionSignal {
 #[serde(rename_all = "camelCase")]
 pub struct Collusion {
     pub level: String, // high | medium | low | none
-    pub score: f32,    // 0..1
+    /// M7 起语义为【校准后证据强度】0..1（以「零证据」为零点重基的 σ(b+Σw·x)），
+    /// 不再是 v1 的经验加权和；导出报告脚注与引擎版本号一并注明（§1.5-5）。
+    pub score: f32,
+    /// 信号分解：weight 字段 M7 起为该信号的 log-odds 贡献 w_i·x_i（DTO 形状不变）。
     pub signals: Vec<CollusionSignal>,
+    /// 校准来源标签（§1.5-6 实验性标签）：experimental-synthetic = 合成语料拟合的 LR 权重；
+    /// empirical-fallback = 权重文件不可用/未过符号审查时的 v1 经验权重回退路径。
+    /// serde(default)：旧任务 collusion_json 缺该字段 → 空串，渲染侧按「未标注」处理。
+    #[serde(default)]
+    pub calibration_kind: String,
+    /// 生效权重文件的版本号（§1.5-5：导出报告脚注需注明校准来源与版本，结论方可复现举证）。
+    #[serde(default)]
+    pub calibration_version: String,
+    /// 技术字段（§1.5-2）：融合层原始概率 σ(z)。【在合成校准语料上测得，不是串通概率】——
+    /// 仅供审计与二次分析，UI/报告一律不得展示为「串通概率 X%」。旧任务缺字段 → None。
+    #[serde(default)]
+    pub probability: Option<f32>,
 }
 
 /// 章节热力：某文档某标段的跨文档雷同强度。

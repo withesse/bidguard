@@ -1,6 +1,9 @@
 // Markdown 报告：文本归档 / 知识库（§14.1）。条款明细超过上限时显式注明，绝不静默截断。
 use super::data::ExportData;
-use super::shared::{field_cn, level_cn, review_cn, section_cn, severity_cn, type_cn};
+use super::shared::{
+    band_cn_of, calibration_lines, calibration_note, contrib_label, field_cn, level_cn, review_cn,
+    section_cn, severity_cn, strength_phrase, type_cn,
+};
 use std::fmt::Write as _;
 
 const MAX_DETAIL_CLUSTERS: usize = 1000;
@@ -18,13 +21,22 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
 
     let _ = writeln!(
         m,
-        "## 综合判定\n\n**{}**（评分 {:.0}%）\n",
+        "## 综合判定\n\n**{}**（证据强度：{}）\n",
         level_cn(&data.collusion.level),
-        data.collusion.score * 100.0
+        strength_phrase(&data.collusion.level)
     );
     for s in &data.collusion.signals {
-        let _ = writeln!(m, "- {}（权重 {:.0}%）", s.detail, s.weight * 100.0);
+        let _ = writeln!(m, "- {}（{}）", s.detail, contrib_label(s.weight));
     }
+    let _ = writeln!(
+        m,
+        "\n> {}",
+        calibration_note(
+            &data.collusion.calibration_kind,
+            &data.collusion.calibration_version,
+            data.app_version
+        )
+    );
 
     let _ = writeln!(m, "\n## 参评标书\n\n| 编号 | 名称 | 类型 | 页数 | 字数 | 元数据风险 |");
     let _ = writeln!(m, "|---|---|---|---:|---:|---|");
@@ -107,6 +119,12 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 复核路由三带（W6-4）：恒常驻——报告必须说明条款是按什么口径排的队。
+    let _ = writeln!(m, "\n## 复核路由（三带）\n");
+    for line in calibration_lines(&data.calibration) {
+        let _ = writeln!(m, "- {line}");
+    }
+
     let shown = data.clusters.len().min(MAX_DETAIL_CLUSTERS);
     let _ = writeln!(m, "\n## 雷同条款明细（{} 组）\n", data.clusters.len());
     if data.clusters.len() > MAX_DETAIL_CLUSTERS {
@@ -118,14 +136,15 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     for c in &data.clusters[..shown] {
         let _ = writeln!(
             m,
-            "### #{} [{}{}] {} · 相似 {:.0}% · {} · {}\n",
+            "### #{} [{}{}] {} · 相似 {:.0}% · {} · {} · 复核路由：{}\n",
             c.index,
             type_cn(&c.cluster_type),
             c.severity.as_deref().map(|s| format!("·{}", severity_cn(s))).unwrap_or_default(),
             c.topic.as_deref().unwrap_or(""),
             c.score.unwrap_or(0.0) * 100.0,
             section_cn(c.section_kind.as_deref().unwrap_or("other")),
-            review_cn(&c.review_status)
+            review_cn(&c.review_status),
+            band_cn_of(c.band.as_deref())
         );
         for mem in &c.members {
             let page = mem.page.map(|p| format!("（第 {p} 页）")).unwrap_or_default();

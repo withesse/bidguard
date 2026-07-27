@@ -47,6 +47,9 @@ export function CompareSetup() {
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [baseDocId, setBaseDocId] = useState<string>("");
   const [semantic, setSemantic] = useState(false);
+  // 交叉复核（W6-2）：默认关闭——模型需按需下载且推理有明显延迟，且它只影响复核排序、
+  // 不改判分类（§1.5-3）。
+  const [rerank, setRerank] = useState(false);
   const [factConflict, setFactConflict] = useState(true);
   const [ignoreTemplates, setIgnoreTemplates] = useState(true);
   const [subtractTender, setSubtractTender] = useState(true);
@@ -77,6 +80,7 @@ export function CompareSetup() {
     }
     const cmp = { ...(globalCmp ?? {}), ...(wsCmp ?? {}) };
     if (typeof cmp.enableSemantic === "boolean") setSemantic(cmp.enableSemantic);
+    if (typeof cmp.enableRerank === "boolean") setRerank(cmp.enableRerank);
     if (typeof cmp.enableFactConflict === "boolean") setFactConflict(cmp.enableFactConflict);
     if (typeof cmp.ignoreTemplates === "boolean") setIgnoreTemplates(cmp.ignoreTemplates);
     if (typeof cmp.subtractTender === "boolean") setSubtractTender(cmp.subtractTender);
@@ -188,6 +192,7 @@ export function CompareSetup() {
         baseDocumentId: baseDocId && ids.includes(baseDocId) ? baseDocId : undefined,
         chunkLevel: (["section", "paragraph", "sentence"] as const)[levelIdx] ?? "paragraph",
         enableSemantic: semantic,
+        enableRerank: rerank,
         enableFactConflict: factConflict,
         ignoreTemplates,
         subtractTender,
@@ -210,6 +215,7 @@ export function CompareSetup() {
           defaultChunkLevel: (["section", "paragraph", "sentence"] as const)[levelIdx] ?? "paragraph",
           similarityThreshold: threshold,
           enableSemantic: semantic,
+          enableRerank: rerank,
           enableFactConflict: factConflict,
           ignoreTemplates,
           subtractTender,
@@ -465,6 +471,12 @@ export function CompareSetup() {
             </SettingRow>
             <SettingRow label="语义查重" hint="识别改写式雷同（首次启用需下载模型）">
               <Toggle on={semantic} onChange={() => setSemantic((v) => !v)} />
+            </SettingRow>
+            <SettingRow
+              label="交叉复核（待复核条款）"
+              hint="对「待复核」条款跑交叉编码器，给出 AI 复核倾向用于排序复核队列。【不改变条款分类】，结论仍需人工确认；需先在工具箱下载复核模型，且会明显增加比对耗时"
+            >
+              <Toggle on={rerank} onChange={() => setRerank((v) => !v)} />
             </SettingRow>
             <SettingRow label="事实冲突检测" hint="同一条款金额/工期/日期不一致 → 风险标记">
               <Toggle on={factConflict} onChange={() => setFactConflict((v) => !v)} />

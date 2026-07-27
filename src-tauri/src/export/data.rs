@@ -44,6 +44,9 @@ pub struct ExportData {
     /// PDF 的 OCR 路径 / 数值层关闭）：不渲染空章节，避免沉默背书。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub numeric: Option<NumericSection>,
+    /// 复核路由三带节（附录 A calibration；M7 填充）。恒常驻（未校准时也写，如实说明
+    /// 「本次未启用校准」），六格式导出统一从这里取文案与计数。
+    pub calibration: CalibrationSection,
     /// 「检查方法与局限」节：§1.5 硬约束——无论是否命中恒常驻，列已执行检查项 +
     /// 可清除性说明 + 「未命中不构成清白证明」声明，堵住沉默背书。
     pub methods_and_limitations: MethodsAndLimitations,
@@ -289,7 +292,105 @@ pub struct ExportCluster {
     pub exempt_reason: Option<String>,
     /// k-共现查证（W3-3）：『多家异常一致·待复核』——进导出「多家异常一致清单」小节（涉嫌措辞+脚注）。
     pub multi_doc_anomaly: bool,
+    /// 复核路由三带（W6-4）：pass|review|flag；旧任务/未校准 → None（报告写「未校准」）。
+    pub band: Option<String>,
+    /// 校准置信度（W6-4）：【技术字段】——JSON 保留数值，人读格式只写三带口头名，
+    /// 数值一律带「在合成校准语料上校准、非串通概率」的限定语（§1.5-2）。
+    pub confidence: Option<f64>,
     pub members: Vec<ExportMember>,
+}
+
+/// 复核路由三带章节（W6-4，M7）。恒常驻：无论是否启用分流都要写，说明这份报告的条款
+/// 是按什么口径排的队——不写等于让读者以为「重点标红」是系统的定性结论（§1.5-1/2）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSection {
+    /// 校准来源标签（experimental-synthetic = 合成语料拟合）与版本、语料 hash。
+    pub calibration_kind: String,
+    pub version: String,
+    pub corpus_hash: String,
+    /// three-band = 三带分流生效；review-all = 分流未启用，全部按需人工复核。
+    pub routing: String,
+    /// 目标漏检率/误报率（【在合成校准语料上测得】）。
+    pub alpha: f32,
+    pub beta: f32,
+    /// 三带计数（含未校准档）。四者之和 = 报告内条款总数。
+    pub pass_count: usize,
+    pub review_count: usize,
+    pub flag_count: usize,
+    pub uncalibrated_count: usize,
+    /// 三带中文名（写器不得自造文案，一律取此处）。
+    pub pass_label: String,
+    pub review_label: String,
+    pub flag_label: String,
+    /// §1.5 强制措辞：分流口径说明 + 「低优先级抽查带不隐藏任何条款」+ 概率语义限定。
+    pub notes: Vec<String>,
+}
+
+impl CalibrationSection {
+    /// 由【比对期落库的校准快照】+ 三带计数装配。
+    ///
+    /// 用快照而不是当前生效模型：报告必须复现「这份结论当时是按哪一版校准排的队」——
+    /// 升级安装包后重新导出旧任务，若改写成新版本号，报告就与落库的 band 对不上了。
+    /// corpus_hash 仅在快照版本与当前随包文件一致时补充（否则该 hash 无从考据，留空）。
+    pub fn build(snapshot: Option<&CompareSummary>, counts: (usize, usize, usize, usize)) -> Self {
+        use crate::engine::calibrate::{
+            band_cn, band_hint, routing_note, Routing, BAND_FLAG, BAND_PASS, BAND_REVIEW,
+        };
+        let (pass_count, review_count, flag_count, uncalibrated_count) = counts;
+        let snap = snapshot.filter(|s| !s.calibration_version.is_empty());
+        let corpus_hash = snap
+            .and_then(|s| {
+                crate::engine::calibrate::active_calibration()
+                    .filter(|m| m.version == s.calibration_version)
+                    .map(|m| m.corpus_hash.clone())
+            })
+            .unwrap_or_default();
+        let mut notes = vec![
+            "复核路由三带是【复核优先级】维度，与条款分类、风险等级相互独立：三带不改变任何条款的分类与定性。"
+                .to_string(),
+            // 逐带释义走 calibrate::band_hint（三带文案的唯一来源，UI 与报告同一份）。
+            format!("{}：{}", band_cn(BAND_FLAG), band_hint(BAND_FLAG)),
+            format!("{}：{}", band_cn(BAND_REVIEW), band_hint(BAND_REVIEW)),
+            format!("{}：{}", band_cn(BAND_PASS), band_hint(BAND_PASS)),
+            format!(
+                "「{}」带的条款【只排在最后并默认折叠，不被隐藏、不被剔除】：本报告已完整列出该带全部条款。",
+                band_cn(BAND_PASS)
+            ),
+            "置信度为【在合成校准语料上校准】的数值，仅作复核排序参考，不是串通概率，也不构成对任何投标人的定性结论。"
+                .to_string(),
+        ];
+        match snap {
+            Some(s) => {
+                let routing = if s.calibration_routing == "three-band" {
+                    Routing::ThreeBand
+                } else {
+                    Routing::ReviewAll
+                };
+                notes.push(routing_note(routing, s.calibration_alpha, s.calibration_beta));
+            }
+            None => notes.push(
+                "本次比对未启用概率校准（旧任务或校准文件不可用）：全部条款标记为「未校准」，按既有风险等级复核。"
+                    .to_string(),
+            ),
+        }
+        CalibrationSection {
+            calibration_kind: snap.map(|s| s.calibration_kind.clone()).unwrap_or_default(),
+            version: snap.map(|s| s.calibration_version.clone()).unwrap_or_default(),
+            corpus_hash,
+            routing: snap.map(|s| s.calibration_routing.clone()).unwrap_or_default(),
+            alpha: snap.map(|s| s.calibration_alpha).unwrap_or(0.0),
+            beta: snap.map(|s| s.calibration_beta).unwrap_or(0.0),
+            pass_count,
+            review_count,
+            flag_count,
+            uncalibrated_count,
+            pass_label: band_cn(BAND_PASS).to_string(),
+            review_label: band_cn(BAND_REVIEW).to_string(),
+            flag_label: band_cn(BAND_FLAG).to_string(),
+            notes,
+        }
+    }
 }
 
 #[derive(Serialize)]

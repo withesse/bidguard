@@ -2002,7 +2002,8 @@ mod tests {
         let hits = lineage_pairs(&mut hard_docs);
         let c = assess_with(CollusionInputs { lineage_hits: &hits, ..Default::default() });
         let s = c.signals.iter().find(|s| s.kind == "pdfLineage").expect("应有 pdfLineage 信号");
-        assert!((s.weight - 0.35).abs() < 1e-6, "硬命中满权重 0.35，实际 {}", s.weight);
+        let expect_hard = crate::engine::collusion::expected_contribution("pdfLineage", 1.0);
+        assert!((s.weight - expect_hard).abs() < 1e-6, "硬命中 x=1 满档，实际 {}", s.weight);
         assert!(s.detail.contains("未命中不代表清白"));
         assert!(hard_docs[0].fingerprint.risk_flags.iter().any(|f| f.contains("同一母文件")));
 
@@ -2013,7 +2014,8 @@ mod tests {
         let mid_hits = lineage_pairs(&mut mid_docs);
         let cm = assess_with(CollusionInputs { lineage_hits: &mid_hits, ..Default::default() });
         let sm = cm.signals.iter().find(|s| s.kind == "pdfLineage").expect("中命中也应有信号");
-        assert!((sm.weight - 0.35 * 0.55).abs() < 1e-6, "仅中命中 x=0.55，实际 {}", sm.weight);
+        let expect_mid = crate::engine::collusion::expected_contribution("pdfLineage", 0.55);
+        assert!((sm.weight - expect_mid).abs() < 1e-6, "仅中命中 x=0.55，实际 {}", sm.weight);
 
         // 均无命中：无该信号
         let n1 = write_lineage_pdf(&dir, "n1.pdf", b"\x03", None, &["DDDDDD+FangSong"]);

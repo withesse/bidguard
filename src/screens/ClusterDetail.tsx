@@ -21,7 +21,17 @@ import {
 import type { AnnotationDto } from "../api/types";
 import { NoteEditor } from "../components/NoteEditor";
 import { docTag } from "../utils/docTag";
-import { REVIEW_UI, severityUi, typeUi, zoneUi } from "../utils/clusterUi";
+import {
+  bandUi,
+  CALIBRATION_QUALIFIER,
+  RERANK_DISCLAIMER,
+  rerankUi,
+  REVIEW_UI,
+  routingNote,
+  severityUi,
+  typeUi,
+  zoneUi,
+} from "../utils/clusterUi";
 
 interface ConflictJson {
   risk: string;
@@ -105,6 +115,9 @@ export function ClusterDetail() {
   const t = typeUi(c.clusterType);
   const sev = severityUi(c.severity);
   const zone = zoneUi(c.sectionKind);
+  const band = bandUi(c.band);
+  // 交叉复核建议（W6-2）：null = 本次未跑复核层（≠「已复核且无嫌疑」）。
+  const lean = rerankUi(c.rerankScore);
   const rv = REVIEW_UI[c.reviewStatus] ?? REVIEW_UI.pending;
   // 成员按文档位次排序，primary 优先
   const members = [...data.members].sort((a, b) => {
@@ -146,9 +159,93 @@ export function ClusterDetail() {
               {sev.label}
             </Pill>
           )}
+          {/* 复核路由三带（W6-4）：与分类/风险并列的正交维度 */}
+          <span title={band.hint} style={{ display: "inline-flex" }}>
+            <Pill fg={band.fg} bg={band.bg} size={11}>
+              {band.label}
+            </Pill>
+          </span>
+          {lean && (
+            <span title={lean.hint} style={{ display: "inline-flex" }}>
+              <Pill fg={lean.fg} bg={lean.bg} size={11}>
+                {lean.label}
+              </Pill>
+            </span>
+          )}
           {c.score != null && (
             <span style={{ fontSize: 12, color: mute }}>组内平均相似 {Math.round(c.score * 100)}%</span>
           )}
+        </div>
+
+        {/* 交叉复核建议（W6-2）。§1.5-3：cross-encoder 是黑盒且为检索相关性训练，
+            「相关」≠「同源改写」，故【不自动改判分类】——这里只给倾向与分数，
+            条款仍停在「待复核」，人工确认后才改分类。 */}
+        {lean && (
+          <div
+            style={{
+              border: `1px solid ${border}`,
+              borderRadius: 10,
+              padding: "10px 12px",
+              background: cardBg,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 11.5, color: mute }}>AI 复核倾向</span>
+              <span style={{ fontSize: 12.5, color: ink, fontWeight: 600 }}>{lean.label}</span>
+            </div>
+            <span style={{ fontSize: 10.5, color: mute }}>
+              {`交叉编码器（cross-encoder）对本条款各家文本两两重打分后的均值。${RERANK_DISCLAIMER}：本条款分类维持「${t.label}」不变。`}
+            </span>
+          </div>
+        )}
+
+        {/* 校准置信度条（W6-4）。§1.5-2：数值只作复核排序参考，必须带限定语——
+            「在合成校准语料上校准、不是串通概率」；未校准时如实写「未校准」而不是留空。 */}
+        <div
+          style={{
+            border: `1px solid ${border}`,
+            borderRadius: 10,
+            padding: "10px 12px",
+            background: cardBg,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 11.5, color: mute }}>校准置信度</span>
+            <div
+              style={{
+                flex: 1,
+                height: 6,
+                borderRadius: 999,
+                background: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${Math.round((c.confidence ?? 0) * 100)}%`,
+                  height: "100%",
+                  background: band.fg,
+                }}
+              />
+            </div>
+            <span style={{ fontSize: 12, color: ink, fontVariantNumeric: "tabular-nums", minWidth: 44, textAlign: "right" }}>
+              {c.confidence != null ? `${(c.confidence * 100).toFixed(1)}%` : "未校准"}
+            </span>
+          </div>
+          <span style={{ fontSize: 10.5, color: mute }}>
+            {c.confidence != null ? `${CALIBRATION_QUALIFIER}。` : ""}
+            {routingNote(
+              summary?.summary?.calibrationRouting,
+              summary?.summary?.calibrationAlpha,
+              summary?.summary?.calibrationBeta,
+            )}
+          </span>
         </div>
 
         {/* 区段归属（W4-5 反向互链，只读）：该条款成员命中的对齐区段 → 跳区段视图定位。 */}

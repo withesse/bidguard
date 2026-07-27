@@ -1,7 +1,10 @@
 // Word 报告 v2：判定 → 文档 → 八类统计 → 逐对相似 → 事实冲突 → 条款明细 → 附录。
 // 最小合法 OOXML（zip + document.xml），Word/WPS/Pages 原生渲染中文。
 use super::data::ExportData;
-use super::shared::{docx_p, field_cn, label, level_cn, review_cn, severity_cn, type_cn, write_docx_package};
+use super::shared::{
+    band_cn_of, calibration_lines, calibration_note, contrib_label, docx_p, field_cn, label,
+    level_cn, review_cn, severity_cn, strength_phrase, type_cn, write_docx_package,
+};
 
 const MAX_DETAIL_CLUSTERS: usize = 500;
 
@@ -22,16 +25,26 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     docx_p(
         &mut body,
         &format!(
-            "综合判定：{}（评分 {:.0}%）",
+            "综合判定：{}（证据强度：{}）",
             level_cn(&data.collusion.level),
-            data.collusion.score * 100.0
+            strength_phrase(&data.collusion.level)
         ),
         true,
         26,
     );
     for s in &data.collusion.signals {
-        docx_p(&mut body, &format!("· {}（权重 {:.0}%）", s.detail, s.weight * 100.0), false, 21);
+        docx_p(&mut body, &format!("· {}（{}）", s.detail, contrib_label(s.weight)), false, 21);
     }
+    docx_p(
+        &mut body,
+        &calibration_note(
+            &data.collusion.calibration_kind,
+            &data.collusion.calibration_version,
+            data.app_version,
+        ),
+        false,
+        19,
+    );
 
     docx_p(&mut body, "参评标书", true, 28);
     for d in &data.documents {
@@ -130,6 +143,12 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 复核路由三带（W6-4）：恒常驻小节，说明条款按什么口径排队 + §1.5 强制措辞。
+    docx_p(&mut body, "复核路由（三带）", true, 28);
+    for line in calibration_lines(&data.calibration) {
+        docx_p(&mut body, &format!("· {line}"), false, 21);
+    }
+
     let shown = data.clusters.len().min(MAX_DETAIL_CLUSTERS);
     docx_p(&mut body, &format!("雷同条款明细（{} 组）", data.clusters.len()), true, 28);
     if data.clusters.len() > MAX_DETAIL_CLUSTERS {
@@ -153,13 +172,14 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         docx_p(
             &mut body,
             &format!(
-                "#{} [{}] {} · 相似 {:.0}% · 涉及 {} · {}",
+                "#{} [{}] {} · 相似 {:.0}% · 涉及 {} · {} · 复核路由：{}",
                 c.index,
                 type_cn(&c.cluster_type),
                 c.topic.as_deref().unwrap_or(""),
                 c.score.unwrap_or(0.0) * 100.0,
                 docs.join("·"),
-                review_cn(&c.review_status)
+                review_cn(&c.review_status),
+                band_cn_of(c.band.as_deref())
             ),
             true,
             22,

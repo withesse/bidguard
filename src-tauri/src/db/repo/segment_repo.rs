@@ -676,6 +676,9 @@ mod tests {
                 base_page: None,
                 exempt_reason: None,
                 multi_doc_anomaly: false,
+                confidence: None,
+                band: None,
+                rerank_score: None,
                 members: vec![
                     NewMember {
                         document_id: "d1".into(),
@@ -791,6 +794,9 @@ mod tests {
                 base_page: None,
                 exempt_reason: None,
                 multi_doc_anomaly: false,
+                confidence: None,
+                band: None,
+                rerank_score: None,
                 members: vec![
                     NewMember {
                         document_id: "d1".into(),

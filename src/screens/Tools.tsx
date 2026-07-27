@@ -15,8 +15,10 @@ import {
   useClearModel,
   useClearOcrModel,
   useDiagnostics,
+  useClearRerankModel,
   useDownloadModel,
   useDownloadOcrModel,
+  useDownloadRerankModel,
   useModelStatus,
   useSaveAppSettings,
   useStorageInfo,
@@ -44,6 +46,7 @@ export function Tools() {
   const appCfg = useAppSettings().data as Record<string, Record<string, unknown>> | undefined;
   const activeOcr = (appCfg?.parser?.ocrModel as string) ?? "v6-small";
   const activeEmbed = (appCfg?.compare?.embeddingModel as string) ?? "bge-zh";
+  const activeRerank = (appCfg?.compare?.rerankModel as string) ?? "bge-reranker-base-int8";
   const saveCfg = useSaveAppSettings();
   // 在工具箱直接切换当前档位（合并写配置，不覆盖其它项）
   const setActive = (section: "parser" | "compare", field: string, key: string) => {
@@ -61,6 +64,8 @@ export function Tools() {
   const clearModel = useClearModel();
   const downloadOcr = useDownloadOcrModel();
   const clearOcr = useClearOcrModel();
+  const downloadRerank = useDownloadRerankModel();
+  const clearRerank = useClearRerankModel();
   const clearCache = useClearEmbeddingCache();
   const vacuum = useVacuumDb();
   const cleanup = useCleanupOldJobs();
@@ -84,6 +89,16 @@ export function Tools() {
     setDownloading(key);
     toast.show(`正在下载 ${label}（约 132MB），可能需要几分钟…`, "info");
     downloadOcr.mutate(key, {
+      onSuccess: (n) => toast.show(`${label} 已就绪（${mb(n)}）`, "success"),
+      onError: (e) => toast.show("下载失败：" + errMsg(e), "error"),
+      onSettled: () => setDownloading(null),
+    });
+  };
+
+  const onDownloadRerank = (key: string, label: string, sizeLabel: string) => {
+    setDownloading(key);
+    toast.show(`正在下载 ${label}（${sizeLabel}），可能需要几分钟…`, "info");
+    downloadRerank.mutate(key, {
       onSuccess: (n) => toast.show(`${label} 已就绪（${mb(n)}）`, "success"),
       onError: (e) => toast.show("下载失败：" + errMsg(e), "error"),
       onSettled: () => setDownloading(null),
@@ -176,6 +191,63 @@ export function Tools() {
                   </ConfirmButton>
                 ) : (
                   <Button kind="secondary" size="sm" disabled={downloading != null} onClick={() => onDownload(m.key, m.label)}>
+                    {downloading === m.key ? "下载中…" : "下载"}
+                  </Button>
+                )}
+              </Row>
+            ))}
+          </Card>
+
+          {/* —— 复核模型（交叉编码器）——
+              默认关闭的可选层：只在比对设置里显式开启「交叉复核」时才用到。
+              它给出的是【复核排序建议】，不改判条款分类（§1.5-3）。 */}
+          <Card
+            title="复核模型 · 交叉编码器（可选，默认关闭）"
+            cardBg={cardBg}
+            border={border}
+            mute={mute}
+          >
+            <div style={{ fontSize: 11, color: mute, padding: "0 0 8px" }}>
+              为「待复核」条款给出 AI 复核倾向，用于排序人工复核队列；<b>不改变条款分类</b>，结论仍需人工确认。
+              未下载时比对照常完成，只是不产出倾向分。
+            </div>
+            {(ms?.rerankModels ?? []).map((m, i, arr) => (
+              <Row key={m.key} ink={ink} mute={mute} border={border} last={i === arr.length - 1}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: ink }}>{m.label}</span>
+                    {m.key === activeRerank && <ActivePill accent={accent} />}
+                  </div>
+                  <div style={{ fontSize: 11, color: mute, marginTop: 2 }}>
+                    {m.cached ? `已缓存 · ${mb(m.sizeBytes)}` : `未下载 · ${m.sizeLabel}`}
+                  </div>
+                </div>
+                {m.key !== activeRerank && (
+                  <Button kind="ghost" size="sm" onClick={() => setActive("compare", "rerankModel", m.key)}>
+                    设为当前
+                  </Button>
+                )}
+                {m.cached ? (
+                  <ConfirmButton
+                    confirmLabel="确认删除？"
+                    pending={clearRerank.isPending}
+                    pendingLabel="删除中…"
+                    onConfirm={() =>
+                      clearRerank.mutate(m.key, {
+                        onSuccess: (n) => toast.show(`已释放 ${mb(n)}`, "success"),
+                        onError: (e) => toast.show("删除失败：" + errMsg(e), "error"),
+                      })
+                    }
+                  >
+                    删除缓存
+                  </ConfirmButton>
+                ) : (
+                  <Button
+                    kind="secondary"
+                    size="sm"
+                    disabled={downloading != null}
+                    onClick={() => onDownloadRerank(m.key, m.label, m.sizeLabel)}
+                  >
                     {downloading === m.key ? "下载中…" : "下载"}
                   </Button>
                 )}

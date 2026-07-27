@@ -2,7 +2,10 @@
 // 事实冲突 → 条款明细（按风险排序，超限显式注明）→ 共有特征词 → 配置与版本附录。
 // 自包含单文件，可「打印 → 另存为 PDF」。
 use super::data::ExportData;
-use super::shared::{field_cn, label, level_cn, review_cn, section_cn, severity_cn, type_cn, xml_escape};
+use super::shared::{
+    band_cn_of, calibration_lines, calibration_note, contrib_label, field_cn, label, level_cn,
+    review_cn, section_cn, severity_cn, strength_phrase, type_cn, xml_escape,
+};
 use std::fmt::Write as _;
 
 const MAX_DETAIL_CLUSTERS: usize = 800;
@@ -25,18 +28,23 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     let col = &data.collusion;
     let _ = write!(
         h,
-        "<div class=\"verdict {}\">综合判定：{}（评分 {:.0}%）</div>",
+        "<div class=\"verdict {}\">综合判定：{}（证据强度：{}）</div>",
         e(&col.level),
         level_cn(&col.level),
-        col.score * 100.0
+        e(strength_phrase(&col.level))
     );
     if !col.signals.is_empty() {
         h.push_str("<ul>");
         for s in &col.signals {
-            let _ = write!(h, "<li>{}（权重 {:.0}%）</li>", e(&s.detail), s.weight * 100.0);
+            let _ = write!(h, "<li>{}（{}）</li>", e(&s.detail), e(&contrib_label(s.weight)));
         }
         h.push_str("</ul>");
     }
+    let _ = write!(
+        h,
+        "<p class=\"muted\">{}</p>",
+        e(&calibration_note(&col.calibration_kind, &col.calibration_version, data.app_version))
+    );
 
     // 文档
     h.push_str("<h2>参评标书</h2><table><tr><th>编号</th><th>名称</th><th>类型</th><th>页数</th><th>字数</th><th>解析</th><th>元数据风险</th></tr>");
@@ -181,6 +189,12 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         }
     }
 
+    // 复核路由三带（W6-4）：恒常驻小节，说明条款按什么口径排队 + §1.5 强制措辞。
+    h.push_str("<h2>复核路由（三带）</h2>");
+    for line in calibration_lines(&data.calibration) {
+        let _ = write!(h, "<p class=\"muted\">{}</p>", e(&line));
+    }
+
     // 条款明细
     let shown = data.clusters.len().min(MAX_DETAIL_CLUSTERS);
     let _ = write!(h, "<h2>雷同条款明细（{} 组）</h2>", data.clusters.len());
@@ -203,14 +217,15 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         };
         let _ = write!(
             h,
-            "<p><b>#{} [{}{}] {} · 相似 {:.0}% · 涉及 {} · {}</b></p>",
+            "<p><b>#{} [{}{}] {} · 相似 {:.0}% · 涉及 {} · {} · 复核路由：{}</b></p>",
             c.index,
             type_cn(&c.cluster_type),
             c.severity.as_deref().map(|s| format!("·{}", severity_cn(s))).unwrap_or_default(),
             e(c.topic.as_deref().unwrap_or("")),
             c.score.unwrap_or(0.0) * 100.0,
             docs.join("·"),
-            review_cn(&c.review_status)
+            review_cn(&c.review_status),
+            band_cn_of(c.band.as_deref())
         );
         // k-共现查证标记（W3-3）：豁免簇标注合法共享出处、异常簇标注待复核。
         match c.exempt_reason.as_deref() {

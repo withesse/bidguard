@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     SEGMENT_DIFFS_V20,
     BOQ_ITEMS_V21,
     JOB_NUMERIC_JSON_V22,
+    CLUSTER_CALIBRATION_V23,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -562,6 +563,23 @@ CREATE INDEX idx_boq_items_align ON boq_items(job_id, align_key);
 // 迁移台账（§1 全局裁决 1）：V21=boq_items 表、V22=jobs.numeric_json 列。
 const JOB_NUMERIC_JSON_V22: &str = "
 ALTER TABLE jobs ADD COLUMN numeric_json TEXT;
+";
+
+// V23：clusters 增三列（M7 收官里程碑的【唯一】新迁移，三列合批以免抢号）：
+//   · confidence   REAL —— 校准后的置信度 p（engine/calibrate：簇分经 Platt 校准；
+//                          【在合成校准语料上校准，不是串通概率】，UI 一律带限定语展示）；
+//   · band         TEXT —— 复核路由三带码值 pass|review|flag（中文名由 calibrate::band_cn
+//                          唯一给出：低优先级抽查 / 需人工复核 / 重点标红）；
+//   · rerank_score REAL —— cross-encoder 复核建议分（W6-2）。本批先建列，M7 步骤 3 写入；
+//                          与 confidence 同批落地是因为二者同属一次比对的复核路由产物，
+//                          分两个迁移会让中间版本的库出现「有带无分」的半截状态。
+// 迁移台账（§1 全局裁决 1）：V21=boq_items 表、V22=jobs.numeric_json、V23=clusters 三列。
+// 旧行三列均为 NULL → 前端显示「未校准」，向后兼容、无回填（历史任务的分带若靠事后补算，
+// 会与当时生效的校准版本不一致，反而不可举证）。
+const CLUSTER_CALIBRATION_V23: &str = "
+ALTER TABLE clusters ADD COLUMN confidence REAL;
+ALTER TABLE clusters ADD COLUMN band TEXT;
+ALTER TABLE clusters ADD COLUMN rerank_score REAL;
 ";
 
 #[cfg(test)]
@@ -1165,6 +1183,61 @@ mod tests {
         assert_eq!(now.as_deref(), Some("{\"pairs\":[]}"));
 
         // 幂等
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn cluster_calibration_columns_migration_defaults_null_and_is_idempotent() {
+        // 老库（V22：三列出现之前）升级补 V23：旧簇行三列均为 NULL（前端显示「未校准」），
+        // 新值可写可读；重复 run 幂等。验收④「V23 升级后旧任务打开不报错、band 显示未校准」。
+        let mut conn = Connection::open_in_memory().unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[..22] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 22).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w1', '测试', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, workspace_id, job_type, status, created_at)
+             VALUES ('j_old', 'w1', 'compare', 'completed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO clusters (id, job_id, cluster_type, severity, score, review_status, created_at)
+             VALUES ('c_old', 'j_old', 'same', 'low', 0.9, 'pending', 't')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        assert_eq!(version(&conn), MIGRATIONS.len() as i64);
+
+        let (conf, band, rr): (Option<f64>, Option<String>, Option<f64>) = conn
+            .query_row("SELECT confidence, band, rerank_score FROM clusters WHERE id='c_old'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert!(conf.is_none() && band.is_none() && rr.is_none(), "旧簇行三列应为 NULL（前端显示「未校准」）");
+
+        conn.execute(
+            "UPDATE clusters SET confidence = 0.87, band = 'review', rerank_score = 0.5 WHERE id='c_old'",
+            [],
+        )
+        .unwrap();
+        let band: Option<String> = conn
+            .query_row("SELECT band FROM clusters WHERE id='c_old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(band.as_deref(), Some("review"));
+
         run(&mut conn).unwrap();
         assert_eq!(version(&conn), MIGRATIONS.len() as i64);
     }

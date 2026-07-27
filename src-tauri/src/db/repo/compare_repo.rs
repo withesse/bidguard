@@ -42,6 +42,13 @@ pub struct NewCluster {
     pub exempt_reason: Option<String>,
     /// k-共现查证（W3-3）：两库皆查不到出处且查证质量闸门通过 → true（『多家异常一致·待复核』）。
     pub multi_doc_anomaly: bool,
+    /// 校准置信度（W6-4，M7）：簇分经 engine/calibrate 校准后的 p；校准文件不可用 → None
+    /// （落 NULL，前端与旧任务同路径显示「未校准」）。【合成语料校准值，不是串通概率】。
+    pub confidence: Option<f32>,
+    /// 复核路由三带码值 pass|review|flag（中文名走 calibrate::band_cn）；未校准 → None。
+    pub band: Option<String>,
+    /// cross-encoder 复核建议分（W6-2，M7 步骤 3 写入；默认关闭 → None）。
+    pub rerank_score: Option<f32>,
     pub members: Vec<NewMember>,
     pub diffs: Vec<NewDiff>,
 }
@@ -375,8 +382,8 @@ pub fn insert_clusters(
     let mut ins_cluster = conn.prepare(
         "INSERT INTO clusters (id, job_id, cluster_type, topic, summary, severity, score,
          section_kind, conflict_json, base_section_path, base_page, exempt_reason,
-         multi_doc_anomaly, review_status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14)",
+         multi_doc_anomaly, confidence, band, rerank_score, review_status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'pending', ?17)",
     )?;
     let mut ins_member = conn.prepare(
         "INSERT INTO cluster_members (cluster_id, document_id, chunk_id, role, score)
@@ -403,6 +410,9 @@ pub fn insert_clusters(
             c.base_page,
             c.exempt_reason,
             c.multi_doc_anomaly as i64,
+            c.confidence,
+            c.band,
+            c.rerank_score,
             now
         ])?;
         for m in &c.members {
@@ -458,6 +468,9 @@ pub struct ClusterFilter {
     pub multi_doc_anomaly: Option<bool>,
     /// 仅「恰好两家共有」簇（W3-3 首要证据视图）：Some(true)=只看跨 2 份文档的簇。
     pub two_docs_only: Option<bool>,
+    /// 按复核路由三带筛选（W6-4）：'pass'|'review'|'flag'；'uncalibrated' = 未校准（band IS NULL）。
+    /// 【只筛不藏】：低优先级抽查带默认排在最后并折叠，但一直可筛、可展开、可导出（§1.5-1）。
+    pub band: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -480,6 +493,12 @@ pub struct ClusterSummaryRow {
     pub exempt_reason: Option<String>,
     /// k-共现查证（W3-3）：『多家异常一致·待复核』标记，前端红色徽标、可筛。
     pub multi_doc_anomaly: bool,
+    /// 校准置信度（W6-4）：旧任务/未校准 → None，前端显示「未校准」。
+    pub confidence: Option<f64>,
+    /// 三带码值 pass|review|flag；旧任务/未校准 → None。
+    pub band: Option<String>,
+    /// cross-encoder 复核建议分（W6-2）；未开启 → None。
+    pub rerank_score: Option<f64>,
 }
 
 /// 动态过滤条件。占位符从 ?start 开始编号——调用方的固定参数占用 ?1..?(start-1)，
@@ -504,6 +523,12 @@ fn filter_sql(f: &ClusterFilter, start: usize) -> (String, Vec<String>) {
             " AND EXISTS (SELECT 1 FROM cluster_members m WHERE m.cluster_id = cl.id AND m.document_id = ?{})",
             start + binds.len() - 1
         ));
+    }
+    // 三带筛选（W6-4）：uncalibrated 走 IS NULL（旧任务/校准未启用），其余精确匹配码值。
+    match f.band.as_deref() {
+        Some("uncalibrated") => cond.push_str(" AND cl.band IS NULL"),
+        Some(_) => add("cl.band", &f.band, &mut binds, &mut cond),
+        None => {}
     }
     // 布尔筛选无需绑定参数（W3-3）：多家异常一致 / 仅两家共有（跨 2 份文档）。
     if f.multi_doc_anomaly == Some(true) {
@@ -543,18 +568,29 @@ pub fn list_clusters(
     let limit = limit.clamp(1, 500);
     let offset = offset.max(0);
     let (cond, binds) = filter_sql(filter, 2);
-    // 排序：风险降序（high>medium>low>review>none）再按分数降序。
+    // 排序：三带优先（重点标红 → 需人工复核 → 未校准 → 低优先级抽查），再风险降序
+    // （high>medium>low>review>none），再【AI 复核倾向降序】（W6-2：uncertain 簇同为
+    // severity='review'，倾向高的排前面就是复核队列的顺序；未复核的 rerank_score IS NULL
+    // 统一排在已复核之后，「未复核」≠「倾向低」），最后分数降序。
+    // 复核带默认关闭 ⇒ 全表 rerank_score 均为 NULL ⇒ 该两级排序键全表同值，
+    // 退化为 M6 的原排序（逐字节一致）。
+    // §1.5-1：低优先级抽查带【只排序不隐藏】——排最后是为了把复核注意力放在前面，
+    // 该带的簇仍完整落库、可筛、可展开、可导出。未校准（band IS NULL）排在低优先级之前，
+    // 使旧任务/校准未启用时的相对次序与 M7 之前保持一致（全表同一档 → 退化为原排序）。
     // GROUP_CONCAT 用逗号切回列表：document_id 是 uuid v4，保证不含逗号
     let sql = format!(
         "SELECT cl.id, cl.job_id, cl.cluster_type, cl.topic, cl.summary, cl.severity, cl.score,
          cl.section_kind, cl.review_status, cl.base_section_path, cl.base_page,
          (SELECT GROUP_CONCAT(DISTINCT m.document_id) FROM cluster_members m WHERE m.cluster_id = cl.id),
          (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id),
-         cl.exempt_reason, cl.multi_doc_anomaly
+         cl.exempt_reason, cl.multi_doc_anomaly, cl.confidence, cl.band, cl.rerank_score
          FROM clusters cl WHERE cl.job_id = ?1{cond}
-         ORDER BY CASE cl.severity
+         ORDER BY CASE cl.band
+            WHEN 'flag' THEN 0 WHEN 'review' THEN 1 WHEN 'pass' THEN 3 ELSE 2 END,
+         CASE cl.severity
             WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2
             WHEN 'review' THEN 3 ELSE 4 END,
+         CASE WHEN cl.rerank_score IS NULL THEN 1 ELSE 0 END, cl.rerank_score DESC,
          cl.score DESC LIMIT {limit} OFFSET {offset}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -583,6 +619,9 @@ pub fn list_clusters(
                 member_count: r.get(12)?,
                 exempt_reason: r.get(13)?,
                 multi_doc_anomaly: r.get::<_, i64>(14)? != 0,
+                confidence: r.get(15)?,
+                band: r.get(16)?,
+                rerank_score: r.get(17)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -645,7 +684,7 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
              cl.section_kind, cl.review_status, cl.base_section_path, cl.base_page,
              (SELECT GROUP_CONCAT(DISTINCT m.document_id) FROM cluster_members m WHERE m.cluster_id = cl.id),
              (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = cl.id),
-             cl.exempt_reason, cl.multi_doc_anomaly
+             cl.exempt_reason, cl.multi_doc_anomaly, cl.confidence, cl.band, cl.rerank_score
              FROM clusters cl WHERE cl.id = ?1",
             [cluster_id],
             |r| {
@@ -668,6 +707,9 @@ pub fn get_cluster_detail(conn: &rusqlite::Connection, cluster_id: &str) -> AppR
                     member_count: r.get(12)?,
                     exempt_reason: r.get(13)?,
                     multi_doc_anomaly: r.get::<_, i64>(14)? != 0,
+                    confidence: r.get(15)?,
+                    band: r.get(16)?,
+                    rerank_score: r.get(17)?,
                 })
             },
         )
@@ -750,6 +792,10 @@ pub struct ExportRow {
     pub exempt_reason: Option<String>,
     /// k-共现查证（W3-3）：『多家异常一致·待复核』标记。
     pub multi_doc_anomaly: bool,
+    /// 复核路由三带（W6-4）：pass|review|flag；旧任务/未校准 → None（报告写「未校准」）。
+    pub band: Option<String>,
+    /// 校准置信度（W6-4）：合成语料校准值，报告只在技术字段展示并带限定语。
+    pub confidence: Option<f64>,
     pub document_id: String,
     pub text: String,
     pub page: Option<i64>,
@@ -761,12 +807,15 @@ pub fn export_rows(conn: &rusqlite::Connection, job_id: &str) -> AppResult<Vec<E
     let mut stmt = conn.prepare(
         "SELECT cl.id, cl.cluster_type, cl.severity, cl.topic, cl.summary, cl.score,
          cl.review_status, cl.section_kind, cl.conflict_json, cl.exempt_reason, cl.multi_doc_anomaly,
+         cl.band, cl.confidence,
          m.document_id, c.text, c.page, c.section_path, m.role
          FROM clusters cl
          JOIN cluster_members m ON m.cluster_id = cl.id
          JOIN chunks c ON c.id = m.chunk_id
          WHERE cl.job_id = ?1
-         ORDER BY CASE cl.severity
+         ORDER BY CASE cl.band
+            WHEN 'flag' THEN 0 WHEN 'review' THEN 1 WHEN 'pass' THEN 3 ELSE 2 END,
+         CASE cl.severity
             WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2
             WHEN 'review' THEN 3 ELSE 4 END,
          cl.score DESC, cl.id, m.document_id",
@@ -785,11 +834,13 @@ pub fn export_rows(conn: &rusqlite::Connection, job_id: &str) -> AppResult<Vec<E
                 conflict_json: r.get(8)?,
                 exempt_reason: r.get(9)?,
                 multi_doc_anomaly: r.get::<_, i64>(10)? != 0,
-                document_id: r.get(11)?,
-                text: r.get(12)?,
-                page: r.get(13)?,
-                section_path: r.get(14)?,
-                role: r.get(15)?,
+                band: r.get(11)?,
+                confidence: r.get(12)?,
+                document_id: r.get(13)?,
+                text: r.get(14)?,
+                page: r.get(15)?,
+                section_path: r.get(16)?,
+                role: r.get(17)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -940,6 +991,86 @@ mod tests {
         assert_eq!(segs_after, 0, "delete_job_results 后 aligned_segments 应无残留");
         assert_eq!(ancs_after, 0, "区段清空后 segment_anchors 应随 FK 级联清空");
         assert_eq!(diffs_after, 0, "区段清空后 segment_diffs 应随 FK 级联清空");
+    }
+
+    /// 复核队列排序（W6-2）：同带同风险的 uncertain 簇按【AI 复核倾向】降序，
+    /// 未复核（rerank_score IS NULL）统一排在已复核之后——「未复核」不等于「倾向低」，
+    /// 不能让它混进倾向最低的位置被当成已看过。复核带关闭时全表 NULL ⇒ 退化为原排序。
+    #[test]
+    fn list_clusters_orders_review_queue_by_rerank_suggestion() {
+        let conn = setup();
+        let mk = |score: f32, rerank: Option<f32>| NewCluster {
+            cluster_type: "uncertain".into(),
+            topic: Some(format!("{score}/{rerank:?}")),
+            summary: None,
+            severity: "review".into(),
+            score,
+            section_kind: None,
+            conflict_json: None,
+            base_section_path: None,
+            base_page: None,
+            exempt_reason: None,
+            multi_doc_anomaly: false,
+            confidence: None,
+            band: None,
+            rerank_score: rerank,
+            members: vec![],
+            diffs: vec![],
+        };
+        // 故意让「分数高但倾向低」排在「分数低但倾向高」之后，证明倾向确实先于 score 生效
+        insert_clusters(
+            &conn,
+            "j1",
+            &[
+                mk(0.69, Some(0.20)),
+                mk(0.56, Some(0.91)),
+                mk(0.68, None),
+                mk(0.60, Some(0.55)),
+            ],
+        )
+        .unwrap();
+        let rows = list_clusters(&conn, "j1", &Default::default(), 0, 100).unwrap();
+        let order: Vec<Option<i64>> =
+            rows.iter().map(|r| r.rerank_score.map(|v| (v * 100.0).round() as i64)).collect();
+        assert_eq!(
+            order,
+            vec![Some(91), Some(55), Some(20), None],
+            "复核队列须按倾向降序，未复核（NULL）垫底"
+        );
+    }
+
+    /// 复核带关闭（全表 rerank_score 为 NULL）时排序退化为 M6 口径：风险档 → 分数降序。
+    #[test]
+    fn list_clusters_order_unchanged_when_rerank_disabled() {
+        let conn = setup();
+        let mk = |score: f32, severity: &str| NewCluster {
+            cluster_type: "uncertain".into(),
+            topic: None,
+            summary: None,
+            severity: severity.into(),
+            score,
+            section_kind: None,
+            conflict_json: None,
+            base_section_path: None,
+            base_page: None,
+            exempt_reason: None,
+            multi_doc_anomaly: false,
+            confidence: None,
+            band: None,
+            rerank_score: None,
+            members: vec![],
+            diffs: vec![],
+        };
+        insert_clusters(
+            &conn,
+            "j1",
+            &[mk(0.60, "review"), mk(0.95, "high"), mk(0.80, "review"), mk(0.70, "medium")],
+        )
+        .unwrap();
+        let rows = list_clusters(&conn, "j1", &Default::default(), 0, 100).unwrap();
+        let order: Vec<i64> =
+            rows.iter().map(|r| (r.score.unwrap() * 100.0).round() as i64).collect();
+        assert_eq!(order, vec![95, 70, 80, 60], "high → medium → review(分数降序)");
     }
 
     #[test]

@@ -21,6 +21,69 @@ pub fn level_cn(l: &str) -> &'static str {
     }
 }
 
+/// 围标结论的【证据强度口头等级】（ENFSI 式，§1.5-2）：M7 起 score 是校准后的证据强度，
+/// 数值一律不作「串通概率 X%」呈现——报告只给口头等级，数值留在 JSON 技术字段供二次处理。
+pub fn strength_phrase(level: &str) -> &'static str {
+    match level {
+        "high" => "强支持「同源编制」假设",
+        "medium" => "中等支持「同源编制」假设",
+        "low" => "弱支持「同源编制」假设",
+        _ => "未见支持「同源编制」假设的证据",
+    }
+}
+
+/// 单条信号的贡献标签：M7 起 weight 是该信号的对数似然比（log-odds）贡献，不是 0–1 权重占比。
+pub fn contrib_label(weight: f32) -> String {
+    format!("对数似然比贡献 +{weight:.2}")
+}
+
+/// 融合口径脚注（§1.5-5：分级语义变更需可解释 + §1.5-6 实验性标签）。随每份报告的综合判定段落输出。
+pub fn calibration_note(kind: &str, version: &str, app_version: &str) -> String {
+    let src = match kind {
+        "experimental-synthetic" => "实验性校准（合成语料拟合的融合权重）",
+        "empirical-fallback" => "经验权重回退档（本次未启用语料校准）",
+        _ => "未标注校准来源（旧任务，按当时口径生成）",
+    };
+    let ver = if version.is_empty() { "—" } else { version };
+    format!(
+        "融合口径：{src}；权重版本 {ver}；引擎 {app_version}。证据强度由各信号的对数似然比贡献融合而来，         为在合成校准语料上测得的强度等级、不是串通概率；未命中不构成清白证明，是否构成串通投标须由评标委员会依法认定。"
+    )
+}
+
+/// 一条条款的三带名（W6-4）。band=None（旧任务/未校准）→「未校准」，不留空白
+/// ——空白会被读成「没问题」，而未校准只是没测过（§1.5-1 如实展示）。
+pub fn band_cn_of(band: Option<&str>) -> &'static str {
+    crate::engine::calibrate::band_cn(band.unwrap_or(""))
+}
+
+/// 三带章节的人读正文（六格式共用，文案只此一份，避免各写器各写一版而漂移）。
+pub fn calibration_lines(c: &crate::export::data::CalibrationSection) -> Vec<String> {
+    let mut out = vec![format!(
+        "复核路由：{} {} 条 · {} {} 条 · {} {} 条 · 未校准 {} 条",
+        c.flag_label, c.flag_count, c.review_label, c.review_count, c.pass_label, c.pass_count,
+        c.uncalibrated_count
+    )];
+    if !c.version.is_empty() {
+        let src = match c.calibration_kind.as_str() {
+            "experimental-synthetic" => "实验性校准（合成语料）",
+            "empirical-fallback" => "经验回退档",
+            "" => "未标注",
+            other => other,
+        };
+        out.push(format!(
+            "校准来源：{src} · 版本 {}{}",
+            c.version,
+            if c.corpus_hash.is_empty() {
+                String::new()
+            } else {
+                format!(" · 语料 {}", &c.corpus_hash[..c.corpus_hash.len().min(8)])
+            }
+        ));
+    }
+    out.extend(c.notes.iter().cloned());
+    out
+}
+
 pub fn section_cn(s: &str) -> &'static str {
     match s {
         "tech" => "技术标",

@@ -5,6 +5,8 @@
 pub mod align;
 pub mod background;
 pub mod boq;
+/// 概率校准与共形三带（M7 W6-4）：簇分 → 校准概率 → 低优先级抽查/需人工复核/重点标红。
+pub mod calibrate;
 pub mod candidate;
 pub mod chunker;
 pub mod clustering;
@@ -20,12 +22,16 @@ pub mod fact;
 pub mod features;
 pub mod fingerprint;
 pub mod matrix;
+/// 模型按需下载的共用落盘器（embed / rerank）：.tar 原子落盘 + sha256 完整性校验。
+pub mod modelfetch;
 pub mod normalize;
 pub mod ocr;
 pub mod parse;
 pub mod pdf_audit;
 pub mod pdf_xcheck;
 pub mod report;
+/// cross-encoder 复核带（M7 W6-2）：uncertain 簇的【复核建议】分，不自动改判。
+pub mod rerank;
 pub mod scoring;
 pub mod segment;
 pub mod similarity;

@@ -13,7 +13,7 @@ import type { Screen } from "../routes";
 import type { Collusion, Fingerprint } from "../engine";
 import type { CompareSummaryDto } from "../api/types";
 import { docColor, docTag } from "../utils/docTag";
-import { simBand } from "../utils/clusterUi";
+import { bandUi, routingNote, simBand } from "../utils/clusterUi";
 
 const EMPTY_FP: Fingerprint = {
   author: null,
@@ -68,6 +68,10 @@ interface MatrixView {
   pairRows: PairRow[];
   insights: Insight[];
   forensicSignals: { tag: string; fg: string; bg: string; detail: string; weight: number }[];
+  /** 围标结论的证据强度口头等级（ENFSI 式，§1.5-2）：不展示概率数值。 */
+  strength: string;
+  /** 复核路由三带统计（W6-4）+ 分流说明；旧任务全部计入「未校准」。 */
+  bands: { pass: number; review: number; flag: number; uncalibrated: number; note: string };
   /** M6 商务标数值层：有清单数据才提供「商务标数值」入口（独立屏，决策 5）。 */
   hasNumeric: boolean;
   numericAlarmPairs: number;
@@ -101,6 +105,11 @@ const KIND_META: Record<string, { tag: string; fg: string; bg: string }> = {
   numericMechanism: { tag: "评标机制反事实", fg: C.hi3, bg: C.hi3Soft },
 };
 const KIND_META_DEFAULT = { tag: "相似", fg: C.hi3, bg: C.brandSoft };
+// M7 起 CollusionSignal.weight 是该信号的【对数似然比贡献】（log-odds），不再是 0–1 的权重占比，
+// 故不能再按百分比呈现。数值越大代表该证据把结论往「同源编制」方向推得越多；分解按贡献降序。
+function contribLabel(weight: number): string {
+  return `对数似然比贡献 +${weight.toFixed(2)}`;
+}
 // 取证指纹折叠区消费的信号 kind（rsid/PDF 血缘/图片同源/共同错误）。
 const FORENSIC_KINDS = ["rsid", "pdfLineage", "imageReuse", "sharedErrors"];
 const FORENSIC_DISCLAIMER =
@@ -109,6 +118,21 @@ const FORENSIC_DISCLAIMER =
 function sev(pct: number): { c: string; label: string } {
   const b = simBand(pct);
   return { c: b.color, label: b.label };
+}
+
+// 围标结论的【证据强度口头等级】（ENFSI 式，§1.5-2）：M7 起围标 score 是校准后的证据强度，
+// 一律不作「串通概率 X%」呈现——屏幕只给口头等级，概率数值仅留在 collusion_json 技术字段。
+function strengthPhrase(level: string): string {
+  switch (level) {
+    case "high":
+      return "强支持「同源编制」假设";
+    case "medium":
+      return "中等支持「同源编制」假设";
+    case "low":
+      return "弱支持「同源编制」假设";
+    default:
+      return "未见支持「同源编制」假设的证据";
+  }
 }
 
 const LEVEL_META: Record<string, { pill: string; color: string; statement: string }> = {
@@ -195,12 +219,12 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
         tag: "异常字符",
         fg: C.warn,
         bg: C.warnSoft,
-        title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`,
+        title: contribLabel(sig.weight),
         body: "检测到异常字符（可能来自复制粘贴），建议人工留意；未达规避特征确认级，未必构成规避。",
       };
     }
     const meta = KIND_META[sig.kind] ?? KIND_META_DEFAULT;
-    return { ...meta, title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`, body: sig.detail };
+    return { ...meta, title: contribLabel(sig.weight), body: sig.detail };
   });
   // 取证指纹折叠区：逐条列出 rsid/PDF 血缘/图片同源/共同错误信号（明细含天干对与免责纪律）。
   const forensicSignals = signals
@@ -245,6 +269,26 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
     peakPair: `${docs[pi].tag} ←→ ${docs[pj].tag}`,
     tenderRefCount: sm.summary?.tenderRefChunkCount ?? 0,
     peakOriginalPct: Math.round((sm.matrix?.peakOriginal ?? sm.matrix?.peak ?? 0) * 100),
+    strength: strengthPhrase(level),
+    bands: {
+      pass: sm.summary?.bandPassCount ?? 0,
+      review: sm.summary?.bandReviewCount ?? 0,
+      flag: sm.summary?.bandFlagCount ?? 0,
+      uncalibrated:
+        sm.summary?.bandUncalibratedCount ??
+        Math.max(
+          0,
+          (sm.summary?.clusterCount ?? 0) -
+            (sm.summary?.bandPassCount ?? 0) -
+            (sm.summary?.bandReviewCount ?? 0) -
+            (sm.summary?.bandFlagCount ?? 0),
+        ),
+      note: routingNote(
+        sm.summary?.calibrationRouting,
+        sm.summary?.calibrationAlpha,
+        sm.summary?.calibrationBeta,
+      ),
+    },
     conclusion: { pill: lv.pill, statement, desc },
     pairRows,
     insights,
@@ -387,7 +431,54 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
               >
                 {v.conclusion.statement}
               </div>
+              {/* 证据强度口头等级（§1.5-2 ENFSI 式）：不展示「串通概率 X%」，
+                  概率数值仅保留在导出 JSON 的技术字段并注明「合成语料校准、非串通概率」。 */}
+              <div style={{ fontSize: 12.5, color: mute, marginTop: 8 }}>
+                证据强度：<b style={{ color: ink }}>{v.strength}</b>
+                （在合成校准语料上测得的强度等级，不是串通概率；是否构成串通投标须由评标委员会依法认定）
+              </div>
               <div style={{ fontSize: 13, color: mute, marginTop: 8, lineHeight: 1.65 }}>{v.conclusion.desc}</div>
+              {/* 复核路由三带统计（W6-4）：条款按什么口径排队，报告与列表口径一致 */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: mute }}>复核路由</span>
+                {([
+                  ["flag", v.bands.flag],
+                  ["review", v.bands.review],
+                  ["pass", v.bands.pass],
+                  ["uncalibrated", v.bands.uncalibrated],
+                ] as const).map(([key, n]) => {
+                  const ui = bandUi(key);
+                  return (
+                    <span
+                      key={key}
+                      role="button"
+                      tabIndex={0}
+                      title={ui.hint}
+                      onClick={() => onGo("clusters")}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onGo("clusters");
+                        }
+                      }}
+                      style={{
+                        fontSize: 11,
+                        padding: "3px 9px",
+                        borderRadius: 999,
+                        cursor: "pointer",
+                        color: ui.fg,
+                        background: ui.bg,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {ui.label} {n}
+                    </span>
+                  );
+                })}
+                <span style={{ fontSize: 10.5, color: mute, flexBasis: "100%", lineHeight: 1.6 }}>
+                  {v.bands.note}
+                </span>
+              </div>
               {v.segMatrix && (
                 <div style={{ fontSize: 11, color: mute, marginTop: 8, lineHeight: 1.6 }}>
                   围标判定基于<b style={{ color: ink }}>聚类口径（剔除后 · 峰值 {v.peakPct}%）</b>；
@@ -671,7 +762,7 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                             {s.tag}
                           </Pill>
                           <span style={{ fontSize: 11, color: mute, fontFamily: C.mono }}>
-                            权重 {(s.weight * 100).toFixed(0)}%
+                            {contribLabel(s.weight)}
                           </span>
                         </div>
                         <div style={{ fontSize: 11, color: mute, marginTop: 6, lineHeight: 1.6 }}>{s.detail}</div>

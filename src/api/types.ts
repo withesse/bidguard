@@ -121,6 +121,25 @@ export interface AppInfoDto {
   embeddingModels: EmbedModelInfo[];
   ocrModels: OcrModelInfo[];
   defaultOcrModel: string;
+  /** 随包概率校准的只读台账（W6-4）：设置页展示，不可运行时调整（改 α 即改承诺语义）。 */
+  calibration?: CalibrationInfoDto;
+}
+
+export interface CalibrationInfoDto {
+  available: boolean;
+  version: string;
+  /** 'experimental-synthetic' = 合成语料拟合的实验性校准。 */
+  kind: string;
+  /** 'platt' | 'isotonic'。 */
+  calibrator: string;
+  /** 'three-band' = 三带分流生效；'review-all' = 分流未启用，全部按需人工复核。 */
+  routing: string;
+  alpha: number;
+  beta: number;
+  tLow: number;
+  tHigh: number;
+  corpusHash: string;
+  note: string;
 }
 
 export interface ProgressEvent {
@@ -161,6 +180,11 @@ export interface CompareRequest {
   /** 逐项单价雷同率告警线（W5-2）：默认 0.80，后端 clamp 到 0.5–1.0，随任务配置快照持久化。 */
   identicalRateAlarm?: number;
   embeddingModel?: string;
+  /** 交叉复核（W6-2）：对「待复核」条款跑 cross-encoder 产出【复核建议分】。默认 false。
+   *  只影响复核队列排序与倾向徽标，【不改判分类】——结论仍需人工确认。 */
+  enableRerank?: boolean;
+  /** 复核模型档位，默认 bge-reranker-base-int8。 */
+  rerankModel?: string;
 }
 
 /** 一条共享算术错误（W5-2）：同一对齐清单项在两份文档中 工程量/单价/（算错的）合价三者全等。
@@ -342,6 +366,26 @@ export interface CompareSummary {
   /** 识别为报价清单的表数 / 表头未识别或列数不一致被跳过的表数。 */
   boqTableCount?: number;
   boqSkippedTableCount?: number;
+  /**
+   * 复核路由三带计数（W6-4）：四者之和恒等于 clusterCount。旧任务缺键 → 全部按「未校准」渲染。
+   * 【低优先级抽查带只排序与折叠，不隐藏任何条款】。
+   */
+  bandPassCount?: number;
+  bandReviewCount?: number;
+  bandFlagCount?: number;
+  bandUncalibratedCount?: number;
+  /** 生效校准版本 / 来源标签 / 分流模式（'three-band' | 'review-all'）；空 = 本次未校准。 */
+  calibrationVersion?: string;
+  calibrationKind?: string;
+  calibrationRouting?: string;
+  /** 目标漏检率 α / 误报率 β：【在合成校准语料上测得】，不是对真实标书的承诺。 */
+  calibrationAlpha?: number;
+  calibrationBeta?: number;
+  /** 交叉复核（W6-2）：开了复核但模型不可用（未缓存 + 离线）→ true，比对照常完成。
+   *  【不静默失败】：缺失的倾向分不等于「没有嫌疑」。 */
+  rerankDegraded?: boolean;
+  /** 实际拿到复核建议分的簇数。 */
+  rerankReviewedCount?: number;
 }
 
 export interface ClusterSummaryDto {
@@ -364,6 +408,15 @@ export interface ClusterSummaryDto {
   exemptReason: string | null;
   /** k-共现查证（W3-3）：『多家异常一致·待复核』——红色徽标、涉嫌措辞，需评标委员会依法认定。 */
   multiDocAnomaly: boolean;
+  /**
+   * 校准置信度（W6-4）：【在合成校准语料上校准的数值，不是串通概率】。
+   * null = 未校准（旧任务或校准文件不可用）→ UI 显示「未校准」，不留空白。
+   */
+  confidence?: number | null;
+  /** 复核路由三带码值：'pass' | 'review' | 'flag'；null = 未校准。 */
+  band?: string | null;
+  /** cross-encoder 复核建议分（W6-2，默认关闭）；null = 未跑复核层。 */
+  rerankScore?: number | null;
 }
 
 export interface PageResult<T> {
@@ -386,6 +439,8 @@ export interface ClusterFilter {
   multiDocAnomaly?: boolean;
   /** 仅『恰好两家共有』簇（W3-3 首要证据视图）。 */
   twoDocsOnly?: boolean;
+  /** 按三带筛选（W6-4）：'pass' | 'review' | 'flag' | 'uncalibrated'。只筛不藏。 */
+  band?: string;
 }
 
 export interface MemberDetailDto {
@@ -600,11 +655,22 @@ export interface EmbedModelStatus {
   cached: boolean;
   sizeBytes: number;
 }
+/** 复核模型（cross-encoder，W6-2）：sizeLabel 是标称体积（未下载也要能看到要占多少盘），
+ *  sizeBytes 是实测占用（未就绪为 0）。 */
+export interface RerankModelStatus {
+  key: string;
+  label: string;
+  sizeLabel: string;
+  cached: boolean;
+  sizeBytes: number;
+}
 export interface ModelStatusDto {
   ocrPresent: boolean;
   ocrLocation: string | null;
   embedCacheDir: string | null;
   embeddingModels: EmbedModelStatus[];
+  rerankCacheDir: string | null;
+  rerankModels: RerankModelStatus[];
 }
 export interface StorageInfoDto {
   dbBytes: number;

@@ -1,6 +1,6 @@
 // CSV 报告：条款级平铺（每个成员一行），UTF-8 BOM 让 Excel 直接识别中文。
 use super::data::ExportData;
-use super::shared::{review_cn, section_cn, severity_cn, type_cn};
+use super::shared::{band_cn_of, review_cn, section_cn, severity_cn, type_cn};
 
 fn esc(s: &str) -> String {
     // CWE-1236 CSV 公式注入防护：标书正文来自投标人（对抗方），若单元格以 = + - @ 或
@@ -17,7 +17,7 @@ fn esc(s: &str) -> String {
 
 pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     let mut out = String::from("\u{feff}");
-    out.push_str("组号,类型,风险,确认状态,标段,组内相似,主题,涉及文档,文档,角色,页码,章节路径,文本\n");
+    out.push_str("组号,类型,风险,复核路由,确认状态,标段,组内相似,主题,涉及文档,文档,角色,页码,章节路径,文本\n");
     for c in &data.clusters {
         let docs: Vec<&str> = {
             let mut seen: Vec<&str> = Vec::new();
@@ -30,10 +30,11 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         };
         for m in &c.members {
             out.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 c.index,
                 type_cn(&c.cluster_type),
                 severity_cn(c.severity.as_deref().unwrap_or("none")),
+                band_cn_of(c.band.as_deref()),
                 review_cn(&c.review_status),
                 section_cn(c.section_kind.as_deref().unwrap_or("other")),
                 c.score.map(|s| format!("{:.0}%", s * 100.0)).unwrap_or_default(),

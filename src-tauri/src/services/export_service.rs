@@ -145,6 +145,8 @@ pub fn assemble(
                     .and_then(|s| serde_json::from_str::<FactConflict>(s).ok()),
                 exempt_reason: row.exempt_reason.clone(),
                 multi_doc_anomaly: row.multi_doc_anomaly,
+                band: row.band.clone(),
+                confidence: row.confidence,
                 members: Vec::new(),
             });
         }
@@ -203,6 +205,21 @@ pub fn assemble(
     // 屏幕、与围标判定同源）。无清单数据 → None（不渲染空章节）。
     let numeric = build_numeric(r.numeric_json.as_deref(), &doc_ids);
     let methods_and_limitations = MethodsAndLimitations::standard();
+    // M7「复核路由三带」节：计数就地从本报告的条款清单统计（与屏幕同源：clusters 来自
+    // 同一次比对的落库结果），校准元数据取生效模型——旧任务的簇 band 为 NULL ⇒ 全部计入
+    // 「未校准」，报告如实写明本次未启用校准。
+    let calibration = {
+        let mut c = (0usize, 0usize, 0usize, 0usize);
+        for cl in &clusters {
+            match cl.band.as_deref() {
+                Some(crate::engine::calibrate::BAND_PASS) => c.0 += 1,
+                Some(crate::engine::calibrate::BAND_REVIEW) => c.1 += 1,
+                Some(crate::engine::calibrate::BAND_FLAG) => c.2 += 1,
+                _ => c.3 += 1,
+            }
+        }
+        crate::export::data::CalibrationSection::build(summary.as_ref(), c)
+    };
 
     let mut data = ExportData {
         report_version: REPORT_VERSION,
@@ -225,6 +242,7 @@ pub fn assemble(
         evasion,
         segments,
         numeric,
+        calibration,
         methods_and_limitations,
     };
     apply_export_prefs(conn, &mut data, include_raw_text, include_config)?;
@@ -668,6 +686,8 @@ mod tests {
             enable_alignment: true,
             enable_numeric: true,
             identical_rate_alarm: 0.80,
+            enable_rerank: false,
+            rerank_model: "bge-reranker-base-int8".into(),
         };
         // 与 start_compare 一致：运行配置存入任务行（assemble 从这里取 documentIds）
         let cctx = {
@@ -750,6 +770,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 复核路由三带节 golden（六格式，W6-4）：直接构造带三带的 ExportData 喂给写器——
+    /// ①六格式都写出三带章节/列；②「低优先级抽查」带的条款【不被丢弃】（§1.5-1 只排序不隐藏）；
+    /// ③人读格式不出现「自动放行 / 漏检保证 / 串通概率」；④未校准条款写「未校准」不留空。
+    #[test]
+    fn calibration_band_section_renders_in_all_formats_and_hides_nothing() {
+        use crate::engine::report::Collusion;
+        use crate::export::data::CalibrationSection;
+        let dir = std::env::temp_dir().join(format!("bg_band_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cluster = |i: usize, band: Option<&str>, topic: &str| ExportCluster {
+            index: i,
+            cluster_type: "same".into(),
+            severity: Some("low".into()),
+            topic: Some(topic.into()),
+            summary: None,
+            score: Some(0.9),
+            review_status: "pending".into(),
+            section_kind: Some("tech".into()),
+            conflict: None,
+            exempt_reason: None,
+            multi_doc_anomaly: false,
+            band: band.map(str::to_string),
+            confidence: Some(0.87),
+            members: vec![ExportMember {
+                doc: 0,
+                tag: "甲".into(),
+                text: format!("{topic} 的正文片段"),
+                page: Some(3),
+                section_path: vec!["第一章".into()],
+                role: "primary".into(),
+            }],
+        };
+        let mut sm = CompareSummary { cluster_count: 4, ..Default::default() };
+        sm.calibration_version = "m7-calib-test".into();
+        sm.calibration_kind = "experimental-synthetic".into();
+        sm.calibration_routing = "three-band".into();
+        sm.calibration_alpha = 0.05;
+        sm.calibration_beta = 0.05;
+        let clusters = vec![
+            cluster(1, Some("flag"), "标红条款"),
+            cluster(2, Some("review"), "复核条款"),
+            cluster(3, Some("pass"), "抽查条款"),
+            cluster(4, None, "旧任务条款"),
+        ];
+        let data = ExportData {
+            report_version: "2.0",
+            app_version: "test",
+            generated_at: "2026-07-27T00:00:00.000Z".into(),
+            workspace_id: "w1".into(),
+            job_id: "j1".into(),
+            job_name: Some("三带测试".into()),
+            documents: vec![ExportDoc {
+                tag: "甲".into(),
+                name: "甲标.docx".into(),
+                file_type: "docx".into(),
+                pages: 10,
+                char_count: 5000,
+                parse_method: Some("docx".into()),
+                risk_flags: vec![],
+            }],
+            config: serde_json::json!({}),
+            summary: Some(sm.clone()),
+            matrix: vec![vec![1.0]],
+            peak: 0.9,
+            collusion: Collusion::default(),
+            shared_terms: vec![],
+            sections: vec![],
+            clusters,
+            pairs: vec![],
+            forensic: None,
+            evasion: None,
+            segments: None,
+            numeric: None,
+            calibration: CalibrationSection::build(Some(&sm), (1, 1, 1, 1)),
+            methods_and_limitations: MethodsAndLimitations::standard(),
+        };
+
+        for (fmt, ext) in [("html", "html"), ("markdown", "md"), ("csv", "csv"), ("json", "json")] {
+            let p = dir.join(format!("r.{ext}"));
+            crate::export::write(&data, fmt, p.to_str().unwrap()).unwrap();
+            let text = std::fs::read_to_string(&p).unwrap();
+            for band in ["低优先级抽查", "需人工复核", "重点标红"] {
+                assert!(text.contains(band), "{fmt} 应含三带名「{band}」");
+            }
+            // 只排序不隐藏：三带的条款一条都不能少（含未校准那条）。
+            for topic in ["标红条款", "复核条款", "抽查条款", "旧任务条款"] {
+                assert!(text.contains(topic), "{fmt} 丢了条款「{topic}」——三带只排序不隐藏");
+            }
+            assert!(!text.contains("自动放行"), "{fmt} 禁用「自动放行」字样");
+            assert!(!text.contains("漏检保证"), "{fmt} 禁用「漏检保证」字样");
+            // 「串通概率」只允许出现在否定式免责语里（「不是串通概率」/「非串通概率」），
+            // 绝不能作为一个被展示的量（§1.5-2 检察官谬误）。
+            for (i, _) in text.match_indices("串通概率") {
+                let before = &text[..i];
+                assert!(
+                    before.ends_with("不是") || before.ends_with("非"),
+                    "{fmt} 出现了非否定式的「串通概率」表述：…{}",
+                    &text[i.saturating_sub(20)..(i + 20).min(text.len())]
+                );
+            }
+            if fmt != "json" {
+                assert!(text.contains("未校准"), "{fmt} 未校准条款应写「未校准」而不是留空");
+            }
+        }
+        // 二进制格式只验证能写出且非空（内容由各自库封装）。
+        for (fmt, ext) in [("xlsx", "xlsx"), ("docx", "docx")] {
+            let p = dir.join(format!("r.{ext}"));
+            crate::export::write(&data, fmt, p.to_str().unwrap()).unwrap();
+            assert!(std::fs::metadata(&p).unwrap().len() > 0, "{fmt} 应写出非空文件");
+        }
+        // JSON 技术字段：置信度数值保留，但必须与限定语同在（§1.5-2）。
+        let jp = dir.join("r.json");
+        let json = std::fs::read_to_string(&jp).unwrap();
+        assert!(json.contains("\"confidence\": 0.87"), "JSON 应保留置信度技术字段");
+        assert!(json.contains("\"routing\": \"three-band\""), "JSON 应记录分流模式");
+        assert!(json.contains("不是串通概率"), "JSON 的三带节须带概率语义限定语");
+
+        // 未校准态（旧任务）：章节仍常驻，如实写「本次比对未启用概率校准」。
+        let uncal = ExportData {
+            summary: None,
+            calibration: CalibrationSection::build(None, (0, 0, 0, 4)),
+            ..data
+        };
+        let up = dir.join("uncal.html");
+        crate::export::write(&uncal, "html", up.to_str().unwrap()).unwrap();
+        let uhtml = std::fs::read_to_string(&up).unwrap();
+        assert!(uhtml.contains("复核路由（三带）"), "未校准时三带章节仍常驻");
+        assert!(uhtml.contains("未启用概率校准"), "未校准时须如实说明");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 附录 A 三节 golden（HTML/JSON）：直接构造带取证/规避命中的 ExportData 喂给写器——
     /// 与导入管线解耦、离线秒级，验证 forensic/evasion/methodsAndLimitations 三节的渲染与序列化。
     #[test]
@@ -829,6 +981,7 @@ mod tests {
             segments: None,
             numeric: None,
             methods_and_limitations: MethodsAndLimitations::standard(),
+            calibration: crate::export::data::CalibrationSection::build(None, (0, 0, 0, 0)),
         };
 
         let hp = dir.join("f.html");
@@ -913,6 +1066,7 @@ mod tests {
             segments,
             numeric: None,
             methods_and_limitations: MethodsAndLimitations::standard(),
+            calibration: crate::export::data::CalibrationSection::build(None, (0, 0, 0, 0)),
         };
         let data = base(Some(SegmentsSection {
             pairs: vec![SegmentPair {
@@ -1098,6 +1252,7 @@ mod tests {
             segments: None,
             numeric,
             methods_and_limitations: MethodsAndLimitations::standard(),
+            calibration: crate::export::data::CalibrationSection::build(None, (0, 0, 0, 0)),
         };
         let data = base(Some(section));
 

@@ -10,7 +10,16 @@ import { useTheme } from "../theme";
 import type { ClusterFilter, ClusterSummaryDto } from "../api/types";
 import { useClustersInfinite, useCompareSummary, useSetReviewStatus } from "../queries/data";
 import { docTag } from "../utils/docTag";
-import { REVIEW_UI, severityUi, typeUi, zoneUi } from "../utils/clusterUi";
+import {
+  bandUi,
+  RERANK_DISCLAIMER,
+  rerankUi,
+  REVIEW_UI,
+  routingNote,
+  severityUi,
+  typeUi,
+  zoneUi,
+} from "../utils/clusterUi";
 
 const TYPE_FILTERS: Array<{ key: string | undefined; label: string }> = [
   { key: undefined, label: "全部" },
@@ -34,6 +43,16 @@ const ZONE_FILTERS: Array<{ key: string | undefined; label: string }> = [
   { key: "other", label: "其他" },
 ];
 
+// 复核路由三带筛选（W6-4）：【只筛不藏】——「低优先级抽查」带的条款一直在列表里
+// （后端排序把它排到最后），这里的 chip 只是快速定位，不是可见性开关。
+const BAND_FILTERS: Array<{ key: string | undefined; label: string }> = [
+  { key: undefined, label: "全部" },
+  { key: "flag", label: "重点标红" },
+  { key: "review", label: "需人工复核" },
+  { key: "pass", label: "低优先级抽查" },
+  { key: "uncalibrated", label: "未校准" },
+];
+
 export function ClustersScreen() {
   const { wsId, jobId } = useParams<{ wsId: string; jobId: string }>();
   const nav = useNavigate();
@@ -44,6 +63,12 @@ export function ClustersScreen() {
   // k-共现查证（W3-3）快捷筛选：仅两家共有（首要证据视图）/ 仅多家异常一致（待复核）。
   const [onlyTwoDocs, setOnlyTwoDocs] = useState(false);
   const [onlyAnomaly, setOnlyAnomaly] = useState(false);
+  // 复核路由三带筛选（W6-4）：默认「全部」——三带只改排序，不做默认过滤，
+  // 否则「低优先级抽查」带会在用户不知情时消失（§1.5-1 铁律：不隐藏任何簇）。
+  const [bandKey, setBandKey] = useState<string | undefined>(undefined);
+  // 「低优先级抽查」带默认折叠为单行（后端已把该带排到最后）。折叠 ≠ 隐藏：条款仍在列表里、
+  // 仍计数、仍可点开、仍进导出——§1.5-1 铁律，这个开关只改行高不改可见性。
+  const [collapsePass, setCollapsePass] = useState(true);
 
   const filter: ClusterFilter = useMemo(
     () => ({
@@ -52,8 +77,9 @@ export function ClustersScreen() {
       reviewStatus: onlyPending ? "pending" : undefined,
       twoDocsOnly: onlyTwoDocs ? true : undefined,
       multiDocAnomaly: onlyAnomaly ? true : undefined,
+      band: bandKey,
     }),
-    [typeKey, zoneKey, onlyPending, onlyTwoDocs, onlyAnomaly],
+    [typeKey, zoneKey, onlyPending, onlyTwoDocs, onlyAnomaly, bandKey],
   );
   const { data: summary } = useCompareSummary(jobId);
   const q = useClustersInfinite(jobId, filter);
@@ -64,6 +90,17 @@ export function ClustersScreen() {
     [q.data],
   );
   const total = q.data?.pages[0]?.total ?? 0;
+
+  // 三带计数（W6-4）：来自比对快照，与当前筛选无关；旧任务缺键 → 全部计入「未校准」。
+  const bandCounts: Record<string, number | undefined> = useMemo(() => {
+    const s = summary?.summary;
+    if (!s) return {};
+    const pass = s.bandPassCount ?? 0;
+    const review = s.bandReviewCount ?? 0;
+    const flag = s.bandFlagCount ?? 0;
+    const uncal = s.bandUncalibratedCount ?? Math.max(0, s.clusterCount - pass - review - flag);
+    return { all: s.clusterCount, pass, review, flag, uncalibrated: uncal };
+  }, [summary?.summary]);
 
   const docOrder: string[] = (summary?.matrix?.documentIds as string[]) ?? [];
   const tagOf = (docId: string) => {
@@ -162,6 +199,14 @@ export function ClustersScreen() {
           onToggle={() => setOnlyAnomaly((v) => !v)}
         />
         <QuickToggle
+          label="折叠低优先级抽查"
+          active={collapsePass}
+          activeColor="var(--accent, #4F58A8)"
+          mute={mute}
+          border={border}
+          onToggle={() => setCollapsePass((v) => !v)}
+        />
+        <QuickToggle
           label="只看待确认"
           active={onlyPending}
           activeColor="var(--accent, #4F58A8)"
@@ -169,6 +214,64 @@ export function ClustersScreen() {
           border={border}
           onToggle={() => setOnlyPending((v) => !v)}
         />
+      </div>
+
+      {/* 复核路由三带（W6-4）：计数 chips + 分流说明。计数取自比对快照（summary），
+          与列表筛选独立——即使当前筛掉了某带，计数仍显示全量，避免「看不见 = 不存在」。 */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "8px 24px",
+          borderBottom: `1px solid ${border}`,
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ fontSize: 11, color: mute, marginRight: 2 }}>复核路由</span>
+        {BAND_FILTERS.map((f) => {
+          const active = bandKey === f.key;
+          const ui = f.key ? bandUi(f.key) : null;
+          const n = bandCounts[f.key ?? "all"];
+          return (
+            <span
+              key={f.label}
+              role="button"
+              tabIndex={0}
+              title={ui?.hint ?? "不过滤：三带只改排序，不隐藏任何条款"}
+              onClick={() => setBandKey(f.key)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setBandKey(f.key); } }}
+              style={{
+                fontSize: 11,
+                padding: "4px 10px",
+                borderRadius: 999,
+                cursor: "pointer",
+                background: active ? (ui ? ui.bg : "rgba(79,88,168,0.15)") : "transparent",
+                color: active ? (ui ? ui.fg : "var(--accent, #4F58A8)") : mute,
+                border: `1px solid ${active ? (ui ? ui.fg : "var(--accent, #4F58A8)") : border}`,
+                fontWeight: active ? 700 : 500,
+              }}
+            >
+              {f.label}
+              {n != null ? ` ${n}` : ""}
+            </span>
+          );
+        })}
+        <span style={{ fontSize: 10.5, color: mute, flexBasis: "100%", marginTop: 2 }}>
+          {routingNote(summary?.summary?.calibrationRouting, summary?.summary?.calibrationAlpha, summary?.summary?.calibrationBeta)}
+        </span>
+        {/* 交叉复核降级（W6-2）：开了复核但模型不可用 ⇒ 明说没跑成，不能让缺失的倾向分
+            被读成「没有嫌疑」。已跑成时说明覆盖了多少条款。 */}
+        {summary?.summary?.rerankDegraded && (
+          <span style={{ fontSize: 10.5, color: "#B06A3B", flexBasis: "100%" }}>
+            交叉复核未执行：复核模型未缓存且当前离线，本次比对未产出「AI 复核倾向」（其余结果不受影响）。可在工具箱预下载复核模型后重跑。
+          </span>
+        )}
+        {!summary?.summary?.rerankDegraded && (summary?.summary?.rerankReviewedCount ?? 0) > 0 && (
+          <span style={{ fontSize: 10.5, color: mute, flexBasis: "100%" }}>
+            {`已对 ${summary?.summary?.rerankReviewedCount} 个「待复核」条款给出 AI 复核倾向：${RERANK_DISCLAIMER}。`}
+          </span>
+        )}
       </div>
 
       {/* 五区筛选（W3-5）：按标段分区过滤 */}
@@ -231,6 +334,7 @@ export function ClustersScreen() {
                 {c ? (
                   <ClusterRow
                     c={c}
+                    collapsed={collapsePass && c.band === "pass"}
                     tagOf={tagOf}
                     cardBg={cardBg}
                     border={border}
@@ -260,6 +364,7 @@ export function ClustersScreen() {
 
 function ClusterRow({
   c,
+  collapsed,
   tagOf,
   cardBg,
   border,
@@ -269,6 +374,8 @@ function ClusterRow({
   onReview,
 }: {
   c: ClusterSummaryDto;
+  /** 折叠为单行（低优先级抽查带默认折叠）。折叠只压缩行高，不影响可见性与可点击。 */
+  collapsed?: boolean;
   tagOf: (id: string) => string;
   cardBg: string;
   border: string;
@@ -280,10 +387,59 @@ function ClusterRow({
   const t = typeUi(c.clusterType);
   const sev = severityUi(c.severity);
   const zone = zoneUi(c.sectionKind);
+  const band = bandUi(c.band);
+  // 交叉复核建议（W6-2）：只在跑过复核层的簇上出现；【不改判分类】，仅供排序与人工参考。
+  const lean = rerankUi(c.rerankScore);
   const review = REVIEW_UI[c.reviewStatus] ?? REVIEW_UI.pending;
   // k-共现查证（W3-3）：豁免簇（合法共享）置灰、标出处；异常簇标『待复核·涉嫌一致』红徽标。
   const exemptLabel =
     c.exemptReason === "tender" ? "引用招标文件" : c.exemptReason === "background" ? "行业范本套话" : null;
+  if (collapsed) {
+    // 折叠态：单行摘要（徽标 + 标题 + 相似度），点击照常进详情。折叠只是把复核注意力
+    // 让给前面的带，条款本身没有被隐藏或剔除（§1.5-1）。
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        title={`${band.label}：${band.hint}`}
+        onClick={onOpen}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}
+        style={{
+          background: cardBg,
+          border: `1px solid ${border}`,
+          borderRadius: 8,
+          padding: "6px 12px",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          opacity: 0.75,
+        }}
+      >
+        <Pill fg={band.fg} bg={band.bg} size={10}>
+          {band.label}
+        </Pill>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            fontSize: 12,
+            color: ink,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {c.topic ?? "（无标题条款）"}
+        </span>
+        {c.score != null && (
+          <span style={{ fontSize: 11, color: mute, fontVariantNumeric: "tabular-nums" }}>
+            {Math.round(c.score * 100)}%
+          </span>
+        )}
+      </div>
+    );
+  }
   return (
     <div
       role="button"
@@ -306,6 +462,12 @@ function ClusterRow({
         <Pill fg={t.fg} bg={t.bg} size={10.5} weight={700}>
           {t.label}
         </Pill>
+        {/* 复核路由三带（W6-4）：与分类/风险并列的正交维度徽标 */}
+        <span title={band.hint} style={{ display: "inline-flex" }}>
+          <Pill fg={band.fg} bg={band.bg} size={10.5}>
+            {band.label}
+          </Pill>
+        </span>
         <Pill fg={zone.fg} bg={zone.bg} size={10.5}>
           {zone.label}
         </Pill>
@@ -318,6 +480,13 @@ function ClusterRow({
           <Pill fg="#C0392B" bg="rgba(192,57,43,0.12)" size={10.5} weight={700}>
             待复核 · 涉嫌多家异常一致
           </Pill>
+        )}
+        {lean && (
+          <span title={lean.hint} style={{ display: "inline-flex" }}>
+            <Pill fg={lean.fg} bg={lean.bg} size={10.5}>
+              {lean.label}
+            </Pill>
+          </span>
         )}
         {sev && sev.label && !c.multiDocAnomaly && (
           <Pill fg={sev.fg} bg={sev.bg} size={10.5}>

@@ -1,6 +1,9 @@
 // Excel 报告 v2：总览 / 相似度矩阵 / 条款明细 / 事实冲突 / 逐对明细 五个工作表。
 use super::data::ExportData;
-use super::shared::{field_cn, label, level_cn, review_cn, section_cn, severity_cn, type_cn};
+use super::shared::{
+    band_cn_of, calibration_lines, calibration_note, contrib_label, field_cn, label, level_cn,
+    review_cn, section_cn, severity_cn, strength_phrase, type_cn,
+};
 use rust_xlsxwriter::{Format, Workbook};
 
 type R = Result<(), String>;
@@ -31,14 +34,26 @@ pub fn write(data: &ExportData, path: &str) -> R {
         r += 2;
         s.write_string_with_format(r, 0, "综合判定", &head).map_err(err)?;
         s.write_string(r, 1, format!(
-            "{}（评分 {:.0}%）",
+            "{}（证据强度：{}）",
             level_cn(&data.collusion.level),
-            data.collusion.score * 100.0
+            strength_phrase(&data.collusion.level)
         )).map_err(err)?;
         r += 1;
         for sig in &data.collusion.signals {
-            s.write_string(r, 1, format!("· {}（权重 {:.0}%）", sig.detail, sig.weight * 100.0))
+            s.write_string(r, 1, format!("· {}（{}）", sig.detail, contrib_label(sig.weight)))
                 .map_err(err)?;
+            r += 1;
+        }
+        s.write_string(r, 1, calibration_note(
+            &data.collusion.calibration_kind,
+            &data.collusion.calibration_version,
+            data.app_version,
+        )).map_err(err)?;
+        r += 2;
+        // 复核路由三带（W6-4）：恒常驻小节。
+        s.write_string_with_format(r, 0, "复核路由（三带）", &head).map_err(err)?;
+        for line in calibration_lines(&data.calibration) {
+            s.write_string(r, 1, line).map_err(err)?;
             r += 1;
         }
         if let Some(sm) = &data.summary {
@@ -96,7 +111,7 @@ pub fn write(data: &ExportData, path: &str) -> R {
     {
         let s = wb.add_worksheet();
         s.set_name("条款明细").map_err(err)?;
-        for (c, h) in ["组号", "类型", "风险", "确认", "标段", "组内相似", "主题", "文档", "页码", "段落文本"]
+        for (c, h) in ["组号", "类型", "风险", "复核路由", "确认", "标段", "组内相似", "主题", "文档", "页码", "段落文本"]
             .iter()
             .enumerate()
         {
@@ -109,16 +124,17 @@ pub fn write(data: &ExportData, path: &str) -> R {
                 s.write_string(r, 1, type_cn(&cl.cluster_type)).map_err(err)?;
                 s.write_string(r, 2, severity_cn(cl.severity.as_deref().unwrap_or("none")))
                     .map_err(err)?;
-                s.write_string(r, 3, review_cn(&cl.review_status)).map_err(err)?;
-                s.write_string(r, 4, section_cn(cl.section_kind.as_deref().unwrap_or("other")))
+                s.write_string(r, 3, band_cn_of(cl.band.as_deref())).map_err(err)?;
+                s.write_string(r, 4, review_cn(&cl.review_status)).map_err(err)?;
+                s.write_string(r, 5, section_cn(cl.section_kind.as_deref().unwrap_or("other")))
                     .map_err(err)?;
-                s.write_number_with_format(r, 5, cl.score.unwrap_or(0.0), &pctf).map_err(err)?;
-                s.write_string(r, 6, cl.topic.as_deref().unwrap_or("")).map_err(err)?;
-                s.write_string(r, 7, &m.tag).map_err(err)?;
+                s.write_number_with_format(r, 6, cl.score.unwrap_or(0.0), &pctf).map_err(err)?;
+                s.write_string(r, 7, cl.topic.as_deref().unwrap_or("")).map_err(err)?;
+                s.write_string(r, 8, &m.tag).map_err(err)?;
                 if let Some(p) = m.page {
-                    s.write_number(r, 8, p as f64).map_err(err)?;
+                    s.write_number(r, 9, p as f64).map_err(err)?;
                 }
-                s.write_string(r, 9, &m.text).map_err(err)?;
+                s.write_string(r, 10, &m.text).map_err(err)?;
                 r += 1;
             }
         }

@@ -37,6 +37,10 @@ pub struct CompareRequest {
     /// 逐项单价雷同率告警线（W5-2，M6），默认 0.80，取值 clamp 到 0.5–1.0。
     pub identical_rate_alarm: Option<f64>,
     pub embedding_model: Option<String>,
+    /// cross-encoder 复核带（W6-2，M7）：默认 false。只影响复核排序建议，不改判分类。
+    pub enable_rerank: Option<bool>,
+    /// 复核模型档位（默认 bge-reranker-base-int8）。
+    pub rerank_model: Option<String>,
 }
 
 #[tauri::command]
@@ -107,6 +111,9 @@ pub async fn start_compare(
         verbatim_min_chars: compare_service::default_verbatim_min_chars(),
         // 对齐区段链化（W4-2）：CompareSetup 暂不暴露，默认开启。
         enable_alignment: true,
+        // cross-encoder 复核带（W6-2）：默认关闭，模型未缓存时后端自行降级（rerank_degraded）。
+        enable_rerank: request.enable_rerank.unwrap_or(d.enable_rerank),
+        rerank_model: request.rerank_model.unwrap_or(d.rerank_model),
     };
     let name = request
         .name
