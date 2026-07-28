@@ -185,6 +185,103 @@ export interface CompareRequest {
   enableRerank?: boolean;
   /** 复核模型档位，默认 bge-reranker-base-int8。 */
   rerankModel?: string;
+  /** 评标办法（W5-5 机制感知筛查）：【仅单次任务级】——每个项目评标办法不同，不进全局默认。
+   *  缺省 = 不录入 ⇒ 不做任何反事实计算。
+   *  【产品纪律】只驱动「基准价敏感性」描述性分析，不参与围标信号与分级。 */
+  evaluation?: EvaluationConfigDto;
+}
+
+/** 评标办法（v1 只支持「(去 m 高 n 低后) 算术平均 × 系数，最接近基准价者价格分最高」一族；
+ *  lowest 只作最低价孤立度描述）。人工录入，UI 必须回显公式全文供核对。 */
+export interface EvaluationConfigDto {
+  method: 'avg_benchmark' | 'lowest';
+  /** 计算基准价前去掉的最低报价个数 n。 */
+  trimLowest: number;
+  /** 计算基准价前去掉的最高报价个数 m。 */
+  trimHighest: number;
+  /** 系数区间（含端点），后端在其上取 ≥200 个均匀格点逐点重算。 */
+  coeffMin: number;
+  coeffMax: number;
+}
+
+/** 一份投标总价及其来源打标（取自投标总价行 / 取自清单合计 / 启发式回落）。 */
+export interface MechanismPriceDto {
+  docIndex: number;
+  total: number;
+  source: string;
+  sourceLabel: string;
+}
+
+/** 候选组的构造依据一条（textPeak / identicalRate / metadata）。 */
+export interface MechanismBasisDto {
+  kind: string;
+  detail: string;
+}
+
+/** 一个候选嫌疑组的反事实结果。flipProb 是【反事实占比】，不是概率、不是显著性。 */
+export interface MechanismGroupDto {
+  docs: number[];
+  /** 组的构造依据（必须随组展示，防循环论证观感）。 */
+  basis: MechanismBasisDto[];
+  flipProb: number;
+  flippedPoints: number;
+  /** 剔除该组后基准价相对全量的偏移（%）。 */
+  benchmarkShiftPct: number;
+  /** |偏移| 在同规模子集穷举中的分位。 */
+  shiftPercentile: number;
+  subsetsCompared: number;
+  winnerFull: number;
+  winnerExcluded: number;
+  supportBidDocs: number[];
+}
+
+/** 均值基准价一族的反事实块（method=lowest 时缺席）。 */
+export interface MechanismBenchmarkDto {
+  trimLowest: number;
+  trimHighest: number;
+  coeffMin: number;
+  coeffMax: number;
+  gridPoints: number;
+  coeffMid: number;
+  benchmarkMid: number;
+  winnerMid: number;
+  groups: MechanismGroupDto[];
+}
+
+/** 最低评标价法的最低价孤立度（禁用均值类统计）。 */
+export interface MechanismLowestDto {
+  winner: number;
+  lowest: number;
+  secondLowest: number;
+  gap: number;
+  medianGap: number;
+  isolated: boolean;
+}
+
+/** 断崖式报价（support-bid 形态）标记。 */
+export interface MechanismSupportBidDto {
+  docIndex: number;
+  total: number;
+  position: 'lowest' | 'highest' | string;
+  gap: number;
+  medianGap: number;
+  deviationPct: number;
+}
+
+/** 机制感知筛查结果（W5-5，numeric_json.mechanism）。
+ *  【仅供展示】：不参与围标分级；notes 为强制措辞，呈现层不得省略。 */
+export interface MechanismDto {
+  applicable: boolean;
+  /** 公式不匹配 / 数据不足时的原因（此时不出任何计算结果）。 */
+  notApplicableReason?: string;
+  method: string;
+  /** 评标办法公式全文（人工录入回显）。 */
+  formula: string;
+  prices: MechanismPriceDto[];
+  benchmark?: MechanismBenchmarkDto;
+  lowest?: MechanismLowestDto;
+  supportBids: MechanismSupportBidDto[];
+  notes: string[];
 }
 
 /** 一条共享算术错误（W5-2）：同一对齐清单项在两份文档中 工程量/单价/（算错的）合价三者全等。
@@ -299,6 +396,8 @@ export interface NumericDto {
   pairs: NumericPairDto[];
   /** 单文档数值画像（W5-3）：与 documentIds 同序；旧任务缺键。 */
   docs?: NumericDocDto[];
+  /** 机制感知筛查（W5-5）：未录入评标办法 / 旧任务 → 缺键，前端隐藏「基准价敏感性」块。 */
+  mechanism?: MechanismDto | null;
   /** 强制随数据下发的措辞（§1.5）：雷同率口径说明、共享算术错误的人工核对提示、覆盖范围声明。
    *  呈现层必须原样展示，不得省略。 */
   notes: {

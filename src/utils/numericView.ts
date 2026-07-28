@@ -1,6 +1,12 @@
 // 商务标数值证据（W5-4/W5-6）的纯派生逻辑 —— 与 React 解耦，便于单测。
 // 铁律：这里只做「把后端事实排布成可视形状」，不重算任何指标、不改判任何结论。
-import type { BoqCorrelationDto, BoqPatternKind, BoqScatterPoint, NumericPairDto } from "../api/types";
+import type {
+  BoqCorrelationDto,
+  BoqPatternKind,
+  BoqScatterPoint,
+  EvaluationConfigDto,
+  NumericPairDto,
+} from "../api/types";
 
 /** 强证据双条件（§1.5）：r>0.99 且比值 CV<0.5%。两者缺一都只是「天然同源」的噪声。 */
 export const STRONG_R_MIN = 0.99;
@@ -103,4 +109,63 @@ export function discountBand(
 /** 百分比文案（雷同率/占比统一口径：一位小数）。 */
 export function pct1(v: number): string {
   return `${(v * 100).toFixed(1)}%`;
+}
+
+// ── 机制感知筛查（W5-5「基准价敏感性」）的纯派生文案 ──
+// 【产品纪律】本块只作描述性解释，不参与围标分级；措辞不得弱化、不得表述为概率或认定。
+
+/** §1.5 强制提示：本块的性质声明（与后端 mechanism::MECHANISM_NOTE 同文）。 */
+export const MECHANISM_DISCLAIMER =
+  "本节为反事实解释性分析，不参与围标分级；评标办法为人工录入，请核对公式与参数。";
+
+/**
+ * 评标办法公式全文（配置页在【发起前】回显，与后端 EvaluationConfig::formula_text 同文案）——
+ * 人工录错公式会让整节结论失真，必须让用户在发起前逐字核对。
+ */
+export function mechanismFormulaText(ev: EvaluationConfigDto): string {
+  if (ev.method === "lowest") {
+    return "最低评标价法：投标总价最低者价格分最高。本节只作「最低价孤立度」描述，不计算均值基准价。";
+  }
+  return (
+    `基准价 =（全部有效投标总价去掉 ${ev.trimHighest} 个最高、${ev.trimLowest} 个最低后的算术平均）` +
+    `× 系数 c，c ∈ [${ev.coeffMin.toFixed(4)}, ${ev.coeffMax.toFixed(4)}]；投标总价最接近基准价者价格分最高。`
+  );
+}
+
+/** 评标办法参数是否可提交（与后端校验同口径：不合法直接拒绝，不静默纠正）。 */
+export function evaluationError(ev: EvaluationConfigDto, docCount: number): string | null {
+  if (ev.method === "lowest") return null;
+  if (!(ev.coeffMin > 0) || !(ev.coeffMax >= ev.coeffMin) || ev.coeffMax > 2) {
+    return "系数区间不合法：须满足 0 < 下限 ≤ 上限 ≤ 2";
+  }
+  if (ev.trimLowest + ev.trimHighest >= docCount) {
+    return `去高（${ev.trimHighest}）与去低（${ev.trimLowest}）之和须小于参评份数（${docCount}）`;
+  }
+  return null;
+}
+
+/** 报价分布端点标签（与后端 mechanism_position_cn 同文案）。 */
+export function mechanismPositionLabel(position: string): string {
+  if (position === "lowest") return "报价最低端";
+  if (position === "highest") return "报价最高端";
+  return position;
+}
+
+/** 投标总价来源标签回落（后端已下发 sourceLabel，缺失时按稳定标识兜底）。 */
+export function priceSourceLabel(source: string, label?: string): string {
+  if (label) return label;
+  if (source === "totalRow") return "取自投标总价行";
+  if (source === "boqSum") return "取自清单合计";
+  if (source === "heuristic") return "启发式回落（全文最大金额）";
+  return source;
+}
+
+/** 一组反事实结论的口头表述（【占比】而非概率，措辞不得改写成「概率/显著」）。 */
+export function flipStatement(flipProb: number): string {
+  return `若剔除该组，中标人在 ${pct1(flipProb)} 的系数取值下改变`;
+}
+
+/** 基准价偏移文案（带符号，正 = 剔除后基准价上移）。 */
+export function shiftLabel(pct: number): string {
+  return `${pct >= 0 ? "+" : "−"}${Math.abs(pct).toFixed(2)}%`;
 }

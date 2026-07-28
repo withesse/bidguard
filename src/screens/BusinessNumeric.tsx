@@ -11,19 +11,23 @@ import { Button, Pill } from "../components/primitives";
 import { C, severityColor } from "../design/tokens";
 import { useTheme } from "../theme";
 import { useCompareSummary } from "../queries/data";
-import type { BoqScatterPoint, NumericDto, NumericPairDto } from "../api/types";
+import type { BoqScatterPoint, MechanismDto, NumericDto, NumericPairDto } from "../api/types";
 import { docColor, docTag } from "../utils/docTag";
 import {
   defaultPair,
   discountBand,
+  flipStatement,
   identicalMatrix,
   isStrongCorrelation,
+  mechanismPositionLabel,
   pairIndex,
   pairKey,
   patternLabel,
   pct1,
+  priceSourceLabel,
   reasonLabel,
   SCATTER_MAX,
+  shiftLabel,
   toSvgXY,
 } from "../utils/numericView";
 
@@ -204,6 +208,16 @@ export function BusinessNumeric() {
                 onChunk={(docId, chunkId) => nav(`/workspace/${wsId}/doc/${docId}?chunk=${chunkId}`)}
               />
             </>
+          )}
+
+          {numeric.mechanism && (
+            <MechanismPanel
+              mech={numeric.mechanism}
+              cardBg={cardBg}
+              border={border}
+              ink={ink}
+              mute={mute}
+            />
           )}
         </div>
       </div>
@@ -561,6 +575,189 @@ function StatPanels({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 基准价敏感性（W5-5 机制感知筛查）——【描述性块，不参与围标分级】。
+ * 展示：评标办法公式全文（人工录入回显）、逐份投标总价与来源打标、候选组及其【构造依据】、
+ * 中标人翻转比例、断崖式报价标记；后端下发的强制措辞原样列出，不得省略、不得改写。
+ */
+function MechanismPanel({
+  mech,
+  cardBg,
+  border,
+  ink,
+  mute,
+}: {
+  mech: MechanismDto;
+  cardBg: string;
+  border: string;
+  ink: string;
+  mute: string;
+}) {
+  const th = {
+    fontSize: 10.5,
+    fontWeight: 700,
+    color: mute,
+    textAlign: "left" as const,
+    padding: "6px 8px",
+    borderBottom: `1px solid ${border}`,
+    whiteSpace: "nowrap" as const,
+  };
+  const td = {
+    fontSize: 11.5,
+    color: ink,
+    padding: "7px 8px",
+    borderBottom: `1px solid ${border}`,
+  };
+  const money = (v: number) => v.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const b = mech.benchmark ?? null;
+  return (
+    <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 14, padding: 20 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 13.5, fontWeight: 700, color: ink }}>基准价敏感性</span>
+        <Pill fg={C.ink3} bg="rgba(107,107,118,0.12)" size={10.5} weight={700}>
+          反事实解释性分析 · 不参与围标分级
+        </Pill>
+      </div>
+      {/* §1.5 强制措辞：原样展示后端下发的每一条，任何呈现层都不得省略 */}
+      <div style={{ fontSize: 11, color: mute, marginTop: 8, lineHeight: 1.8 }}>
+        {mech.notes.map((n, i) => (
+          <div key={i}>{n}</div>
+        ))}
+      </div>
+      <div style={{ fontSize: 11.5, color: ink, marginTop: 12, lineHeight: 1.8 }}>
+        <b>评标办法（人工录入）：</b>
+        {mech.formula}
+      </div>
+
+      {!mech.applicable ? (
+        <div style={{ fontSize: 11.5, color: mute, marginTop: 12, lineHeight: 1.8 }}>
+          {mech.notApplicableReason ?? "本节不适用，未作任何反事实计算。"}
+        </div>
+      ) : (
+        <>
+          {b && (
+            <div style={{ fontSize: 12, color: ink, marginTop: 12, lineHeight: 1.9, fontFamily: C.mono }}>
+              基准价（系数 {b.coeffMid.toFixed(4)}）= {money(b.benchmarkMid)} 元 · 去 {b.trimHighest} 高 / 去{" "}
+              {b.trimLowest} 低 · 系数区间 [{b.coeffMin.toFixed(4)}, {b.coeffMax.toFixed(4)}] 取 {b.gridPoints} 个均匀格点
+              <br />
+              该系数下中标人：{docTag(b.winnerMid)}
+            </div>
+          )}
+          {mech.lowest && (
+            <div style={{ fontSize: 12, color: ink, marginTop: 12, lineHeight: 1.9, fontFamily: C.mono }}>
+              最低投标总价：{docTag(mech.lowest.winner)} · {money(mech.lowest.lowest)} 元 · 次低{" "}
+              {money(mech.lowest.secondLowest)} 元 · 间距 {money(mech.lowest.gap)} 元（中位间距{" "}
+              {money(mech.lowest.medianGap)} 元）
+              <br />
+              {mech.lowest.isolated ? "最低价与其余报价断崖，建议核对成本构成" : "未见断崖式孤立"}
+            </div>
+          )}
+
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: ink, marginTop: 18 }}>投标总价与来源</div>
+          <div style={{ overflowX: "auto", marginTop: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 480 }}>
+              <thead>
+                <tr>
+                  <th style={th}>编号</th>
+                  <th style={th}>投标总价（元）</th>
+                  <th style={th}>来源</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mech.prices.map((p) => (
+                  <tr key={p.docIndex}>
+                    <td style={td}>{docTag(p.docIndex)}</td>
+                    <td style={{ ...td, fontFamily: C.mono }}>{money(p.total)}</td>
+                    <td style={td}>{priceSourceLabel(p.source, p.sourceLabel)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {b && (
+            <>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: ink, marginTop: 18 }}>
+                候选组反事实结果（{b.groups.length} 组）
+              </div>
+              {b.groups.length === 0 ? (
+                <div style={{ fontSize: 11.5, color: mute, marginTop: 8, lineHeight: 1.8 }}>
+                  未构造出候选组：参评文档间未出现可作依据的既有文档证据（文本相似峰值 / 逐项单价雷同率 / 元数据同源），
+                  故不作剔除重算。
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
+                  {b.groups.map((g) => (
+                    <div
+                      key={g.docs.join("-")}
+                      style={{ border: `1px solid ${border}`, borderRadius: 10, padding: "10px 14px" }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 12.5, fontWeight: 700, color: ink, fontFamily: C.serif }}>
+                          {g.docs.map((d) => docTag(d)).join(" × ")}
+                        </span>
+                        <Pill fg={C.hi2} bg={C.hi2Soft} size={10.5} weight={700}>
+                          {flipStatement(g.flipProb)}
+                        </Pill>
+                        {g.supportBidDocs.length > 0 && (
+                          <Pill fg={C.hi4} bg={C.hi4Soft} size={10.5} weight={700}>
+                            含断崖式报价 {g.supportBidDocs.map((d) => docTag(d)).join("、")}
+                          </Pill>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: ink, marginTop: 6, lineHeight: 1.85, fontFamily: C.mono }}>
+                        基准价偏移 {shiftLabel(g.benchmarkShiftPct)} · 同规模子集分位 {pct1(g.shiftPercentile)}（共{" "}
+                        {g.subsetsCompared} 个子集）· 中标人 {docTag(g.winnerFull)} → {docTag(g.winnerExcluded)}
+                      </div>
+                      <div style={{ fontSize: 11, color: mute, marginTop: 6, lineHeight: 1.75 }}>
+                        组的构造依据：{g.basis.map((x) => x.detail).join("；") || "—"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {mech.supportBids.length > 0 && (
+            <>
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: ink, marginTop: 18 }}>
+                断崖式报价（support-bid 形态）
+              </div>
+              <div style={{ overflowX: "auto", marginTop: 8 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 560 }}>
+                  <thead>
+                    <tr>
+                      <th style={th}>编号</th>
+                      <th style={th}>投标总价（元）</th>
+                      <th style={th}>位置</th>
+                      <th style={th}>与次邻间距（元）</th>
+                      <th style={th}>偏离中位数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mech.supportBids.map((s) => (
+                      <tr key={s.docIndex}>
+                        <td style={td}>{docTag(s.docIndex)}</td>
+                        <td style={{ ...td, fontFamily: C.mono }}>{money(s.total)}</td>
+                        <td style={td}>{mechanismPositionLabel(s.position)}</td>
+                        <td style={{ ...td, fontFamily: C.mono }}>
+                          {money(s.gap)}（中位间距 {money(s.medianGap)}）
+                        </td>
+                        <td style={{ ...td, fontFamily: C.mono }}>{shiftLabel(s.deviationPct)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </>
+      )}
     </div>
   );
 }

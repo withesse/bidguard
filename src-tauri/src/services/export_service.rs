@@ -441,8 +441,104 @@ fn build_numeric(numeric_json: Option<&str>, doc_ids: &[String]) -> Option<Numer
         aligned_item_count: usz("alignedItemCount"),
         pairs,
         docs,
+        mechanism: v.get("mechanism").filter(|m| !m.is_null()).map(build_mechanism),
         notes,
     })
+}
+
+/// 装配「基准价敏感性」小节（W5-5）：原样消费 numeric_json.mechanism，只做天干标签化，
+/// 【不重算】。缺字段按缺省容错——旧任务无该键时上游已判 None，不会走到这里。
+fn build_mechanism(v: &serde_json::Value) -> crate::export::data::NumericMechanism {
+    use crate::export::data::{
+        MechanismBenchmark, MechanismGroup, MechanismLowest, MechanismPrice, MechanismSupportBid,
+        NumericMechanism,
+    };
+    let f = |o: &serde_json::Value, k: &str| o.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    let u = |o: &serde_json::Value, k: &str| {
+        o.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize
+    };
+    let s = |o: &serde_json::Value, k: &str| {
+        o.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_string()
+    };
+    let tag_of = |o: &serde_json::Value, k: &str| crate::export::data_tag(u(o, k));
+    let arr = |o: &serde_json::Value, k: &str| -> Vec<serde_json::Value> {
+        o.get(k).and_then(serde_json::Value::as_array).cloned().unwrap_or_default()
+    };
+    let prices: Vec<MechanismPrice> = arr(v, "prices")
+        .iter()
+        .map(|p| MechanismPrice {
+            tag: tag_of(p, "docIndex"),
+            total: f(p, "total"),
+            source_label: s(p, "sourceLabel"),
+        })
+        .collect();
+    let benchmark = v.get("benchmark").filter(|b| !b.is_null()).map(|b| MechanismBenchmark {
+        trim_lowest: u(b, "trimLowest"),
+        trim_highest: u(b, "trimHighest"),
+        coeff_min: f(b, "coeffMin"),
+        coeff_max: f(b, "coeffMax"),
+        grid_points: u(b, "gridPoints"),
+        coeff_mid: f(b, "coeffMid"),
+        benchmark_mid: f(b, "benchmarkMid"),
+        winner_mid: tag_of(b, "winnerMid"),
+        groups: arr(b, "groups")
+            .iter()
+            .map(|g| MechanismGroup {
+                docs: arr(g, "docs")
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|i| crate::export::data_tag(i as usize))
+                    .collect(),
+                basis: arr(g, "basis").iter().map(|x| s(x, "detail")).collect(),
+                flip_prob: f(g, "flipProb"),
+                benchmark_shift_pct: f(g, "benchmarkShiftPct"),
+                shift_percentile: f(g, "shiftPercentile"),
+                subsets_compared: u(g, "subsetsCompared"),
+                winner_full: tag_of(g, "winnerFull"),
+                winner_excluded: tag_of(g, "winnerExcluded"),
+                support_bid_docs: arr(g, "supportBidDocs")
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|i| crate::export::data_tag(i as usize))
+                    .collect(),
+            })
+            .collect(),
+    });
+    let lowest = v.get("lowest").filter(|l| !l.is_null()).map(|l| MechanismLowest {
+        winner: tag_of(l, "winner"),
+        lowest: f(l, "lowest"),
+        second_lowest: f(l, "secondLowest"),
+        gap: f(l, "gap"),
+        median_gap: f(l, "medianGap"),
+        isolated: l.get("isolated").and_then(serde_json::Value::as_bool).unwrap_or(false),
+    });
+    NumericMechanism {
+        applicable: v.get("applicable").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        not_applicable_reason: v
+            .get("notApplicableReason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        method: s(v, "method"),
+        formula: s(v, "formula"),
+        prices,
+        benchmark,
+        lowest,
+        support_bids: arr(v, "supportBids")
+            .iter()
+            .map(|b| MechanismSupportBid {
+                tag: tag_of(b, "docIndex"),
+                total: f(b, "total"),
+                position: s(b, "position"),
+                gap: f(b, "gap"),
+                median_gap: f(b, "medianGap"),
+                deviation_pct: f(b, "deviationPct"),
+            })
+            .collect(),
+        notes: arr(v, "notes")
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+    }
 }
 
 /// numeric_json 的单个 pair → 导出条目（天干标签化；缺字段按缺省容错，旧任务不炸）。
@@ -688,6 +784,7 @@ mod tests {
             identical_rate_alarm: 0.80,
             enable_rerank: false,
             rerank_model: "bge-reranker-base-int8".into(),
+            evaluation: None,
         };
         // 与 start_compare 一致：运行配置存入任务行（assemble 从这里取 documentIds）
         let cctx = {
@@ -1329,6 +1426,348 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// CSV / Markdown / XLSX 章节补齐（§2 后置池）：同一份含取证 + 规避 + 数值 + 区段 + 三带证据的
+    /// 任务，三格式（加既有 JSON）都必须能引用到全部证据节与 §1.5 强制措辞；无证据任务导出不报错、
+    /// 「检查方法与局限」仍常驻；同数据两次导出内容一致（写器为纯函数）。
+    #[test]
+    fn evidence_sections_render_in_markdown_csv_xlsx_and_json() {
+        use crate::engine::report::Collusion;
+        use crate::export::data::CalibrationSection;
+        let dir = std::env::temp_dir().join(format!("bg_flatexp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 数值节走与比对期落库同形的 numeric_json，经 build_numeric 装配（不另造结构）。
+        let numeric_json = serde_json::json!({
+            "documentIds": ["d1", "d2"],
+            "identicalRateAlarm": 0.80,
+            "minComparable": 10,
+            "itemCount": 24,
+            "alignedItemCount": 24,
+            "pairs": [{
+                "a": 0, "b": 1,
+                "comparable": 12, "identical": 11,
+                "identicalRate": 11.0 / 12.0,
+                "alarm": true,
+                "reason": null,
+                "sharedArithErrors": [{
+                    "alignKey": "c:010101001004",
+                    "name": "分项工程4",
+                    "qty": 100.0, "unitPrice": 25.5, "total": 2505.0, "expectedTotal": 2550.0,
+                    "chunkIds": ["ck-a", "ck-b"],
+                }],
+                "pattern": {
+                    "kind": "geo_discount", "a": 0.97, "b": 0.0, "r2": 0.9999, "n": 12,
+                    "ratioCv": 0.0001, "diffRange": 3.2, "corroborated": true,
+                    "note": crate::engine::boq::PATTERN_NOTE,
+                },
+                "correlation": {
+                    "n": 12, "pearson": 0.9993, "spearman": 1.0, "ratioCv": 0.0001,
+                    "note": crate::engine::boq::CORRELATION_NOTE,
+                },
+                "scatter": [],
+            }],
+            "docs": [
+                { "docIndex": 0, "documentId": "d1", "digitStats": {
+                    "n": 24, "centChiSquare": 216.0, "jiaoChiSquare": 216.0, "critical": 27.877,
+                    "zeroFiveRatio": 1.0, "clustered": true, "note": crate::engine::boq::DIGIT_NOTE,
+                } },
+                { "docIndex": 1, "documentId": "d2", "digitStats": null },
+            ],
+            "notes": {
+                "identicalRate": "逐项单价雷同率（参照地方雷同认定口径，针对逐项单价相同率）。达到告警线仅表示需重点核查，不构成串通投标认定。",
+                "sharedArithError": "共享算术错误：请核对是否源自同一计价软件舍入惯例或招标文件。",
+                "coverage": "数值层仅覆盖 xlsx / docx / 文本 PDF 中可识别的报价清单表；扫描件 PDF 走 OCR 不产表格行，不在覆盖范围内。",
+            },
+        })
+        .to_string();
+        let numeric = build_numeric(Some(&numeric_json), &["d1".into(), "d2".into()]).unwrap();
+
+        let doc = |tag: &str, name: &str| ExportDoc {
+            tag: tag.into(),
+            name: name.into(),
+            file_type: "docx".into(),
+            pages: 12,
+            char_count: 6000,
+            parse_method: Some("docx".into()),
+            risk_flags: vec![],
+        };
+        let mut sm = CompareSummary { cluster_count: 1, ..Default::default() };
+        sm.calibration_version = "m8-flat-test".into();
+        sm.calibration_kind = "experimental-synthetic".into();
+        sm.calibration_routing = "three-band".into();
+        sm.calibration_alpha = 0.05;
+        sm.calibration_beta = 0.05;
+        let full = ExportData {
+            report_version: "2.0",
+            app_version: "test",
+            generated_at: "2026-07-27T00:00:00.000Z".into(),
+            workspace_id: "w1".into(),
+            job_id: "j1".into(),
+            job_name: Some("三格式补齐".into()),
+            documents: vec![doc("甲", "甲标.docx"), doc("乙", "乙标.docx")],
+            config: serde_json::json!({}),
+            summary: Some(sm.clone()),
+            matrix: vec![vec![1.0, 0.9], vec![0.9, 1.0]],
+            peak: 0.9,
+            collusion: Collusion::default(),
+            shared_terms: vec![],
+            sections: vec![],
+            clusters: vec![ExportCluster {
+                index: 1,
+                cluster_type: "same".into(),
+                severity: Some("high".into()),
+                topic: Some("标红条款".into()),
+                summary: None,
+                score: Some(0.95),
+                review_status: "pending".into(),
+                section_kind: Some("tech".into()),
+                conflict: None,
+                exempt_reason: None,
+                multi_doc_anomaly: false,
+                band: Some("flag".into()),
+                confidence: Some(0.9),
+                members: vec![ExportMember {
+                    doc: 0,
+                    tag: "甲".into(),
+                    text: "施工现场实行封闭管理".into(),
+                    page: Some(3),
+                    section_path: vec!["第三章".into()],
+                    role: "primary".into(),
+                }],
+            }],
+            pairs: vec![],
+            forensic: Some(ForensicSection {
+                hits: vec![ForensicHit {
+                    kind: "rsid".into(),
+                    doc_a: "甲".into(),
+                    doc_b: "乙".into(),
+                    level: "hard".into(),
+                    detail: "共享 5 个 rsid 修订标识，rsidRoot 相同".into(),
+                }],
+                per_document: vec![ForensicDoc {
+                    doc_id: "d1".into(),
+                    tag: "甲".into(),
+                    rsid_count: 5,
+                    template_name: Some("投标模板.dotx".into()),
+                    lineage: serde_json::json!({ "documentId": "uuid:ABC" }),
+                }],
+            }),
+            evasion: Some(EvasionSection {
+                per_document: vec![EvasionDoc {
+                    doc_id: "d1".into(),
+                    tag: "甲".into(),
+                    counts: serde_json::json!({ "zeroWidth": 12 }),
+                    verdict: "confirmed".into(),
+                    evidence_kinds: vec!["隐形码点".into()],
+                }],
+            }),
+            segments: Some(SegmentsSection {
+                pairs: vec![SegmentPair {
+                    a: "甲".into(),
+                    b: "乙".into(),
+                    segments: vec![SegmentEntry {
+                        a_range: "第三章 › 3.2 施工组织 · 第3–5页".into(),
+                        b_range: "第三章 › 3.2 施工组织 · 第4–6页".into(),
+                        coverage: 0.82,
+                        verbatim_chars: 620,
+                        anchor_count: 14,
+                        tender_quote: true,
+                    }],
+                    verbatims: vec![VerbatimEntry {
+                        a_page: Some(3),
+                        b_page: Some(4),
+                        a_section: Some("3.2 施工组织".into()),
+                        b_section: Some("3.2 施工组织".into()),
+                        char_len: 620,
+                        // 竖线是 GFM 表格列分隔符：正文含竖线时必须被中和，否则表格错行丢证据。
+                        sample: "施工现场实行封闭管理|并设置专职安全员全程旁站监督".into(),
+                        tender_quote: false,
+                    }],
+                }],
+            }),
+            numeric: Some(numeric),
+            calibration: CalibrationSection::build(Some(&sm), (0, 0, 1, 0)),
+            methods_and_limitations: MethodsAndLimitations::standard(),
+        };
+
+        // 三格式 + JSON 全量写出。
+        let path = |name: &str| dir.join(name);
+        for (fmt, name) in
+            [
+                ("markdown", "r.md"),
+                ("csv", "r.csv"),
+                ("xlsx", "r.xlsx"),
+                ("json", "r.json"),
+                ("docx", "r.docx"),
+            ]
+        {
+            crate::export::write(&full, fmt, path(name).to_str().unwrap()).unwrap();
+        }
+        // xlsx 是 zip：把全部 xml 部件拼起来做结构断言（docProps 含生成时间，确定性比对时剔除）。
+        let xlsx_xml = |p: &std::path::Path, with_props: bool| {
+            let f = std::fs::File::open(p).unwrap();
+            let mut z = zip::ZipArchive::new(f).unwrap();
+            let mut all = String::new();
+            for i in 0..z.len() {
+                let mut e = z.by_index(i).unwrap();
+                let n = e.name().to_string();
+                if !n.ends_with(".xml") || (!with_props && n.starts_with("docProps/")) {
+                    continue;
+                }
+                all.push_str(&n);
+                std::io::Read::read_to_string(&mut e, &mut all).unwrap();
+            }
+            all
+        };
+
+        let md = std::fs::read_to_string(path("r.md")).unwrap();
+        let csv = std::fs::read_to_string(path("r.csv")).unwrap();
+        let xlsx = xlsx_xml(&path("r.xlsx"), true);
+        let json = std::fs::read_to_string(path("r.json")).unwrap();
+        // docx 同为 zip：§1.5 要求「屏幕可见证据须在正式报告可引用」，而 DOCX 是评标专家实际
+        // 传阅的格式——曾出现 forensic/evasion/methodsAndLimitations 三节只进 HTML 的缺口，
+        // 缺「检查方法与局限」时「没有取证章节」会被读成「查过了，干净」，故在此钉死。
+        let docx = xlsx_xml(&path("r.docx"), true);
+        for h in ["取证证据", "规避特征复核", "检查方法与局限"] {
+            assert!(docx.contains(h), "DOCX 缺「{h}」节");
+        }
+
+        // ① 各节都在（Markdown 小节 / CSV 区块 / XLSX 工作表）。
+        for h in [
+            "## 对齐区段与逐字证据",
+            "## 商务标数值证据",
+            "## 取证证据",
+            "## 规避特征复核",
+            "## 检查方法与局限",
+            "## 复核路由（三带）",
+        ] {
+            assert!(md.contains(h), "Markdown 缺小节 {h}");
+        }
+        for b in [
+            "## 对齐区段",
+            "## 逐字雷同区间",
+            "## 逐项单价雷同率",
+            "## 规律性差异与相关性",
+            "## 共享算术错误清单",
+            "## 逐文档单价尾数分布",
+            "## 取证证据",
+            "## 逐文档取证指纹",
+            "## 规避特征复核",
+            "## 检查方法与局限",
+            "## 复核路由（三带）",
+            "## 条款明细",
+        ] {
+            assert!(csv.contains(b), "CSV 缺区块 {b}");
+        }
+        for sheet in [
+            "对齐区段与逐字证据",
+            "数值证据",
+            "取证证据",
+            "规避特征",
+            "复核路由",
+            "检查方法与局限",
+        ] {
+            assert!(xlsx.contains(sheet), "XLSX 缺工作表 {sheet}");
+        }
+        for key in ["\"forensic\"", "\"evasion\"", "\"numeric\"", "\"segments\"", "methodsAndLimitations"] {
+            assert!(json.contains(key), "JSON 缺节 {key}");
+        }
+
+        // ② 证据明细与 §1.5 强制措辞在三格式里逐一可引用。
+        for (fmt, text) in [("markdown", &md), ("csv", &csv), ("xlsx", &xlsx)] {
+            for needle in [
+                "投标模板.dotx",              // 逐文档取证指纹
+                "共享 5 个 rsid 修订标识",     // 取证命中说明
+                "隐形码点",                   // 规避证据种类
+                "3.2 施工组织",               // 区段定位（章节 + 页码）
+                "引用招标文件",               // 招标豁免标注
+                "施工现场实行封闭管理",        // 逐字铁证样本
+                "91.7%",                     // 逐项单价雷同率
+                "达告警线",                   // 告警标注
+                "等比 / 恒定折扣",            // 规律性形态
+                "分项工程4",                  // 共享算术错误清单项
+                "ck-a",                      // 原文锚点
+                "尾数聚集",                   // 尾数分布结论
+                "参照地方雷同认定口径",         // §1.5 雷同率口径
+                "统一下浮",                   // §1.5 规律性线索文案
+                "请核对是否源自同一计价软件舍入惯例或招标文件", // §1.5 共享算术错误提示
+                "扫描件 PDF",                 // §1.5 数值层覆盖范围声明
+                "未命中不构成清白证明",         // §1.5 免责声明
+                "重点标红",                   // 三带名
+            ] {
+                assert!(text.contains(needle), "{fmt} 缺证据/措辞「{needle}」");
+            }
+            // §1.5：不得出现「检查通过 / 无异常」类沉默背书表述。
+            for banned in ["检查通过", "无异常", "自动放行"] {
+                assert!(!text.contains(banned), "{fmt} 出现禁用表述「{banned}」");
+            }
+        }
+        // Markdown 表格安全：正文竖线必须被转义，否则表格错行丢证据。
+        assert!(md.contains("封闭管理\\|并设置"), "Markdown 表格单元格应转义竖线");
+
+        // ③ 确定性：同数据两次导出内容一致（xlsx 剔除含生成时间的 docProps）。
+        for (fmt, name) in [("markdown", "r2.md"), ("csv", "r2.csv"), ("xlsx", "r2.xlsx")] {
+            crate::export::write(&full, fmt, path(name).to_str().unwrap()).unwrap();
+        }
+        assert_eq!(md, std::fs::read_to_string(path("r2.md")).unwrap(), "Markdown 两次导出应一致");
+        assert_eq!(csv, std::fs::read_to_string(path("r2.csv")).unwrap(), "CSV 两次导出应一致");
+        assert_eq!(
+            xlsx_xml(&path("r.xlsx"), false),
+            xlsx_xml(&path("r2.xlsx"), false),
+            "XLSX 两次导出内容应一致"
+        );
+
+        // ④ 空态：无任何证据 → 各证据节省略、导出不报错，但「检查方法与局限」常驻。
+        let empty = ExportData {
+            forensic: None,
+            evasion: None,
+            segments: None,
+            numeric: None,
+            clusters: vec![],
+            summary: None,
+            calibration: CalibrationSection::build(None, (0, 0, 0, 0)),
+            documents: vec![doc("甲", "甲标.docx")],
+            matrix: vec![vec![1.0]],
+            job_name: Some("空态".into()),
+            ..full
+        };
+        for (fmt, name) in [("markdown", "e.md"), ("csv", "e.csv"), ("xlsx", "e.xlsx")] {
+            crate::export::write(&empty, fmt, path(name).to_str().unwrap()).unwrap();
+        }
+        let emd = std::fs::read_to_string(path("e.md")).unwrap();
+        let ecsv = std::fs::read_to_string(path("e.csv")).unwrap();
+        let exlsx = xlsx_xml(&path("e.xlsx"), true);
+        for (fmt, text) in [("markdown", &emd), ("csv", &ecsv), ("xlsx", &exlsx)] {
+            assert!(text.contains("检查方法与局限"), "{fmt} 空态仍须常驻「检查方法与局限」");
+            assert!(text.contains("未命中不构成清白证明"), "{fmt} 空态仍须带免责声明");
+            // 空态不得出现任何证据数据与判级措辞（CSV 文件头的区块清单是导读，不是证据）。
+            for banned in ["硬命中", "投标模板.dotx", "尾数聚集", "达告警线", "引用招标文件"] {
+                assert!(!text.contains(banned), "{fmt} 空态渲染了不存在的证据「{banned}」");
+            }
+        }
+        // 空态：各证据节的标题/区块/工作表整体省略（不留空表沉默背书）。
+        for h in ["## 取证证据", "## 规避特征复核", "## 商务标数值证据", "## 对齐区段与逐字证据"] {
+            assert!(!emd.contains(h), "空态 Markdown 不应有 {h}");
+        }
+        for b in ["## 取证证据", "## 规避特征复核", "## 逐项单价雷同率", "## 对齐区段", "## 逐字雷同区间"]
+        {
+            assert!(!ecsv.contains(b), "空态 CSV 不应有区块 {b}");
+        }
+        // XLSX 空态：按各证据表专属导语判断（工作表名的字面片段会与常驻的检查项文案重合）。
+        for note in [
+            "取证信号为线索级同源证据",
+            "检测到疑似规避特征",
+            "报价清单逐项比对",
+            "对齐区段为与聚类并存的独立证据层",
+        ] {
+            assert!(!exlsx.contains(note), "空态 XLSX 不应有证据表「{note}」");
+        }
+        assert!(emd.contains("## 复核路由（三带）"), "空态 Markdown 三带章节仍常驻");
+        assert!(ecsv.contains("## 复核路由（三带）"), "空态 CSV 三带区块仍常驻");
+        assert!(exlsx.contains("未启用概率校准"), "空态 XLSX 须如实写明未校准");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// build_segments 的存储朝向归一化 + 天干映射：区段以反向朝向（doc_a=d2, doc_b=d1）落库，
     /// 装配须归一化到 (i=d1, j=d2)——a 侧定位/页码对应 d1，逐字页码两侧对应正确。
     #[test]
@@ -1436,6 +1875,189 @@ mod tests {
         // 无区段任务 → None（不渲染空章节）。
         let empty_job = jr::create(&conn, &ws, "compare", None, "{}").unwrap();
         assert!(build_segments(&conn, &empty_job.id, &doc_ids).unwrap().is_none());
+    }
+
+    /// 「基准价敏感性」小节（W5-5 机制感知筛查）：六格式都要能引用到基准价、候选组及其
+    /// 【构造依据】、翻转比例、断崖式报价标记与强制措辞；未录入评标办法时整块缺席。
+    #[test]
+    fn mechanism_subsection_renders_in_all_formats_and_omits_when_absent() {
+        use crate::engine::report::Collusion;
+        use crate::export::data::CalibrationSection;
+        let dir = std::env::temp_dir().join(format!("bg_mechexp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 与比对期落库同形：numeric_json.mechanism 由 engine::mechanism::run 序列化而来
+        let mech = crate::engine::mechanism::run(
+            &crate::engine::mechanism::EvaluationConfig {
+                method: crate::engine::mechanism::METHOD_AVG_BENCHMARK.into(),
+                trim_lowest: 0,
+                trim_highest: 0,
+                coeff_min: 0.9,
+                coeff_max: 1.0,
+            },
+            &[
+                crate::engine::mechanism::BidPrice {
+                    doc: 0,
+                    total: 1_000_000.0,
+                    source: crate::engine::mechanism::PriceSource::TotalRow,
+                },
+                crate::engine::mechanism::BidPrice {
+                    doc: 1,
+                    total: 980_000.0,
+                    source: crate::engine::mechanism::PriceSource::BoqSum,
+                },
+                crate::engine::mechanism::BidPrice {
+                    doc: 2,
+                    total: 975_000.0,
+                    source: crate::engine::mechanism::PriceSource::BoqSum,
+                },
+                crate::engine::mechanism::BidPrice {
+                    doc: 3,
+                    total: 400_000.0,
+                    source: crate::engine::mechanism::PriceSource::Heuristic,
+                },
+            ],
+            &[crate::engine::mechanism::PairEvidence {
+                a: 2,
+                b: 3,
+                basis: vec![crate::engine::mechanism::EvidenceBasis {
+                    kind: "identicalRate".into(),
+                    detail: "逐项单价雷同率 91.7%（≥告警线 80%）".into(),
+                }],
+            }],
+        );
+        assert!(mech.applicable);
+        let numeric_json = serde_json::json!({
+            "documentIds": ["d1", "d2"],
+            "identicalRateAlarm": 0.80,
+            "minComparable": 10,
+            "itemCount": 24,
+            "alignedItemCount": 24,
+            "pairs": [{
+                "a": 0, "b": 1, "comparable": 12, "identical": 11,
+                "identicalRate": 11.0 / 12.0, "alarm": true, "reason": null,
+                "sharedArithErrors": [], "pattern": null, "correlation": null, "scatter": [],
+            }],
+            "docs": [],
+            "notes": { "identicalRate": "口径说明", "sharedArithError": "核对提示", "coverage": "覆盖范围" },
+            "mechanism": mech,
+        })
+        .to_string();
+        let section = build_numeric(Some(&numeric_json), &["d1".into(), "d2".into()]).unwrap();
+        let mc = section.mechanism.as_ref().expect("mechanism 应装配出来");
+        assert_eq!(mc.prices[0].tag, "甲", "天干标签化");
+        assert_eq!(mc.prices[0].source_label, "取自投标总价行");
+        assert_eq!(mc.prices[3].source_label, "启发式回落（全文最大金额）");
+        let g = &mc.benchmark.as_ref().unwrap().groups[0];
+        assert_eq!(g.docs, vec!["丙", "丁"]);
+        assert!(!g.basis.is_empty(), "构造依据必须随组带出");
+
+        let doc = |tag: &str| ExportDoc {
+            tag: tag.into(),
+            name: format!("{tag}标.xlsx"),
+            file_type: "xlsx".into(),
+            pages: 1,
+            char_count: 900,
+            parse_method: Some("xlsx".into()),
+            risk_flags: vec![],
+        };
+        let data = ExportData {
+            report_version: "2.0",
+            app_version: "test",
+            generated_at: "2026-07-27T00:00:00.000Z".into(),
+            workspace_id: "w1".into(),
+            job_id: "j1".into(),
+            job_name: Some("机制感知".into()),
+            documents: vec![doc("甲"), doc("乙"), doc("丙"), doc("丁")],
+            config: serde_json::json!({}),
+            summary: None,
+            matrix: vec![vec![1.0]],
+            peak: 0.0,
+            collusion: Collusion::default(),
+            shared_terms: vec![],
+            sections: vec![],
+            clusters: vec![],
+            pairs: vec![],
+            forensic: None,
+            evasion: None,
+            segments: None,
+            numeric: Some(section),
+            calibration: CalibrationSection::build(None, (0, 0, 0, 0)),
+            methods_and_limitations: MethodsAndLimitations::standard(),
+        };
+
+        let path = |name: &str| dir.join(name);
+        for (fmt, name) in [
+            ("html", "m.html"),
+            ("docx", "m.docx"),
+            ("markdown", "m.md"),
+            ("csv", "m.csv"),
+            ("xlsx", "m.xlsx"),
+            ("json", "m.json"),
+        ] {
+            crate::export::write(&data, fmt, path(name).to_str().unwrap()).unwrap();
+        }
+        let zip_text = |p: &std::path::Path| {
+            let f = std::fs::File::open(p).unwrap();
+            let mut z = zip::ZipArchive::new(f).unwrap();
+            let mut all = String::new();
+            for i in 0..z.len() {
+                let mut e = z.by_index(i).unwrap();
+                if !e.name().ends_with(".xml") {
+                    continue;
+                }
+                std::io::Read::read_to_string(&mut e, &mut all).unwrap();
+            }
+            all
+        };
+        let html = std::fs::read_to_string(path("m.html")).unwrap();
+        let docx = zip_text(&path("m.docx"));
+        let md = std::fs::read_to_string(path("m.md")).unwrap();
+        let csv = std::fs::read_to_string(path("m.csv")).unwrap();
+        let xlsx = zip_text(&path("m.xlsx"));
+        let json = std::fs::read_to_string(path("m.json")).unwrap();
+
+        for (fmt, text) in [
+            ("html", &html),
+            ("docx", &docx),
+            ("markdown", &md),
+            ("csv", &csv),
+            ("xlsx", &xlsx),
+        ] {
+            for needle in [
+                "基准价敏感性",                   // 小节标题
+                "评标办法（人工录入）",             // 公式回显前缀
+                "算术平均",                       // 公式全文
+                "取自清单合计",                    // 投标总价来源打标
+                "启发式回落",                      // 回落来源打标
+                "逐项单价雷同率 91.7%",            // 组的构造依据
+                "本节为反事实解释性分析，不参与围标分级", // §1.5 性质声明
+                "评标办法为人工录入，请核对公式与参数", // §1.5 人工录入提示
+                "断崖式报价",                      // support-bid 小节
+                "不是统计显著性",                   // §1.5 反事实口径（明确否定 p 值/概率解读）
+            ] {
+                assert!(text.contains(needle), "{fmt} 缺「{needle}」");
+            }
+            for banned in ["自动放行", "检查通过", "认定串通"] {
+                assert!(!text.contains(banned), "{fmt} 出现禁用表述「{banned}」");
+            }
+        }
+        assert!(json.contains("\"mechanism\""), "JSON 应含 mechanism 节");
+        assert!(json.contains("\"flipProb\""), "JSON 应含翻转比例技术字段");
+        // 同数据两次导出一致（写器为纯函数）
+        crate::export::write(&data, "html", path("m2.html").to_str().unwrap()).unwrap();
+        assert_eq!(html, std::fs::read_to_string(path("m2.html")).unwrap());
+
+        // 未录入评标办法 → mechanism 键缺席 → 小节整块不渲染（数值节其余部分照常）
+        let no_mech_json = numeric_json.replace("\"mechanism\"", "\"mechanismDisabled\"");
+        let plain = build_numeric(Some(&no_mech_json), &["d1".into(), "d2".into()]).unwrap();
+        assert!(plain.mechanism.is_none());
+        let data2 = ExportData { numeric: Some(plain), ..data };
+        crate::export::write(&data2, "html", path("p.html").to_str().unwrap()).unwrap();
+        let plain_html = std::fs::read_to_string(path("p.html")).unwrap();
+        assert!(plain_html.contains("商务标数值证据"), "数值节仍在");
+        assert!(!plain_html.contains("基准价敏感性"), "未录入评标办法 → 该小节整块缺席");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 配置四层在 DB 链路上的覆盖关系：工作区 patch 覆盖用户全局，任务请求再覆盖工作区。

@@ -1,15 +1,22 @@
 import { describe, it, expect } from "vitest";
-import type { NumericPairDto } from "../api/types";
+import type { EvaluationConfigDto, NumericPairDto } from "../api/types";
 import {
   defaultPair,
   discountBand,
+  evaluationError,
+  flipStatement,
   identicalMatrix,
   isStrongCorrelation,
+  mechanismFormulaText,
+  mechanismPositionLabel,
   pairIndex,
   pairKey,
   patternLabel,
+  priceSourceLabel,
   reasonLabel,
+  shiftLabel,
   toSvgXY,
+  MECHANISM_DISCLAIMER,
 } from "./numericView";
 
 const pair = (p: Partial<NumericPairDto> & Pick<NumericPairDto, "a" | "b">): NumericPairDto => ({
@@ -102,5 +109,61 @@ describe("toSvgXY / discountBand", () => {
     expect(discountBand("geo_discount", 1.0)).toBeNull();
     expect(discountBand("arith_seq", 0.97)).toBeNull();
     expect(discountBand("geo_discount", null)).toBeNull();
+  });
+});
+
+describe("机制感知筛查（基准价敏感性）文案", () => {
+  const ev = (p: Partial<EvaluationConfigDto> = {}): EvaluationConfigDto => ({
+    method: "avg_benchmark",
+    trimLowest: 1,
+    trimHighest: 1,
+    coeffMin: 0.9,
+    coeffMax: 1.0,
+    ...p,
+  });
+
+  it("公式全文回显含去高/去低与系数区间（人工录入需逐字核对）", () => {
+    const t = mechanismFormulaText(ev());
+    expect(t).toContain("去掉 1 个最高");
+    expect(t).toContain("1 个最低");
+    expect(t).toContain("0.9000");
+    expect(t).toContain("1.0000");
+    expect(t).toContain("最接近基准价者价格分最高");
+    // 最低评标价法不得出现均值基准表述
+    const low = mechanismFormulaText(ev({ method: "lowest" }));
+    expect(low).toContain("最低评标价法");
+    expect(low).not.toContain("算术平均");
+  });
+
+  it("性质声明必须写明不参与围标分级且需核对人工录入", () => {
+    expect(MECHANISM_DISCLAIMER).toContain("不参与围标分级");
+    expect(MECHANISM_DISCLAIMER).toContain("人工录入");
+  });
+
+  it("参数校验与后端同口径：去高去低之和须小于参评份数、系数区间须合法", () => {
+    expect(evaluationError(ev(), 5)).toBeNull();
+    expect(evaluationError(ev({ trimLowest: 3, trimHighest: 2 }), 5)).toContain("小于参评份数");
+    expect(evaluationError(ev({ coeffMin: 1.1, coeffMax: 0.9 }), 5)).toContain("系数区间不合法");
+    expect(evaluationError(ev({ coeffMin: 0 }), 5)).toContain("系数区间不合法");
+    // 最低评标价法不校验均值参数
+    expect(evaluationError(ev({ method: "lowest", trimLowest: 9 }), 2)).toBeNull();
+  });
+
+  it("反事实结论表述为占比而非概率", () => {
+    const s = flipStatement(0.831);
+    expect(s).toContain("83.1%");
+    expect(s).toContain("的系数取值下改变");
+    expect(s).not.toContain("概率");
+  });
+
+  it("来源打标与端点/偏移标签", () => {
+    expect(priceSourceLabel("totalRow")).toBe("取自投标总价行");
+    expect(priceSourceLabel("boqSum")).toBe("取自清单合计");
+    expect(priceSourceLabel("heuristic")).toContain("启发式回落");
+    expect(priceSourceLabel("boqSum", "后端下发标签")).toBe("后端下发标签");
+    expect(mechanismPositionLabel("lowest")).toBe("报价最低端");
+    expect(mechanismPositionLabel("highest")).toBe("报价最高端");
+    expect(shiftLabel(1.6773)).toBe("+1.68%");
+    expect(shiftLabel(-0.3458)).toBe("−0.35%");
   });
 });

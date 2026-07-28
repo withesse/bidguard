@@ -7,6 +7,7 @@ use crate::db::repo::{document_repo, job_repo};
 use crate::db::repo::document_repo::DocumentRow;
 use crate::db::repo::job_repo::JobRow;
 use crate::engine::diff::graded_diff;
+use crate::engine::mechanism;
 use crate::engine::report::DiffOp;
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::progress::TauriEventSink;
@@ -41,6 +42,10 @@ pub struct CompareRequest {
     pub enable_rerank: Option<bool>,
     /// 复核模型档位（默认 bge-reranker-base-int8）。
     pub rerank_model: Option<String>,
+    /// 评标办法（W5-5 机制感知筛查）：【仅请求级】——每个项目评标办法不同，不进全局默认。
+    /// 缺省 = 不录入 ⇒ 不做任何反事实计算。录入值经校验后原样写入 jobs.config_json 快照
+    /// （公式全文可在报告里逐字核对——人工录入错了会误导，必须可追溯）。
+    pub evaluation: Option<mechanism::EvaluationConfig>,
 }
 
 #[tauri::command]
@@ -83,6 +88,24 @@ pub async fn start_compare(
     if !matches!(scope.as_str(), "full" | "tech" | "business") {
         return Err(AppError::new(AppErrorCode::InvalidConfig, "比对范围不合法"));
     }
+    // 评标办法（W5-5）：录入即校验（公式族、系数区间、去高去低之和 < 参评份数）。
+    // 不合法【直接拒绝】而非静默纠正——参数错了整节结论都是错的，不能让用户以为生效了。
+    if let Some(ev) = &request.evaluation {
+        ev.validate()
+            .map_err(|e| AppError::new(AppErrorCode::InvalidConfig, format!("评标办法不合法：{e}")))?;
+        if ev.method == mechanism::METHOD_AVG_BENCHMARK && ev.trim_lowest + ev.trim_highest >= ids.len()
+        {
+            return Err(AppError::new(
+                AppErrorCode::InvalidConfig,
+                format!(
+                    "评标办法不合法：去高（{}）与去低（{}）之和须小于参评份数（{}）",
+                    ev.trim_highest,
+                    ev.trim_lowest,
+                    ids.len()
+                ),
+            ));
+        }
+    }
     let run = CompareRunConfig {
         document_ids: ids.clone(),
         base_document_id: request.base_document_id,
@@ -114,6 +137,7 @@ pub async fn start_compare(
         // cross-encoder 复核带（W6-2）：默认关闭，模型未缓存时后端自行降级（rerank_degraded）。
         enable_rerank: request.enable_rerank.unwrap_or(d.enable_rerank),
         rerank_model: request.rerank_model.unwrap_or(d.rerank_model),
+        evaluation: request.evaluation,
     };
     let name = request
         .name

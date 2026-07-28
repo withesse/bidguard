@@ -2,8 +2,14 @@
 // 最小合法 OOXML（zip + document.xml），Word/WPS/Pages 原生渲染中文。
 use super::data::ExportData;
 use super::shared::{
-    band_cn_of, calibration_lines, calibration_note, contrib_label, docx_p, field_cn, label,
-    level_cn, review_cn, severity_cn, strength_phrase, type_cn, write_docx_package,
+    band_cn_of, calibration_lines, calibration_note, contrib_label, digit_clustered_cn, digit_stat,
+    docx_p, evasion_verdict_cn, field_cn, forensic_kind_cn, forensic_level_cn, forensic_pair_label,
+    label, level_cn, lineage_summary, mechanism_group_cells, mechanism_lines,
+    mechanism_price_cells, mechanism_support_cells, numeric_intro, numeric_pattern_cn,
+    numeric_rate_cell, review_cn, severity_cn, strength_phrase, type_cn, verbatim_locator,
+    write_docx_package, ARITH_ERROR_NOTE, DIGIT_TAIL_NOTE, EVASION_NOTE, FORENSIC_NOTE,
+    MECHANISM_GROUP_TITLE, MECHANISM_PRICE_TITLE, MECHANISM_SUPPORT_TITLE, MECHANISM_TITLE,
+    SEGMENTS_NOTE,
 };
 
 const MAX_DETAIL_CLUSTERS: usize = 500;
@@ -198,14 +204,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     // 对齐区段与逐字证据（附录 A segments 节；§1.5 第二种正式格式。无区段/逐字则整章省略）
     if let Some(seg) = &data.segments {
         docx_p(&mut body, "对齐区段与逐字证据", true, 28);
-        docx_p(
-            &mut body,
-            "对齐区段为与聚类并存的独立证据层（按 chunk 去重的真实覆盖）。深红＝逐字铁证、橙＝锚点雷同、\
-             黄＝gap 细化差异；标注「引用招标文件」者落在招标豁免块，系对同一招标条款的合法应答，非串通证据。\
-             未命中不构成清白证明。",
-            false,
-            20,
-        );
+        docx_p(&mut body, SEGMENTS_NOTE, false, 20);
         for p in &seg.pairs {
             docx_p(&mut body, &format!("{} × {}", p.a, p.b), true, 24);
             if p.segments.is_empty() {
@@ -258,32 +257,13 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     // 商务标数值证据（附录 A numeric 节；§1.5 第二种正式格式。无清单数据则整章省略）
     if let Some(nm) = &data.numeric {
         docx_p(&mut body, "商务标数值证据", true, 28);
-        docx_p(
-            &mut body,
-            &format!(
-                "报价清单逐项比对：共识别清单条目 {} 条、跨文档对齐 {} 条；雷同率告警线 {:.0}%，\
-                 可比条目不足 {} 项的文档对不出结论。",
-                nm.item_count,
-                nm.aligned_item_count,
-                nm.identical_rate_alarm * 100.0,
-                nm.min_comparable
-            ),
-            false,
-            20,
-        );
+        docx_p(&mut body, &numeric_intro(nm), false, 20);
         for note in &nm.notes {
             docx_p(&mut body, note, false, 20);
         }
         docx_p(&mut body, "逐项单价雷同率", true, 24);
         for p in &nm.pairs {
-            let rate = match p.identical_rate {
-                Some(r) => format!("{:.1}%", r * 100.0),
-                None => match p.reason.as_deref() {
-                    Some("insufficient") => "—（可比条目不足，不出结论）".to_string(),
-                    Some(other) => format!("—（{other}）"),
-                    None => "—（无可比条目）".to_string(),
-                },
-            };
+            let rate = numeric_rate_cell(p);
             docx_p(
                 &mut body,
                 &format!(
@@ -310,7 +290,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
                             "· {} ↔ {} · 规律性：{} · a={:.4} · b={:.2} 元 · R²={:.4} · n={}{}。{}",
                             p.a,
                             p.b,
-                            pattern_kind_cn(&x.kind),
+                            numeric_pattern_cn(&x.kind),
                             x.a,
                             x.b,
                             x.r2,
@@ -343,13 +323,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         let err_count: usize = nm.pairs.iter().map(|p| p.shared_arith_errors.len()).sum();
         if err_count > 0 {
             docx_p(&mut body, &format!("共享算术错误清单（{err_count} 条）"), true, 24);
-            docx_p(
-                &mut body,
-                "同一清单项在两份文件中工程量、综合单价与（算错的）合价三者到分全等。检测已排除可由常见\
-                 舍入规则解释的差值；请核对是否源自同一计价软件舍入惯例或招标文件，单条命中不构成串通投标认定。",
-                false,
-                20,
-            );
+            docx_p(&mut body, ARITH_ERROR_NOTE, false, 20);
             for p in &nm.pairs {
                 for x in &p.shared_arith_errors {
                     let name = x.name.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("—");
@@ -373,38 +347,146 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
                 }
             }
         }
+        // 基准价敏感性（W5-5 机制感知筛查）：【描述性小节，不参与围标分级】
+        if let Some(mc) = &nm.mechanism {
+            docx_p(&mut body, MECHANISM_TITLE, true, 24);
+            for line in mechanism_lines(mc) {
+                docx_p(&mut body, &line, false, 20);
+            }
+            if !mc.prices.is_empty() {
+                docx_p(&mut body, MECHANISM_PRICE_TITLE, true, 21);
+                for p in &mc.prices {
+                    let c = mechanism_price_cells(p);
+                    docx_p(&mut body, &format!("· {} · {} 元 · {}", c[0], c[1], c[2]), false, 21);
+                }
+            }
+            if let Some(b) = &mc.benchmark {
+                if b.groups.is_empty() {
+                    docx_p(
+                        &mut body,
+                        "未构造出候选组：参评文档间未出现可作依据的既有文档证据（文本相似峰值 / 逐项单价雷同率 / 元数据同源），故不作剔除重算。",
+                        false,
+                        20,
+                    );
+                } else {
+                    docx_p(&mut body, MECHANISM_GROUP_TITLE, true, 21);
+                    for g in &b.groups {
+                        let c = mechanism_group_cells(g);
+                        docx_p(
+                            &mut body,
+                            &format!(
+                                "· {} · 中标人翻转比例 {} · 基准价偏移 {} · 同规模子集分位 {} · 中标人 {} · 构造依据：{}",
+                                c[0], c[2], c[3], c[4], c[5], c[1]
+                            ),
+                            false,
+                            21,
+                        );
+                    }
+                }
+            }
+            if !mc.support_bids.is_empty() {
+                docx_p(&mut body, MECHANISM_SUPPORT_TITLE, true, 21);
+                for s in &mc.support_bids {
+                    let c = mechanism_support_cells(s);
+                    docx_p(
+                        &mut body,
+                        &format!(
+                            "· {} · {} 元 · {} · 与次邻间距 {} · 偏离中位数 {}",
+                            c[0], c[1], c[2], c[3], c[4]
+                        ),
+                        false,
+                        21,
+                    );
+                }
+            }
+        }
         // 逐文档单价尾数分布
         if nm.docs.iter().any(|d| d.digit_stats.is_some()) {
             docx_p(&mut body, "逐文档单价尾数分布", true, 24);
             for d in &nm.docs {
                 let Some(ds) = &d.digit_stats else { continue };
-                let g = |k: &str| ds.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let clustered =
-                    ds.get("clustered").and_then(serde_json::Value::as_bool).unwrap_or(false);
                 docx_p(
                     &mut body,
                     &format!(
                         "· {} · 样本 {} · 分位 χ²={:.2} · 角位 χ²={:.2} · 临界值 {:.3} · 0/5 尾占比 {:.0}% · {}",
                         d.tag,
-                        g("n") as i64,
-                        g("centChiSquare"),
-                        g("jiaoChiSquare"),
-                        g("critical"),
-                        g("zeroFiveRatio") * 100.0,
-                        if clustered { "尾数聚集" } else { "未见聚集" }
+                        digit_stat(ds, "n") as i64,
+                        digit_stat(ds, "centChiSquare"),
+                        digit_stat(ds, "jiaoChiSquare"),
+                        digit_stat(ds, "critical"),
+                        digit_stat(ds, "zeroFiveRatio") * 100.0,
+                        digit_clustered_cn(ds)
                     ),
                     false,
                     21,
                 );
             }
+            docx_p(&mut body, DIGIT_TAIL_NOTE, false, 20);
+        }
+    }
+
+    // 取证证据（附录 A forensic 节；无命中不渲染——§1.5 不留空表沉默背书）
+    if let Some(f) = &data.forensic {
+        docx_p(&mut body, "取证证据", true, 28);
+        docx_p(&mut body, FORENSIC_NOTE, false, 20);
+        for hit in &f.hits {
             docx_p(
                 &mut body,
-                "尾数聚集反映报价的取整习惯（如统一取整到角/元），单独不构成串通认定，需结合取证类证据；\
-                 本工具未做 Benford 首位检验（单价通常只跨 2–3 个数量级，前提不成立）。",
+                &format!(
+                    "· {} · {} · 强度 {} — {}",
+                    forensic_kind_cn(&hit.kind),
+                    forensic_pair_label(&hit.doc_a, &hit.doc_b),
+                    forensic_level_cn(&hit.level),
+                    hit.detail
+                ),
+                false,
+                21,
+            );
+        }
+        docx_p(&mut body, "逐文档取证指纹", true, 22);
+        for d in &f.per_document {
+            docx_p(
+                &mut body,
+                &format!(
+                    "　{}：rsid {} 个 · 模板 {} · 血缘 {}",
+                    d.tag,
+                    d.rsid_count,
+                    d.template_name.as_deref().unwrap_or("—"),
+                    lineage_summary(&d.lineage)
+                ),
                 false,
                 20,
             );
         }
+    }
+
+    // 规避特征复核（附录 A evasion 节；仅列达判级线文档，无则不渲染）
+    if let Some(ev) = &data.evasion {
+        docx_p(&mut body, "规避特征复核", true, 28);
+        docx_p(&mut body, EVASION_NOTE, false, 20);
+        for d in &ev.per_document {
+            let kinds =
+                if d.evidence_kinds.is_empty() { "—".to_string() } else { d.evidence_kinds.join("、") };
+            docx_p(
+                &mut body,
+                &format!("　{}：{} · 证据种类 {}", d.tag, evasion_verdict_cn(&d.verdict), kinds),
+                false,
+                21,
+            );
+        }
+    }
+
+    // 检查方法与局限（附录 A methodsAndLimitations：§1.5 无条件常驻，堵沉默背书——
+    // 缺此节时「没有取证章节」会被读成「查过了，干净」，而 rsid/元数据/规避恰恰都可被清除）。
+    let ml = &data.methods_and_limitations;
+    docx_p(&mut body, "检查方法与局限", true, 28);
+    docx_p(&mut body, "本次已执行的取证 / 对抗检查项：", true, 22);
+    for c in &ml.checks_run {
+        docx_p(&mut body, &format!("　· {c}"), false, 20);
+    }
+    docx_p(&mut body, "局限与声明：", true, 22);
+    for d in &ml.disclaimers {
+        docx_p(&mut body, &format!("　· {d}"), false, 20);
     }
 
     docx_p(&mut body, "附录：比对配置", true, 28);
@@ -422,28 +504,3 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     write_docx_package(path, &doc)
 }
 
-/// 规律性差异形态的中文标签（numeric.pairs[].pattern.kind）。
-fn pattern_kind_cn(kind: &str) -> &str {
-    match kind {
-        "arith_seq" => "等差（各项差额恒定）",
-        "geo_discount" => "等比 / 恒定折扣（各项系数恒定）",
-        "affine" => "仿射（系数与差额均非平凡）",
-        other => other,
-    }
-}
-
-/// 逐字区间一侧定位串（页码 + 章节路径 → 单行；docx_p 内部再转义）。
-fn verbatim_locator(page: Option<i64>, section: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(pg) = page {
-        parts.push(format!("第{pg}页"));
-    }
-    if let Some(s) = section.map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(s.to_string());
-    }
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join(" · ")
-    }
-}

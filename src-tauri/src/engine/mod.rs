@@ -22,6 +22,8 @@ pub mod fact;
 pub mod features;
 pub mod fingerprint;
 pub mod matrix;
+/// 机制感知筛查（W5-5）：评标办法配置 + 反事实基准价重算。【仅描述性输出，不进围标分级】。
+pub mod mechanism;
 /// 模型按需下载的共用落盘器（embed / rerank）：.tar 原子落盘 + sha256 完整性校验。
 pub mod modelfetch;
 pub mod normalize;

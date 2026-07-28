@@ -10,7 +10,8 @@ import { useToast } from "../components/Toast";
 import { errMsg, isTauri } from "../api/client";
 import { setWorkspaceSettings } from "../api";
 import { pickBidFiles } from "../engine";
-import type { DocRole, DocumentDto } from "../api/types";
+import type { DocRole, DocumentDto, EvaluationConfigDto } from "../api/types";
+import { evaluationError, mechanismFormulaText, MECHANISM_DISCLAIMER } from "../utils/numericView";
 import {
   useAppSettings,
   useDocuments,
@@ -58,6 +59,14 @@ export function CompareSetup() {
   const [threshold, setThreshold] = useState(0.7);
   const [cfgApplied, setCfgApplied] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  // 评标办法（W5-5 机制感知筛查）：【仅单次任务级】，不写工作区/全局默认——每个项目办法不同。
+  // 默认关闭：录入错误会让「基准价敏感性」整节失真，必须是用户主动录入的显式动作。
+  const [evalOn, setEvalOn] = useState(false);
+  const [evalMethodIdx, setEvalMethodIdx] = useState(0); // 0=截尾均值×系数 1=最低评标价
+  const [trimHighest, setTrimHighest] = useState(0);
+  const [trimLowest, setTrimLowest] = useState(0);
+  const [coeffMin, setCoeffMin] = useState(0.9);
+  const [coeffMax, setCoeffMax] = useState(1.0);
 
   // 生效默认 = 用户全局默认 < 本工作区默认（工作区层覆盖全局层），二者就绪后填充一次；此后用户改动优先。
   // 修复前只读全局，导致「保存为本工作区默认」写入 settingsJson 却从不被回填 → 保存零生效。
@@ -179,14 +188,32 @@ export function CompareSetup() {
     });
   };
 
+  // 录入的评标办法（关闭时为 undefined，请求里整键缺席 ⇒ 后端不做任何反事实计算）
+  const evaluation: EvaluationConfigDto | undefined = evalOn
+    ? {
+        method: evalMethodIdx === 1 ? "lowest" : "avg_benchmark",
+        trimLowest,
+        trimHighest,
+        coeffMin,
+        coeffMax,
+      }
+    : undefined;
+
   const onStart = async () => {
     const ids = parsed.filter((d) => chosen.has(d.id)).map((d) => d.id);
     if (ids.length < 2) {
       toast.show("请至少勾选 2 份解析成功的标书", "warn");
       return;
     }
+    // 评标办法参数不合法【直接拦下】：参数错了整节结论都是错的，不能让用户以为生效了
+    const evalErr = evaluation ? evaluationError(evaluation, ids.length) : null;
+    if (evalErr) {
+      toast.show("评标办法不合法：" + evalErr, "warn");
+      return;
+    }
     try {
       const job = await startCompare.mutateAsync({
+        evaluation,
         documentIds: ids,
         name: taskName.trim() || undefined,
         baseDocumentId: baseDocId && ids.includes(baseDocId) ? baseDocId : undefined,
@@ -500,10 +527,124 @@ export function CompareSetup() {
                 保存为本工作区默认
               </Button>
             </div>
+            {/* 评标办法（可选）：W5-5 机制感知筛查。仅本次任务生效，不随「保存为本工作区默认」写入 */}
+            <details style={{ borderTop: `1px solid ${border}`, paddingTop: 12 }}>
+              <summary style={{ fontSize: 12.5, fontWeight: 600, color: ink, cursor: "pointer" }}>
+                评标办法（可选）· 基准价敏感性分析
+              </summary>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 12 }}>
+                <div style={{ fontSize: 11, color: mute, lineHeight: 1.75 }}>
+                  录入后，报告增加「基准价敏感性」描述性小节：按本办法重算基准价，并给出「若剔除某组投标人，
+                  中标人是否改变」的反事实结果。{MECHANISM_DISCLAIMER}
+                  本项仅对本次比对生效，不写入工作区默认；且需本次比对能识别出报价清单。
+                </div>
+                <SettingRow
+                  label="录入评标办法"
+                  hint="默认不录入：不录入则不做任何反事实计算，报告无此小节"
+                >
+                  <Toggle on={evalOn} onChange={() => setEvalOn((v) => !v)} />
+                </SettingRow>
+                {evalOn && (
+                  <>
+                    <SettingRow
+                      label="计价办法"
+                      hint="v1 仅支持「(去 m 高 n 低后) 算术平均 × 系数，最接近基准价者价格分最高」一族；其他公式（二次平均/分段计分等）会明确输出「不适用」而不硬算"
+                    >
+                      <SegControl
+                        options={["截尾均值×系数", "最低评标价"]}
+                        value={evalMethodIdx}
+                        onChange={setEvalMethodIdx}
+                      />
+                    </SettingRow>
+                    {evalMethodIdx === 0 && (
+                      <>
+                        <SettingRow label="去掉最高报价（个）" hint="计算基准价前剔除的最高价个数 m">
+                          <NumberInput value={trimHighest} min={0} max={8} step={1} onChange={setTrimHighest} />
+                        </SettingRow>
+                        <SettingRow label="去掉最低报价（个）" hint="计算基准价前剔除的最低价个数 n">
+                          <NumberInput value={trimLowest} min={0} max={8} step={1} onChange={setTrimLowest} />
+                        </SettingRow>
+                        <SettingRow
+                          label="系数区间"
+                          hint="招标文件给定区间或抽取值集合时填其上下限；系统在区间上取 201 个均匀格点逐点重算（固定格点，结果可复现）"
+                        >
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <NumberInput value={coeffMin} min={0.5} max={2} step={0.01} onChange={setCoeffMin} />
+                            <span style={{ fontSize: 12, color: mute }}>—</span>
+                            <NumberInput value={coeffMax} min={0.5} max={2} step={0.01} onChange={setCoeffMax} />
+                          </div>
+                        </SettingRow>
+                      </>
+                    )}
+                    {/* 公式全文回显：人工录入错了会误导，发起前必须能逐字核对（同一文案写入配置快照） */}
+                    <div
+                      style={{
+                        background: dark ? "rgba(255,255,255,0.04)" : C.paper2,
+                        border: `1px solid ${border}`,
+                        borderRadius: 8,
+                        padding: "10px 12px",
+                        fontSize: 11.5,
+                        color: ink,
+                        lineHeight: 1.8,
+                      }}
+                    >
+                      <b>本次将按以下公式计算（请核对）：</b>
+                      <br />
+                      {evaluation ? mechanismFormulaText(evaluation) : ""}
+                      {evaluation && evaluationError(evaluation, Math.max(chosen.size, 2)) && (
+                        <div style={{ color: C.danger, marginTop: 6 }}>
+                          {evaluationError(evaluation, Math.max(chosen.size, 2))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            </details>
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+/** 小数字输入框（评标办法参数用）：受控、失焦回填合法值，不静默改写用户输入。 */
+function NumberInput({
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  const { dark } = useTheme();
+  return (
+    <input
+      type="number"
+      value={value}
+      min={min}
+      max={max}
+      step={step}
+      onChange={(e) => {
+        const v = Number(e.target.value);
+        if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, v)));
+      }}
+      style={{
+        width: 84,
+        background: dark ? "#1E1E25" : C.white,
+        border: `1px solid ${dark ? "rgba(255,255,255,0.07)" : C.line}`,
+        borderRadius: 8,
+        padding: "6px 8px",
+        fontSize: 12,
+        color: dark ? "#fff" : C.ink,
+        fontFamily: C.mono,
+      }}
+    />
   );
 }
 

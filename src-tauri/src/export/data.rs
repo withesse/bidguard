@@ -65,9 +65,102 @@ pub struct NumericSection {
     pub aligned_item_count: usize,
     pub pairs: Vec<NumericPairEntry>,
     pub docs: Vec<NumericDocEntry>,
+    /// 机制感知筛查（W5-5）：「基准价敏感性」描述性小节。None = 本次未录入评标办法。
+    /// 【不参与围标分级】——本块只是解释性分析，措辞由 notes 强制随数据下发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mechanism: Option<NumericMechanism>,
     /// §1.5 强制措辞（雷同率口径 / 共享算术错误人工核对 / 数值层覆盖范围声明）：
     /// 随节下发，任何格式的写器都不得省略。
     pub notes: Vec<String>,
+}
+
+/// 「基准价敏感性」小节（附录 A numeric 节的 M8 扩列；数据源 numeric_json.mechanism）。
+/// 天干标签化后原样呈现，【不重算】任何数字。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NumericMechanism {
+    /// false = 公式不匹配 / 数据不足 → 只写 notApplicableReason，不写任何计算结果。
+    pub applicable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_applicable_reason: Option<String>,
+    pub method: String,
+    /// 评标办法公式全文（人工录入回显，供逐字核对）。
+    pub formula: String,
+    pub prices: Vec<MechanismPrice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark: Option<MechanismBenchmark>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lowest: Option<MechanismLowest>,
+    pub support_bids: Vec<MechanismSupportBid>,
+    /// §1.5 强制措辞（不参与围标分级 / 人工录入需核对 / 组构造依据 / 反事实口径 / 断崖口径）。
+    pub notes: Vec<String>,
+}
+
+/// 一份投标总价及其来源打标。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MechanismPrice {
+    pub tag: String,
+    pub total: f64,
+    /// 中文来源标签（取自投标总价行 / 取自清单合计 / 启发式回落）。
+    pub source_label: String,
+}
+
+/// 均值基准价一族的反事实块（method=lowest 时缺席）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MechanismBenchmark {
+    pub trim_lowest: usize,
+    pub trim_highest: usize,
+    pub coeff_min: f64,
+    pub coeff_max: f64,
+    pub grid_points: usize,
+    pub coeff_mid: f64,
+    pub benchmark_mid: f64,
+    pub winner_mid: String,
+    pub groups: Vec<MechanismGroup>,
+}
+
+/// 一个候选嫌疑组的反事实结果。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MechanismGroup {
+    /// 组内文档天干标签。
+    pub docs: Vec<String>,
+    /// 组的构造依据（必须随组呈现，防循环论证观感）。
+    pub basis: Vec<String>,
+    pub flip_prob: f64,
+    pub benchmark_shift_pct: f64,
+    pub shift_percentile: f64,
+    pub subsets_compared: usize,
+    pub winner_full: String,
+    pub winner_excluded: String,
+    pub support_bid_docs: Vec<String>,
+}
+
+/// 最低评标价法的最低价孤立度。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MechanismLowest {
+    pub winner: String,
+    pub lowest: f64,
+    pub second_lowest: f64,
+    pub gap: f64,
+    pub median_gap: f64,
+    pub isolated: bool,
+}
+
+/// 一条断崖式报价（support-bid 形态）标记。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MechanismSupportBid {
+    pub tag: String,
+    pub total: f64,
+    /// "lowest" | "highest"
+    pub position: String,
+    pub gap: f64,
+    pub median_gap: f64,
+    pub deviation_pct: f64,
 }
 
 /// 一对参评文档的数值比对结果（a/b 为天干标签）。

@@ -10,7 +10,7 @@ use crate::engine::corpus::{self, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary, Fingerprint, SectionStat, SharedTerm};
 use crate::engine::{
     align, background, boq, calibrate, candidate, collusion, diff, embed, fact, fingerprint, matrix,
-    rerank, scoring, verbatim, winnow,
+    mechanism, rerank, scoring, verbatim, winnow,
 };
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::jobs::JobCtx;
@@ -71,6 +71,15 @@ pub struct CompareRunConfig {
     /// 复核模型档位（见 engine::rerank::RERANK_MODELS）。旧任务无此键 → 默认 int8 基础档。
     #[serde(default = "default_rerank_model")]
     pub rerank_model: String,
+    /// 评标办法（W5-5，机制感知筛查）：【仅请求级配置】——每个项目评标办法不同，不进全局默认。
+    /// None（默认）= 未录入 ⇒ 本节整体不出，numeric_json 无 mechanism 键、配置快照无此键
+    /// （旧任务与未录入任务的 config_json 逐字节不变）。
+    ///
+    /// 【产品纪律】本项只驱动「基准价敏感性」描述性分析，产物写入 numeric_json.mechanism
+    /// 仅供屏幕与报告引用，【绝不进入围标信号与分级】（见 engine::mechanism 模块头注释）。
+    /// 另需本次比对识别到报价清单（数值层有数据），否则数值节整体缺席、本节随之不出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<mechanism::EvaluationConfig>,
 }
 
 fn default_rerank_model() -> String {
@@ -742,8 +751,8 @@ fn run_inner(
     } else {
         BoqOutcome::default()
     };
-    let (boq_rows, boq_stats, boq_pairs, boq_digits) =
-        (boq_out.rows, boq_out.stats, boq_out.pairs, boq_out.digits);
+    let (boq_rows, boq_stats, boq_pairs, boq_digits, boq_totals) =
+        (boq_out.rows, boq_out.stats, boq_out.pairs, boq_out.digits, boq_out.totals);
     ctx.check()?;
 
     // 基准模式：基准文档中无任何近似命中的分块 → deleted 单块条目
@@ -1032,11 +1041,31 @@ fn run_inner(
         "segmentPeak": seg_peak,
         "mode": matrix_mode,
     });
+    // 8.5) 机制感知筛查（W5-5）：评标办法录入后才跑，且需数值层有数据（数值节缺席时本节
+    //   无处安放）。【纯描述性】——产物只进 numeric_json.mechanism，上面的 collusion 已经
+    //   算完并落库口径不变；本节不回头改任何信号、等级或分数（§2 后置池裁决）。
+    let mechanism_result = cfg
+        .evaluation
+        .as_ref()
+        .filter(|_| boq_stats.item_count > 0)
+        .map(|ev| {
+            compute_mechanism(
+                ev,
+                docs.len(),
+                &boq_totals,
+                &comparable,
+                &m,
+                &boq_pairs,
+                &doc_infos,
+                cfg.identical_rate_alarm,
+            )
+        });
+
     // 商务标数值证据（W5-2，M6）：逐项单价雷同率矩阵 + 共享算术错误明细。
     // 无任何清单条目（纯技术标 / 扫描件 PDF 的 OCR 路径 / 数值层关闭）→ 写 NULL，前端隐藏面板。
     // 措辞随数据一起落库（notes）：§1.5 要求告警文案与「需人工核对」提示不得在任何呈现层被丢掉。
     let numeric_json: Option<String> = (boq_stats.item_count > 0).then(|| {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "documentIds": cfg.document_ids,
             "identicalRateAlarm": cfg.identical_rate_alarm,
             "minComparable": boq::MIN_COMPARABLE,
@@ -1062,8 +1091,15 @@ fn run_inner(
                 "coverage": "数值层仅覆盖 xlsx / docx / 文本 PDF 中可识别的报价清单表；\
 扫描件 PDF 走 OCR 不产表格行，不在覆盖范围内。",
             },
-        })
-        .to_string()
+        });
+        // 机制感知筛查（W5-5）：【仅在录入评标办法时】追加 mechanism 子对象；未录入 → 整键
+        // 缺席，numeric_json 与本条上线前逐字节一致（前端/导出据此隐藏该块）。
+        if let Some(mech) = &mechanism_result {
+            if let Ok(mv) = serde_json::to_value(mech) {
+                v["mechanism"] = mv;
+            }
+        }
+        v.to_string()
     });
     // 罕见词 + 共同错误指纹并入同一 shared_terms_json 通道（错误条目 kind="sharedErrors"）
     let mut shared_out = shared;
@@ -1158,6 +1194,9 @@ struct BoqOutcome {
     pairs: Vec<boq::PairStats>,
     /// 与 docs 同序；单价样本不足 boq::DIGIT_MIN_N 的文档为 None（不出结论）。
     digits: Vec<Option<boq::DigitStats>>,
+    /// 与 docs 同序的投标总价锚定（W5-5）：优先「投标总价/投标报价」行，否则 Σ合价；
+    /// None = 该份清单无合价可用（由机制层回落到全文最大金额启发式）。
+    totals: Vec<Option<boq::TotalPrice>>,
 }
 
 fn compute_boq(
@@ -1220,7 +1259,11 @@ fn compute_boq(
         .iter()
         .map(|items| boq::digit_stats(&boq::bidder_unit_prices(items)))
         .collect();
-    Ok(BoqOutcome { rows, stats, pairs, digits })
+    // 投标总价锚定（W5-5）：与 docs 同序，供机制感知筛查使用；无评标办法配置时白算一次
+    // 加法，代价可忽略且保持产物形状稳定。
+    let totals: Vec<Option<boq::TotalPrice>> =
+        per_doc.iter().map(|items| boq::total_price_of(items)).collect();
+    Ok(BoqOutcome { rows, stats, pairs, digits, totals })
 }
 
 /// 把逐对数值统计（W5-2/3/4）聚合成围标判定用的数值证据（W5-6）。
@@ -1285,6 +1328,96 @@ pub(crate) fn numeric_evidence_of(
     }
     ev.shared_arith_error_count = error_keys.len();
     ev
+}
+
+/// 机制感知筛查（W5-5）的输入装配 + 执行。
+///
+/// 【产品纪律】产物只进 numeric_json.mechanism 供屏幕与报告引用，
+/// 【绝不进入围标信号】——本函数的返回值不参与 collusion::assess_with 的任何入参，
+/// NumericEvidence.mechanism_flip_prob 保持恒 None（见 numeric_evidence_of）。
+///
+/// 投标总价锚定：BOQ「投标总价/投标报价」行 > BOQ Σ合价 > 全文最大金额排除法（回落），
+/// 三档来源逐份打标以便举证。候选嫌疑组的证据（C&D 第一种构造法，组内每对都需其一）：
+/// ① 文本相似峰值 ≥ GROUP_TEXT_PEAK_MIN；② W5-2 逐项单价雷同率达告警线；③ 元数据同源共现。
+#[allow(clippy::too_many_arguments)]
+fn compute_mechanism(
+    ev: &mechanism::EvaluationConfig,
+    n_docs: usize,
+    boq_totals: &[Option<boq::TotalPrice>],
+    chunks: &[CmpChunk],
+    doc_matrix: &[Vec<f32>],
+    boq_pairs: &[boq::PairStats],
+    doc_infos: &[DocInfo],
+    alarm_line: f64,
+) -> mechanism::MechanismResult {
+    // 总价锚定：清单拿不到的文档才回落到启发式（全表扫描只在确有缺口时做一次）
+    let need_fallback = (0..n_docs).any(|i| boq_totals.get(i).copied().flatten().is_none());
+    let fallback =
+        if need_fallback { max_amount_by_doc(chunks, n_docs) } else { vec![None; n_docs] };
+    let prices: Vec<mechanism::BidPrice> = (0..n_docs)
+        .filter_map(|i| match boq_totals.get(i).copied().flatten() {
+            Some(t) => Some(mechanism::BidPrice {
+                doc: i,
+                total: t.total,
+                source: if t.from_total_row {
+                    mechanism::PriceSource::TotalRow
+                } else {
+                    mechanism::PriceSource::BoqSum
+                },
+            }),
+            None => fallback.get(i).copied().flatten().map(|v| mechanism::BidPrice {
+                doc: i,
+                total: v as f64,
+                source: mechanism::PriceSource::Heuristic,
+            }),
+        })
+        .collect();
+
+    // 候选组证据：全部来自【已有的文档证据】，且逐条给出可读依据（报告中标明组的构造依据，
+    // 防「先用文本证据圈定、再用数值证据佐证」的循环论证观感）。
+    let mut evidence: Vec<mechanism::PairEvidence> = Vec::new();
+    for a in 0..n_docs {
+        for b in (a + 1)..n_docs {
+            let mut basis: Vec<mechanism::EvidenceBasis> = Vec::new();
+            if let Some(sim) = doc_matrix.get(a).and_then(|r| r.get(b)).copied() {
+                if sim >= mechanism::GROUP_TEXT_PEAK_MIN {
+                    basis.push(mechanism::EvidenceBasis {
+                        kind: "textPeak".into(),
+                        detail: format!(
+                            "文本相似度 {:.2}（≥{:.2}）",
+                            sim,
+                            mechanism::GROUP_TEXT_PEAK_MIN
+                        ),
+                    });
+                }
+            }
+            if let Some(p) = boq_pairs.iter().find(|p| p.a == a && p.b == b) {
+                if let Some(rate) = p.identical_rate.filter(|r| *r >= alarm_line) {
+                    basis.push(mechanism::EvidenceBasis {
+                        kind: "identicalRate".into(),
+                        detail: format!(
+                            "逐项单价雷同率 {:.1}%（≥告警线 {:.0}%）",
+                            rate * 100.0,
+                            alarm_line * 100.0
+                        ),
+                    });
+                }
+            }
+            if let (Some(da), Some(db)) = (doc_infos.get(a), doc_infos.get(b)) {
+                let cats = collusion::shared_meta_categories(da, db);
+                if !cats.is_empty() {
+                    basis.push(mechanism::EvidenceBasis {
+                        kind: "metadata".into(),
+                        detail: format!("元数据同源：{}", cats.join("、")),
+                    });
+                }
+            }
+            if !basis.is_empty() {
+                evidence.push(mechanism::PairEvidence { a, b, basis });
+            }
+        }
+    }
+    mechanism::run(ev, &prices, &evidence)
 }
 
 /// 语义向量：唯一 normalized_hash 查缓存 → 缺失的批量嵌入并回写。
@@ -1824,13 +1957,10 @@ const PRICE_EXCLUDE: &[&str] = &[
     "营业收入", "营业额", "年产值", "合同额", "业绩", "纳税", "保证金",
 ];
 
-/// 报价梯度：每文档取「排除非报价语境后」的最大金额作为投标价，
-/// 两文档共享 ≥3 个雷同条款且报价差 0 < gap < 3% → 信号。
-fn price_proximity(
-    chunks: &[CmpChunk],
-    n_docs: usize,
-    raw: &[clustering::RawCluster],
-) -> Vec<collusion::PriceProximity> {
+/// 每文档「排除非报价语境后」的全文最大金额（排除法启发式）。
+/// 两处消费：① 报价梯度回落信号；② W5-5 机制感知筛查的投标总价【回落】锚点
+/// （清单里既无投标总价行、也无合价可求和时）——回落来源在结果里打标，举证时可辨。
+fn max_amount_by_doc(chunks: &[CmpChunk], n_docs: usize) -> Vec<Option<u64>> {
     let mut max_amount: Vec<Option<u64>> = vec![None; n_docs];
     for c in chunks {
         // 排除注册资本/业绩/保证金等非报价大额所在的块，避免劫持全文最大值
@@ -1850,6 +1980,17 @@ fn price_proximity(
             }
         }
     }
+    max_amount
+}
+
+/// 报价梯度：每文档取「排除非报价语境后」的最大金额作为投标价，
+/// 两文档共享 ≥3 个雷同条款且报价差 0 < gap < 3% → 信号。
+fn price_proximity(
+    chunks: &[CmpChunk],
+    n_docs: usize,
+    raw: &[clustering::RawCluster],
+) -> Vec<collusion::PriceProximity> {
+    let max_amount = max_amount_by_doc(chunks, n_docs);
 
     let mut overlap: HashMap<(usize, usize), u32> = HashMap::new();
     for rc in raw {
@@ -2290,6 +2431,8 @@ mod tests {
             // 复核带默认关闭：测试基线口径 = M6，开启由个别用例显式覆盖
             enable_rerank: false,
             rerank_model: default_rerank_model(),
+            // 评标办法默认不录入：机制感知筛查（W5-5）整节不出，由个别用例显式覆盖
+            evaluation: None,
         }
     }
 
@@ -2795,7 +2938,10 @@ mod tests {
                  a_coverage, b_coverage FROM aligned_segments WHERE job_id = ?1",
             )
             .unwrap();
-        let segs: Vec<(String, String, String, i64, i64, i64, f64, f64)> = stmt
+        /// 区段断言行：(id, doc_a, doc_b, anchor_count, verbatim_chars, a_covered_chars,
+        /// a_coverage, b_coverage)——仅测试内取数用，具名以免元组类型过长。
+        type SegRow = (String, String, String, i64, i64, i64, f64, f64);
+        let segs: Vec<SegRow> = stmt
             .query_map([&job_id], |r| {
                 Ok((
                     r.get(0)?,
@@ -3734,6 +3880,108 @@ mod tests {
         assert_eq!(ds["clustered"], true);
         assert!((ds["zeroFiveRatio"].as_f64().unwrap() - 1.0).abs() < 1e-12);
         assert!(ds["note"].as_str().unwrap().contains("不构成串通认定"));
+    }
+
+    #[test]
+    fn mechanism_lands_in_numeric_json_without_touching_collusion_e2e() {
+        // 验收 e2e（W5-5）：录入评标办法 → numeric_json.mechanism 出「基准价敏感性」描述性块
+        // （基准价 / 候选组及其构造依据 / flipProb / support-bid 标记 / 强制措辞）；
+        // 【负例断言】开关前后 collusion_json 与围标分级【逐字节不变】——本节绝不进围标信号；
+        // 未录入 → 无 mechanism 键；同输入两次运行 mechanism 逐字节一致。
+        let pool = open_in_memory().unwrap();
+        let ws = {
+            let conn = pool.get().unwrap();
+            workspace_repo::create(&conn, "w").unwrap().id
+        };
+        let dir = std::env::temp_dir().join(format!("bg_mech_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 甲乙单价几乎一致（雷同率达告警线 → 候选组证据），丁整体断崖式低价（support-bid 形态）
+        let pa: Vec<f64> = (0..12).map(|i| 200.0 + i as f64).collect();
+        let mut pb = pa.clone();
+        pb[11] += 1.0;
+        let pc: Vec<f64> = pa.iter().map(|p| p + 40.0).collect();
+        let pd: Vec<f64> = pa.iter().map(|p| p * 0.4).collect();
+        let paths = vec![
+            numeric_e2e_doc(&dir, "甲方清单.xlsx", "甲工程量清单", &pa, None),
+            numeric_e2e_doc(&dir, "乙方清单.xlsx", "乙工程量清单", &pb, None),
+            numeric_e2e_doc(&dir, "丙方清单.xlsx", "丙工程量清单", &pc, None),
+            numeric_e2e_doc(&dir, "丁方清单.xlsx", "丁工程量清单", &pd, None),
+        ];
+        let jieba = Arc::new(Jieba::new());
+        let ictx = ctx_for(&pool, &ws, "import", false);
+        import_service::run_import(&ictx, jieba.clone(), &ws, &paths, &Default::default(), "bid")
+            .unwrap();
+        let ids: Vec<String> = {
+            let conn = pool.get().unwrap();
+            document_repo::list(&conn, &ws).unwrap().iter().map(|d| d.id.clone()).collect()
+        };
+        assert_eq!(ids.len(), 4);
+
+        let base_cfg = cfg_with(ids.clone(), 0.5);
+        let eval = crate::engine::mechanism::EvaluationConfig {
+            method: crate::engine::mechanism::METHOD_AVG_BENCHMARK.into(),
+            trim_lowest: 0,
+            trim_highest: 0,
+            coeff_min: 0.9,
+            coeff_max: 1.0,
+        };
+        let with_cfg = CompareRunConfig { evaluation: Some(eval.clone()), ..cfg_with(ids.clone(), 0.5) };
+
+        let run_once = |cfg: &CompareRunConfig| -> (String, Option<String>) {
+            let cctx = ctx_for(&pool, &ws, "compare", false);
+            run_compare(&cctx, jieba.clone(), Arc::new(Mutex::new(None)), &ws, cfg).unwrap();
+            let conn = pool.get().unwrap();
+            let r = job_repo::get_result_jsons(&conn, &cctx.job_id).unwrap();
+            (r.collusion_json.unwrap(), r.numeric_json)
+        };
+        let (col_off, num_off) = run_once(&base_cfg);
+        let (col_on, num_on) = run_once(&with_cfg);
+        let (col_on2, num_on2) = run_once(&with_cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 负例断言：机制感知筛查开关前后，围标 JSON（含 score / level / signals）逐字节不变
+        assert_eq!(col_off, col_on, "机制感知筛查【绝不进围标信号】：collusion_json 必须逐字节不变");
+        assert_eq!(col_on, col_on2, "同输入两次运行围标结论逐字节一致");
+        let numeric_off: serde_json::Value = serde_json::from_str(&num_off.unwrap()).unwrap();
+        assert!(numeric_off.get("mechanism").is_none(), "未录入评标办法 → 无 mechanism 键");
+
+        let numeric_on: serde_json::Value = serde_json::from_str(&num_on.unwrap()).unwrap();
+        let numeric_on2: serde_json::Value = serde_json::from_str(&num_on2.unwrap()).unwrap();
+        let mech = &numeric_on["mechanism"];
+        assert_eq!(
+            serde_json::to_string(mech).unwrap(),
+            serde_json::to_string(&numeric_on2["mechanism"]).unwrap(),
+            "同输入两次运行 mechanism 逐字节一致"
+        );
+        assert_eq!(mech["applicable"], true, "不适用原因：{}", mech["notApplicableReason"]);
+        assert!(mech["formula"].as_str().unwrap().contains("算术平均"), "公式全文须回显");
+        // 投标总价来源打标：清单有合价列 → Σ合价
+        let prices = mech["prices"].as_array().unwrap();
+        assert_eq!(prices.len(), 4);
+        assert!(prices.iter().all(|p| p["source"] == "boqSum"));
+        assert!(prices.iter().all(|p| p["sourceLabel"] == "取自清单合计"));
+        // 基准价块：格点数 ≥200，候选组带构造依据
+        let b = &mech["benchmark"];
+        assert!(b["gridPoints"].as_u64().unwrap() >= 200, "系数区间取格点而非随机采样");
+        assert!(b["benchmarkMid"].as_f64().unwrap() > 0.0);
+        let groups = b["groups"].as_array().unwrap();
+        assert!(!groups.is_empty(), "甲乙雷同率达线应构造出候选组");
+        assert!(
+            groups.iter().all(|g| !g["basis"].as_array().unwrap().is_empty()),
+            "每组必须标明构造依据（防循环论证观感）"
+        );
+        assert!(groups.iter().all(|g| {
+            let f = g["flipProb"].as_f64().unwrap();
+            (0.0..=1.0).contains(&f)
+        }));
+        // 丁整体 0.4 倍报价 → 断崖式（support-bid 形态）标记
+        let supports = mech["supportBids"].as_array().unwrap();
+        assert_eq!(supports.len(), 1, "只有丁断崖：{supports:?}");
+        assert_eq!(supports[0]["position"], "lowest");
+        // §1.5 强制措辞随数据落库
+        let notes: Vec<&str> = mech["notes"].as_array().unwrap().iter().filter_map(|n| n.as_str()).collect();
+        assert!(notes.iter().any(|n| n.contains("不参与围标分级")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("评标办法为人工录入")), "{notes:?}");
     }
 
     #[test]

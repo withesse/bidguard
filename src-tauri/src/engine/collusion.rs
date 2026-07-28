@@ -153,8 +153,21 @@ const IMAGE_NEAR_MAX_HAMMING: u32 = 10;
 /// metadata 信号只认这些强命中类别的 risk_flags 前缀——rsid 交集/PDF 血缘有独立信号
 /// （防双计），「修订号相同（弱）/疑似元数据清洗」是弱标记只供人工核对（不计权）。
 /// 「生成环境一致」是 PDF 血缘的弱命中档：不足以独立成信号，并入 metadata 计权。
-const META_FLAG_CATEGORIES: [&str; 6] =
+pub const META_FLAG_CATEGORIES: [&str; 6] =
     ["作者相同", "最后保存者相同", "模板相同", "创建时间邻近", "包结构一致", "生成环境一致"];
+
+/// 两份文档【共现】的强命中元数据类别（cross_flags 对命中的两份文档写入同一条 risk_flag，
+/// 故取交集即得该对的同源类别）。W5-5 用它作候选嫌疑组的证据之一；不改任何计分。
+pub fn shared_meta_categories(a: &DocInfo, b: &DocInfo) -> Vec<&'static str> {
+    META_FLAG_CATEGORIES
+        .iter()
+        .copied()
+        .filter(|c| {
+            let hit = |d: &DocInfo| d.fingerprint.risk_flags.iter().any(|f| f.starts_with(c));
+            hit(a) && hit(b)
+        })
+        .collect()
+}
 // 三条分级线【定义在 v1 加权和尺度上】：M7 起不再直接与 score 比较，而是经
 // LrModel::v1_line_equivalent 换算到当前模型的证据强度尺度后再比（见该函数注释）。
 pub const LEVEL_HIGH: f32 = 0.6;

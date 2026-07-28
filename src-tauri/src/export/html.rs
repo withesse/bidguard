@@ -3,8 +3,14 @@
 // 自包含单文件，可「打印 → 另存为 PDF」。
 use super::data::ExportData;
 use super::shared::{
-    band_cn_of, calibration_lines, calibration_note, contrib_label, field_cn, label, level_cn,
-    review_cn, section_cn, severity_cn, strength_phrase, type_cn, xml_escape,
+    band_cn_of, calibration_lines, calibration_note, contrib_label, digit_clustered_cn, digit_stat,
+    evasion_verdict_cn, field_cn, forensic_kind_cn, forensic_level_cn, forensic_pair_label, label,
+    level_cn, lineage_summary, mechanism_group_cells, mechanism_lines, mechanism_price_cells,
+    mechanism_support_cells, numeric_intro, numeric_item_label, numeric_pattern_cn,
+    numeric_rate_cell, review_cn, section_cn, severity_cn, strength_phrase, type_cn,
+    verbatim_locator, xml_escape, ARITH_ERROR_NOTE, DIGIT_TAIL_NOTE, EVASION_NOTE, FORENSIC_NOTE,
+    MECHANISM_GROUP_HEADER, MECHANISM_GROUP_TITLE, MECHANISM_PRICE_HEADER, MECHANISM_PRICE_TITLE,
+    MECHANISM_SUPPORT_HEADER, MECHANISM_SUPPORT_TITLE, MECHANISM_TITLE,
 };
 use std::fmt::Write as _;
 
@@ -353,12 +359,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     // 商务标数值证据（附录 A numeric 节；无清单数据不渲染——§1.5 不留空表沉默背书）
     if let Some(nm) = &data.numeric {
         h.push_str("<h2>商务标数值证据</h2>");
-        let _ = write!(
-            h,
-            "<p class=\"muted\">报价清单逐项比对：共识别清单条目 {} 条、跨文档对齐 {} 条；\
-             雷同率告警线 {:.0}%，可比条目不足 {} 项的文档对不出结论。</p>",
-            nm.item_count, nm.aligned_item_count, nm.identical_rate_alarm * 100.0, nm.min_comparable
-        );
+        let _ = write!(h, "<p class=\"muted\">{}</p>", numeric_intro(nm));
         for note in &nm.notes {
             let _ = write!(h, "<p class=\"muted\">{}</p>", e(note));
         }
@@ -367,10 +368,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
             "<table><tr><th>文档对</th><th>可比条目</th><th>单价相同</th><th>逐项雷同率</th><th>告警</th></tr>",
         );
         for p in &nm.pairs {
-            let rate = match p.identical_rate {
-                Some(r) => format!("{:.1}%", r * 100.0),
-                None => format!("—（{}）", numeric_reason_cn(p.reason.as_deref())),
-            };
+            let rate = numeric_rate_cell(p);
             let flag = if p.alarm {
                 "<span class=\"chip\">达告警线 · 需重点核查</span>"
             } else {
@@ -450,11 +448,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
             .collect();
         if !errs.is_empty() {
             let _ = write!(h, "<p style=\"margin-top:14px\"><b>共享算术错误清单（{} 条）</b></p>", errs.len());
-            h.push_str(
-                "<p class=\"muted\">同一清单项在两份文件中工程量、综合单价与（算错的）合价三者到分全等。\
-                 检测已排除可由常见舍入规则解释的差值；请核对是否源自同一计价软件舍入惯例或招标文件，\
-                 单条命中不构成串通投标认定。</p>",
-            );
+            let _ = write!(h, "<p class=\"muted\">{ARITH_ERROR_NOTE}</p>");
             h.push_str(
                 "<table><tr><th>文档对</th><th>清单项</th><th>工程量</th><th>综合单价</th><th>报出合价</th><th>应为</th><th>原文锚点</th></tr>",
             );
@@ -482,40 +476,91 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
             );
             for d in &nm.docs {
                 let Some(ds) = &d.digit_stats else { continue };
-                let g = |k: &str| ds.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
-                let clustered =
-                    ds.get("clustered").and_then(serde_json::Value::as_bool).unwrap_or(false);
                 let _ = write!(
                     h,
                     "<tr><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{:.3}</td><td>{:.0}%</td><td>{}</td></tr>",
                     d.tag,
-                    g("n") as i64,
-                    g("centChiSquare"),
-                    g("jiaoChiSquare"),
-                    g("critical"),
-                    g("zeroFiveRatio") * 100.0,
-                    if clustered { "尾数聚集" } else { "未见聚集" }
+                    digit_stat(ds, "n") as i64,
+                    digit_stat(ds, "centChiSquare"),
+                    digit_stat(ds, "jiaoChiSquare"),
+                    digit_stat(ds, "critical"),
+                    digit_stat(ds, "zeroFiveRatio") * 100.0,
+                    digit_clustered_cn(ds)
                 );
             }
             h.push_str("</table>");
-            h.push_str(
-                "<p class=\"muted\">尾数聚集反映报价的取整习惯（如统一取整到角/元），单独不构成串通认定，\
-                 需结合取证类证据；本工具未做 Benford 首位检验（单价通常只跨 2–3 个数量级，前提不成立）。</p>",
-            );
+            let _ = write!(h, "<p class=\"muted\">{DIGIT_TAIL_NOTE}</p>");
+        }
+        // 基准价敏感性（W5-5 机制感知筛查）：【描述性小节，不参与围标分级】
+        if let Some(mc) = &nm.mechanism {
+            let _ = write!(h, "<p style=\"margin-top:14px\"><b>{MECHANISM_TITLE}</b></p>");
+            for line in mechanism_lines(mc) {
+                let _ = write!(h, "<p class=\"muted\">{}</p>", e(&line));
+            }
+            if !mc.prices.is_empty() {
+                let _ = write!(h, "<p><b>{MECHANISM_PRICE_TITLE}</b></p><table><tr>");
+                for th in MECHANISM_PRICE_HEADER {
+                    let _ = write!(h, "<th>{th}</th>");
+                }
+                h.push_str("</tr>");
+                for p in &mc.prices {
+                    let c = mechanism_price_cells(p);
+                    let _ = write!(
+                        h,
+                        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        e(&c[0]),
+                        e(&c[1]),
+                        e(&c[2])
+                    );
+                }
+                h.push_str("</table>");
+            }
+            if let Some(b) = &mc.benchmark {
+                if b.groups.is_empty() {
+                    h.push_str("<p class=\"muted\">未构造出候选组：参评文档间未出现可作依据的既有文档证据（文本相似峰值 / 逐项单价雷同率 / 元数据同源），故不作剔除重算。</p>");
+                } else {
+                    let _ = write!(h, "<p><b>{MECHANISM_GROUP_TITLE}</b></p><table><tr>");
+                    for th in MECHANISM_GROUP_HEADER {
+                        let _ = write!(h, "<th>{th}</th>");
+                    }
+                    h.push_str("</tr>");
+                    for g in &b.groups {
+                        let c = mechanism_group_cells(g);
+                        h.push_str("<tr>");
+                        for cell in &c {
+                            let _ = write!(h, "<td style=\"text-align:left\">{}</td>", e(cell));
+                        }
+                        h.push_str("</tr>");
+                    }
+                    h.push_str("</table>");
+                }
+            }
+            if !mc.support_bids.is_empty() {
+                let _ = write!(h, "<p><b>{MECHANISM_SUPPORT_TITLE}</b></p><table><tr>");
+                for th in MECHANISM_SUPPORT_HEADER {
+                    let _ = write!(h, "<th>{th}</th>");
+                }
+                h.push_str("</tr>");
+                for s in &mc.support_bids {
+                    let c = mechanism_support_cells(s);
+                    h.push_str("<tr>");
+                    for cell in &c {
+                        let _ = write!(h, "<td>{}</td>", e(cell));
+                    }
+                    h.push_str("</tr>");
+                }
+                h.push_str("</table>");
+            }
         }
     }
 
     // 取证证据（附录 A forensic 节；无命中不渲染——§1.5 不留空表沉默背书）
     if let Some(f) = &data.forensic {
         h.push_str("<h2>取证证据</h2>");
-        h.push_str("<p class=\"muted\">取证信号为线索级同源证据（rsid / PDF 血缘 / 图片同源 / 共同错误）。请核对是否源自招标方统一模板或同一代理机构；未命中不构成清白证明（另存为 / 元数据清洗可消除痕迹）。</p>");
+        let _ = write!(h, "<p class=\"muted\">{FORENSIC_NOTE}</p>");
         h.push_str("<table><tr><th>类型</th><th>文档</th><th>强度</th><th>说明</th></tr>");
         for hit in &f.hits {
-            let pair = if hit.doc_a.is_empty() && hit.doc_b.is_empty() {
-                "见说明".to_string()
-            } else {
-                format!("{} ↔ {}", e(&hit.doc_a), e(&hit.doc_b))
-            };
+            let pair = forensic_pair_label(&e(&hit.doc_a), &e(&hit.doc_b));
             let _ = write!(
                 h,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td style=\"text-align:left\">{}</td></tr>",
@@ -544,7 +589,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     // 规避特征复核（附录 A evasion 节；仅列达判级线文档，无则不渲染）
     if let Some(ev) = &data.evasion {
         h.push_str("<h2>规避特征复核</h2>");
-        h.push_str("<p class=\"muted\">检测到疑似规避特征，请人工复核；本工具不作「规避 / 串通」定性结论。未命中不构成清白证明。</p>");
+        let _ = write!(h, "<p class=\"muted\">{EVASION_NOTE}</p>");
         h.push_str("<table><tr><th>编号</th><th>判级</th><th>证据种类</th></tr>");
         for d in &ev.per_document {
             let kinds = if d.evidence_kinds.is_empty() { "—".to_string() } else { d.evidence_kinds.join("、") };
@@ -588,103 +633,3 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
     std::fs::write(path, h).map_err(|e| e.to_string())
 }
 
-/// 规律性差异形态的中文标签（numeric.pairs[].pattern.kind）。
-fn numeric_pattern_cn(kind: &str) -> &str {
-    match kind {
-        "arith_seq" => "等差（各项差额恒定）",
-        "geo_discount" => "等比 / 恒定折扣（各项系数恒定）",
-        "affine" => "仿射（系数与差额均非平凡）",
-        other => other,
-    }
-}
-
-/// 雷同率缺席原因的中文标签（numeric.pairs[].reason）。
-fn numeric_reason_cn(reason: Option<&str>) -> &str {
-    match reason {
-        Some("insufficient") => "可比条目不足，不出结论",
-        Some(other) => other,
-        None => "无可比条目",
-    }
-}
-
-/// 清单项可读标签：优先项目名称，回落对齐键（编码/名称+单位）。
-fn numeric_item_label(name: Option<&str>, align_key: &str) -> String {
-    match name.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(n) => format!("{n}（{align_key}）"),
-        None => align_key.to_string(),
-    }
-}
-
-/// 取证命中类型中文标签（forensic.hits[].kind）。
-fn forensic_kind_cn(kind: &str) -> &str {
-    match kind {
-        "rsid" => "docx 修订标识（rsid）",
-        "pdfLineage" => "PDF 血缘",
-        "imageReuse" => "内嵌图片同源",
-        "sharedErrors" => "共同错误指纹",
-        other => other,
-    }
-}
-
-/// 取证命中强度中文标签（forensic.hits[].level）。
-fn forensic_level_cn(level: &str) -> &str {
-    match level {
-        "hard" => "硬命中",
-        "mid" => "中命中",
-        "weak" => "弱命中",
-        other => other,
-    }
-}
-
-/// 规避判级中文标签（evasion.perDocument[].verdict）——§1.5：措辞不下定性结论。
-fn evasion_verdict_cn(verdict: &str) -> &str {
-    match verdict {
-        "confirmed" => "需人工复核",
-        "suspect" => "疑似（弱信号）",
-        other => other,
-    }
-}
-
-/// 逐字区间一侧定位串（页码 + 章节路径 → 单行；调用方再 xml_escape）。
-fn verbatim_locator(page: Option<i64>, section: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(pg) = page {
-        parts.push(format!("第{pg}页"));
-    }
-    if let Some(s) = section.map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(s.to_string());
-    }
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join(" · ")
-    }
-}
-
-/// 逐文档血缘键摘要（forensic.perDocument[].lineage → 单行可读串）。
-fn lineage_summary(lineage: &serde_json::Value) -> String {
-    let get = |k: &str| lineage.get(k).and_then(serde_json::Value::as_str).filter(|s| !s.is_empty());
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(v) = get("documentId") {
-        parts.push(format!("GUID {v}"));
-    }
-    if let Some(v) = get("idFirst") {
-        parts.push(format!("trailer ID {v}"));
-    }
-    if let Some(v) = get("derivedFrom") {
-        parts.push(format!("派生自 {v}"));
-    }
-    let tags = lineage
-        .get("fontSubsetTags")
-        .and_then(serde_json::Value::as_array)
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if tags > 0 {
-        parts.push(format!("字体子集 {tags} 个"));
-    }
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join("；")
-    }
-}

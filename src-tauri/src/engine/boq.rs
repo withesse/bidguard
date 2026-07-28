@@ -334,6 +334,59 @@ fn extract_table(table: &[TableRowInput]) -> Result<Vec<BoqItem>, &'static str> 
     Ok(items)
 }
 
+/// 投标总价行关键词（W5-5）：命中的行其合价即该份标书的投标总价，【优先于 Σ合价】——
+/// 汇总行（小计/合计）在解析期已被 FOOTER_KEYWORDS 剔除，故此处只可能命中「投标总价/投标
+/// 报价」这类独立成行的报价行；两者都拿不到时由调用方回落到全文最大金额启发式。
+const TOTAL_PRICE_KEYWORDS: &[&str] = &["投标总价", "投标报价", "投标总报价", "总报价", "投标价"];
+
+/// 投标总价锚定结果（W5-5）：from_total_row 用于【来源打标】，举证时读者要知道这个数从哪来。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TotalPrice {
+    pub total: f64,
+    /// true = 取自含「投标总价/投标报价」字样的行；false = 取自清单 Σ合价。
+    pub from_total_row: bool,
+}
+
+/// 一份文档的投标总价：优先「投标总价/投标报价」行的合价（多行命中取最大——分部分项合计与
+/// 总报价并存时总报价更大），否则取全部条目的 Σ合价。都取不到（无合价列）→ None。
+/// 求和按条目次序固定，同输入逐字节同输出。
+pub fn total_price_of(items: &[BoqItem]) -> Option<TotalPrice> {
+    let mut best_row: Option<f64> = None;
+    for it in items {
+        let name = it.name.as_deref().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let n = normalize::normalize(name, &NormalizeOptions::default());
+        if !TOTAL_PRICE_KEYWORDS.iter().any(|k| n.contains(k)) {
+            continue;
+        }
+        // 总价行常无工程量/单价，合价缺失时退而取单价列（部分模板把总价写在单价列）
+        if let Some(v) = it.total_price.or(it.unit_price).filter(|v| v.is_finite() && *v > 0.0) {
+            if best_row.is_none_or(|cur| v > cur) {
+                best_row = Some(v);
+            }
+        }
+    }
+    if let Some(total) = best_row {
+        return Some(TotalPrice { total, from_total_row: true });
+    }
+    let mut sum = 0f64;
+    let mut any = false;
+    for it in items {
+        if let Some(v) = it.total_price.filter(|v| v.is_finite()) {
+            sum += v;
+            any = true;
+        }
+    }
+    if any && sum > 0.0 {
+        // 分到「分」为止，消除逐项累加的 f64 末位残差（金额只到分）
+        Some(TotalPrice { total: (sum * 100.0).round() / 100.0, from_total_row: false })
+    } else {
+        None
+    }
+}
+
 fn is_footer_name(name: &str) -> bool {
     let n = normalize::normalize(name, &NormalizeOptions::default());
     FOOTER_KEYWORDS.iter().any(|k| n.contains(k))
@@ -1305,6 +1358,32 @@ mod tests {
             " |  本页小计 |  |  |  | 30600",
         ]));
         assert_eq!(ex.items.len(), 1, "小计行不进条目");
+    }
+
+    #[test]
+    fn total_price_prefers_bid_total_row_then_falls_back_to_sum() {
+        // W5-5 投标总价锚定：① 含「投标总价/投标报价」字样的行优先（来源打标要能举证）；
+        // ② 无总价行时取 Σ合价；③ 无合价列 → None（由调用方回落到启发式）。
+        let sum_only = extract_document(&rows(STD));
+        let t = total_price_of(&sum_only.items).expect("有合价列应能求和");
+        assert!(!t.from_total_row, "无总价行 → 取 Σ合价");
+        assert_eq!(t.total, 30600.0 + 12480.4 + 46675.2);
+
+        let mut with_total = STD.to_vec();
+        with_total.push(" | 投标总价 |  |  |  | 89755.60");
+        let ex = extract_document(&rows(&with_total));
+        let t = total_price_of(&ex.items).expect("总价行应命中");
+        assert!(t.from_total_row, "含「投标总价」字样的行优先");
+        assert_eq!(t.total, 89755.6);
+
+        // 无合价列（只有单价）→ Σ合价拿不到，返回 None
+        let no_total = extract_document(&rows(&[
+            "项目编码 | 项目名称 | 单位 | 工程量 | 综合单价",
+            "010101001001 | 挖一般土方 | m3 | 1200 | 25.50",
+            "010101003001 | 挖沟槽土方 | m3 | 380 | 32.80",
+        ]));
+        assert!(total_price_of(&no_total.items).is_none());
+        assert!(total_price_of(&[]).is_none());
     }
 
     #[test]
