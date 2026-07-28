@@ -97,7 +97,7 @@ fn counted_license_consume_exhaust_refund() {
 
     // 消费 3 次
     let g1 = mgr.check_and_consume(&pool).unwrap();
-    assert_eq!(g1.kind == GrantKind::Licensed, true);
+    assert_eq!(g1.kind, GrantKind::Licensed);
     let _g2 = mgr.check_and_consume(&pool).unwrap();
     let _g3 = mgr.check_and_consume(&pool).unwrap();
     assert_eq!(mgr.status(&pool).remaining_uses, Some(0));
