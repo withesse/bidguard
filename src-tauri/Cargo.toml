@@ -43,7 +43,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] } # 解 
 quick-xml = "0.41"
 jieba-rs = "0.7"     # 中文分词
 pdf-extract = "0.12" # PDF 文本抽取回落（纯 Rust，文本型 PDF）；随其自带的 lopdf 一并升到已修复版
-pdfium-render = "0.8" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
+pdfium-render = "0.9" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
 # 读 PDF 元数据指纹（Info 字典）与内容流审计。≥0.42 修复 RUSTSEC-2026-0187（深嵌套 PDF 对象
 # 栈溢出）——本应用直接解析投标人提供的不可信 PDF，属必修。停在 0.42 而非 0.44：0.44 与树内
 # time crate 不兼容（BorrowedFormatItem::StringLiteral 已移除），且 0.42 与 pdf-extract 自带的
