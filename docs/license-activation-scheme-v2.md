@@ -60,7 +60,7 @@ base64url( header_json . payload_b64 . sig_b64 )
 
 ```jsonc
 // header（明文，先于验签断言）
-{ "v": 1, "alg": "Ed25519", "kid": "lic-2026a" }
+{ "v": 1, "alg": "Ed25519", "kid": "bidguard-2026a" }
 
 // payload —— 签名覆盖的是 payload 的原始字节（base64url 内容），
 // 验签通过后才反序列化，杜绝 JSON canonicalization 歧义
@@ -87,7 +87,7 @@ base64url( header_json . payload_b64 . sig_b64 )
 **Lease Token（短期，可反复换发）** —— 由 License 派生的运行许可，`bidguard.lease`：
 
 ```jsonc
-{ "v": 1, "alg": "Ed25519", "kid": "lic-2026a" }
+{ "v": 1, "alg": "Ed25519", "kid": "bidguard-2026a" }
 {
   "licenseId": "…",                 // 必须与已装 License 一致
   "machineAnchorHash": "…",         // 绑定本机
@@ -192,7 +192,8 @@ base64url( header_json . payload_b64 . sig_b64 )
 
 ### 4.2 密钥管理
 
-- 二进制内嵌**多把**验签公钥（`kid = "lic-2026a"`、预置 `"lic-2026b"` 备转轮换），`const` 硬编码于 Rust（Keygen 明确建议硬编码而非外部文件——外部文件可被换 key）。
+- 二进制内嵌**多把**验签公钥（`kid = "bidguard-2026a"`、预置 `"bidguard-2026b"` 备转轮换），`const` 硬编码于 Rust（Keygen 明确建议硬编码而非外部文件——外部文件可被换 key）。
+- **kid 命名约定 `{product}-{year}{rev}`：每产品独立密钥对，签名密钥绝不跨产品共用**——App 只内嵌本产品公钥，跨产品挪用许可在密码学上直接不成立（授权中心通用化的前提，见 §8.9）。
 - 私钥**永不进入本仓库/CI**（仓库是公开的 withesse/bidguard）：签发私钥放离线运营机（形态 A 的 keygen CLI）+ 激活服务器 KMS（形态 B/C），存放于独立**私有仓库** `bidguard-license-server`。
 - 泄漏应对：用 `kid` 切新钥签发 + 应用更新弃用旧 kid；接受"未更新的存量安装在弃用完成前可被旧钥伪造"的残余风险。
 
@@ -411,10 +412,16 @@ CREATE TABLE license_usage (
 
 不新增：HTTP（复用 ureq 3）、base64（0.22 已在树，提升为直接依赖即可）、keyring（v1 双写方案足够，v1.2 再评估并锁 3.x）、任何 machine-id crate（fingerprint.rs 自研 ~200 行，用已在树的 windows-sys 读注册表/固件表、libc `gethostuuid`——避免 machineid-rs 混入 Username/MachineName 等不稳定分量的坑）。Tauri capabilities/CSP **零改动**（Rust 侧网络不走 WebView）。
 
-### 8.9 服务端与签发工具（独立私有仓库 `bidguard-license-server`）
+### 8.9 服务端与签发工具：通用授权内核，单产品部署（独立私有仓库）
 
-- `keygen-cli`：离线签发工具（形态 A），跑在运营离线机，私钥本地加密存储。
-- `activation-server`：`POST /v1/activate`、`/v1/heartbeat`、`/v1/deactivate`、`/v1/offline-exchange`（形态 C portal）；SQLite/Postgres 存 license→fingerprint→席位、trial 去重记录、试用发放限速；私钥入 KMS。
+**定位**：授权域本身产品无关（签发/验签、席位、试用去重、lease、撤销没有一行依赖"标书查重"）。因此内核按**通用形状**设计（数据模型对齐 Keygen 的 Product → Policy → License → Machine → Lease），部署按**单产品**来跑；"原本"产品线出现第二个产品时是插一行配置，不是再写一个服务。相对 BidGuard 专用版的增量约 **+2~3 天**。
+
+- 私有仓库：`bidguard-license-server`（通用化后可更名 `verum-license-server`，内容不变）。
+- `keygen-cli`：离线签发工具（形态 A），跑在运营离线机，私钥本地加密存储；`--product bidguard` 从密钥注册表取对应产品私钥。
+- `activation-server`：`POST /v1/activate`、`/v1/heartbeat`、`/v1/deactivate`、`/v1/offline-exchange`（形态 C portal），请求体带 `product`；单 Rust 二进制 + SQLite（升 Postgres 按需）；私钥入 KMS。
+- 表结构：`products`（产品 + 公私钥注册）、`policies`（plan 模板：期限/次数/试用规则，产品差异全部收敛于此）、`licenses`、`machines`（fingerprint→席位）、`leases`、trial 去重与发放限速记录。
+- **多产品隔离双保险**：每产品独立密钥对（kid 约定 `{product}-{year}{rev}`，见 §4.2）为主；License/Lease payload 增 `product` 字段 + 客户端断言为辅（serde 忽略未知字段，对已发 MVP 许可向后兼容；无 `product` 的旧许可默认 bidguard）。
+- **明确不做**（单人开发 YAGNI 线）：多租户账号体系、管理后台 UI、计费、webhook 平台——那是"做 Keygen 竞品"的活；管理操作用 CLI + 签发台账。自托管 Keygen CE 已评估并否决：Rails+Postgres+Redis 运维过重，且客户端协议（nonce 回显 / lease / 离线文件交换）已定型，迁就其 API 需重做客户端。
 - 本仓库（公开）与 CI **永不接触私钥**；现有 `TAURI_SIGNING_PRIVATE_KEY` 的 GH Secrets 先例只适用于更新签名，license 私钥不进 GH Secrets。
 
 ---
@@ -424,7 +431,7 @@ CREATE TABLE license_usage (
 | 阶段 | 内容 | 交付判据 | 估算 |
 |---|---|---|---|
 | **MVP（v0.6）** | `license/` 模块：token.rs + keys.rs + fingerprint.rs（anchor+副件、M-of-N）+ state.rs（HMAC 双写 fail-closed）+ clock.rs（HWM 基础版）+ ledger.rs（原子扣减+三路退款）；LICENSE_V12 迁移；错误码；`start_compare` 闸门；命令 get_license_status / get_machine_code / import_license_file；前端 /activate（形态 A Tab）+ Guard + Settings 卡；keygen-cli（私有仓库）；试用 = 首启自签发本地 trial 记录（服务端锚定留待 v1.1，接受可重置） | 形态 A 全流程可售：签发→导入→按期/按次强制→失败退款→到期换发 | **1.5–2 周** |
-| **v1.1** | activation-server（activate/heartbeat/deactivate + 席位计数 + trial 指纹去重 + 限速）；activation.rs（nonce+验签+serverTime 锚定 HWM）；lease 滚动续期与对账；试用改为可选在线锚定；VM 检测拒发离线试用；rebind 额度逻辑；报告水印（export.rs） | 形态 B 端到端；撤销演练（停续签→TTL 到期拒绝）通过 | **2–3 周**（含服务端） |
+| **v1.1** | activation-server 按**通用授权内核**实现（§8.9：products/policies 密钥注册 + activate/heartbeat/deactivate + 席位计数 + trial 指纹去重 + 限速）；activation.rs（nonce+验签+serverTime 锚定 HWM）；lease 滚动续期与对账；License payload 增 `product` 断言；试用改为可选在线锚定；VM 检测拒发离线试用；rebind 额度逻辑；报告水印（export.rs） | 形态 B 端到端；撤销演练（停续签→TTL 到期拒绝）通过 | **2.5–3.5 周**（含通用内核服务端） |
 | **v1.2** | 形态 C 文件交换（exchange.rs + self-service portal 页）；mac SE ECDSA 状态绑定；Win DPAPI+entropy at-rest；keyring 评估；clock.rs 证人融合完整版 + 分级响应打磨；obfstr 覆盖；CI 加 aarch64-apple-darwin / x86_64-pc-windows-msvc license 模块编译验证；Authenticode/公证收尾 | 形态 C 可自助；克隆 app_data 到第二台 Mac 失效 | **约 2 周** |
 
 每阶段均满足全局规则：任何代码变更先经用户确认再执行；不自动 commit。
@@ -451,14 +458,14 @@ CREATE TABLE license_usage (
 > 现状：MVP 已实机验证通过（试用→激活→已授权），但内嵌的是**开发公钥** `lic-dev-2026a`，keygen 与开发私钥在本地 scratchpad。**未经本清单不可对外发布**——A 组为硬性阻断项，未完成则任何人用泄漏的开发私钥即可伪造合法许可。
 
 ### A. 密钥换发（硬性阻断，未完成不得发布）
-- [ ] 离线机（不联网、非 CI）执行 `bidguard-keygen genkey --kid lic-2026a` 生成正式密钥对
+- [ ] 离线机（不联网、非 CI）执行 `bidguard-keygen genkey --kid bidguard-2026a` 生成正式密钥对（kid 按产品前缀约定 `{product}-{year}{rev}`，为授权中心通用化预留，见 §4.2/§8.9）
 - [ ] 正式私钥离线加密保管（age/GPG + 硬件密钥），**绝不进任何仓库 / CI / 云盘 / 聊天工具**
-- [ ] 用正式公钥替换 `src-tauri/src/license/keys.rs` 的 `TRUSTED_KEYS`：kid 改 `lic-2026a`，移除 `lic-dev-2026a`
+- [ ] 用正式公钥替换 `src-tauri/src/license/keys.rs` 的 `TRUSTED_KEYS`：kid 改 `bidguard-2026a`，移除 `lic-dev-2026a`
 - [ ] 销毁 scratchpad 的 `lic-dev-2026a.priv` 并视开发钥为已泄漏（本文档、对话记录里出现过其种子）
 - [ ] `FP_SALT` / `STATE_HMAC_SALT` 一次性定稿（改动会使既有激活/试用状态失效，发布后不可再改）
 
 ### B. 签发工具与服务端隔离
-- [ ] keygen 从 scratchpad 迁入独立**私有**仓库 `bidguard-license-server`（连签发台账）
+- [ ] keygen 从 scratchpad 迁入独立**私有**仓库 `bidguard-license-server`（连签发台账；按 §8.9 通用内核形状组织，`--product` 参数化）
 - [ ] 建立签发台账：`licenseId ↔ 客户名 ↔ 机器码 ↔ 期限/次数 ↔ 签发日`（换绑与撤销依据）
 - [ ] 与更新签名私钥 `TAURI_SIGNING_PRIVATE_KEY` 区分：license 私钥**不**进 GH Secrets
 - [ ] 换绑流程文档化：凭旧 `licenseId` 免费换绑，1 次/90 天、累计 3 次（§5.3）
