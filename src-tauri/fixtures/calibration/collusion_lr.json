@@ -69,7 +69,7 @@
     "low": 0.011057,
     "medium": 0.123498
   },
-  "note": "实验性校准（合成语料）：权重由 fixtures/corpus/docsets 拟合，L2 向 v1 经验权重收缩；概率为合成语料校准值、不是串通概率；真实判例回测前不作为唯一依据。重新生成：cargo run --bin corpusgen --features dev-tools -- fit-collusion",
+  "note": "实验性校准（合成语料）：权重由 fixtures/corpus/docsets 拟合，L2 向 v1 经验权重收缩；概率为合成语料校准值、不是串通概率；真实判例回测前不作为唯一依据。重新生成：cargo run --example corpusgen --features dev-tools -- fit-collusion",
   "version": "m7-lr-d68c0536",
   "weights": {
     "cluster": 2.827928,

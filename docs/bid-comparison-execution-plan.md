@@ -701,7 +701,7 @@
 - **配置**：无运行时配置；生成参数（种子、各变换强度）写死在 bin 内并随 fixtures 版本化
 - **新依赖**：无。RNG 用仓库既有 splitmix64；同义表/混淆表自建（规避《同义词词林》等外部词表的许可问题）；JSONL 读写用已有 serde_json
 - **风险**：①循环论证：变换器与检测器共享同一套直觉（同义替换 vs 词面维），在自造语料上的指标会系统性偏乐观，只能证伪不能证真——须在文档注明"合成语料指标是下界回归基线，不是真实检出率"；②同义表覆盖不足会让 rewrite 样本改写强度不够、与 minor_change 标签边界模糊；③seeds 若含真实企业信息有泄露风险，入库前必须脱敏；④label 分级线本身依赖现行八类定义，后续 item 4 改带语义时标注格式需保持前向兼容（label 保留原值，band 另算）
-- **验收标准**：①cargo run --bin corpusgen --features dev-tools 两次运行输出的 pairs.jsonl/docsets 逐字节一致；②pairs.jsonl ≥2000 对、四类标签各 ≥300、每类变换链 ≥200 对；docsets ≥10 组（围标正/独立负各半）；③cargo test --features dev-tools corpus_metrics -- --ignored --nocapture 输出各层指标 JSON（召回层召回率、评分层 per-label P/R/F1、围标层混淆矩阵）且无 panic；④现有 cargo test --lib 全绿（生成器不影响发布路径）；⑤fixtures 总体积 <5MB
+- **验收标准**：①cargo run --example corpusgen --features dev-tools 两次运行输出的 pairs.jsonl/docsets 逐字节一致；②pairs.jsonl ≥2000 对、四类标签各 ≥300、每类变换链 ≥200 对；docsets ≥10 组（围标正/独立负各半）；③cargo test --features dev-tools corpus_metrics -- --ignored --nocapture 输出各层指标 JSON（召回层召回率、评分层 per-label P/R/F1、围标层混淆矩阵）且无 panic；④现有 cargo test --lib 全绿（生成器不影响发布路径）；⑤fixtures 总体积 <5MB
 
 ### cross-encoder 复核带：reranker ONNX 接入模型管理器，只重打分 uncertain 带（4d）
 

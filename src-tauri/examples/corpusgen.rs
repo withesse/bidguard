@@ -1,6 +1,6 @@
 //! 合成对抗语料生成器 CLI（dev-tools 门控，不进发布二进制）。
 //!
-//! 用法：cargo run --bin corpusgen --features dev-tools [-- <子命令> [路径]]
+//! 用法：cargo run --example corpusgen --features dev-tools [-- <子命令> [路径]]
 //!   （无子命令）      → 段对 pairs.jsonl + 文档集 docsets（全量）
 //!   pairs [路径]      → 仅段对语料（默认 fixtures/corpus/pairs.jsonl）
 //!   docsets [目录]    → 仅文档集（默认 fixtures/corpus/docsets/ + docsets.jsonl）

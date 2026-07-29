@@ -17,10 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Enables the synthetic-corpus generator (engine::corpusgen) and its `corpusgen` bin.
 dev-tools = []
 
-# 合成对抗语料生成器 CLI（M3 校准语料）：cargo run --bin corpusgen --features dev-tools
-[[bin]]
+# 合成对抗语料生成器 CLI（M3 校准语料）：cargo run --example corpusgen --features dev-tools
+# 【务必保持 example 而非 bin】：tauri 打包时不看 required-features，包内出现第二个 bin 就会
+# 挑错二进制当主程序（v0.6.0 首次发布即因此失败：Built application at .../release/corpusgen
+# → failed to bundle）。example 不属于应用二进制，tauri 不会看到它。
+[[example]]
 name = "corpusgen"
-path = "src/bin/corpusgen.rs"
+path = "examples/corpusgen.rs"
 required-features = ["dev-tools"]
 
 [build-dependencies]

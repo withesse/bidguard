@@ -34,7 +34,7 @@
     "samples": 1750,
     "trainSamples": 1050
   },
-  "note": "实验性校准（合成语料）：Platt 参数与三带阈值由 fixtures/corpus/pairs.jsonl 拟合。α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；低优先级抽查带只做排序与折叠，不隐藏任何条款。routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。重新生成：cargo run --bin corpusgen --features dev-tools -- fit-calib",
+  "note": "实验性校准（合成语料）：Platt 参数与三带阈值由 fixtures/corpus/pairs.jsonl 拟合。α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；低优先级抽查带只做排序与折叠，不隐藏任何条款。routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。重新生成：cargo run --example corpusgen --features dev-tools -- fit-calib",
   "platt": {
     "a": 25.234619,
     "b": -6.498768

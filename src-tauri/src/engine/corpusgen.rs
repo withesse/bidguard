@@ -2256,7 +2256,7 @@ pub fn lr_json(model: &collusion::LrModel, report: &FitReport) -> String {
         "version": model.version,
         "note": "实验性校准（合成语料）：权重由 fixtures/corpus/docsets 拟合，L2 向 v1 经验权重收缩；\
                  概率为合成语料校准值、不是串通概率；真实判例回测前不作为唯一依据。\
-                 重新生成：cargo run --bin corpusgen --features dev-tools -- fit-collusion",
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-collusion",
         "intercept": round(model.intercept),
         "weights": serde_json::Value::Object(weights),
         "levels": {
@@ -2697,7 +2697,7 @@ pub fn calib_json(model: &calibrate::CalibrationModel, report: &CalibReport) -> 
                  α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；\
                  低优先级抽查带只做排序与折叠，不隐藏任何条款。\
                  routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。\
-                 重新生成：cargo run --bin corpusgen --features dev-tools -- fit-calib",
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-calib",
         "fit": report,
     });
     if let (Some(obj), Some(p)) = (body.as_object_mut(), params.as_object()) {
@@ -3231,7 +3231,7 @@ mod tests {
                 shipped.get(key),
                 fresh.get(key),
                 "随包 score_calib.json 的 {key} 与当前语料/代码重拟合结果不一致：\
-                 请重跑 cargo run --bin corpusgen --features dev-tools -- fit-calib"
+                 请重跑 cargo run --example corpusgen --features dev-tools -- fit-calib"
             );
         }
     }
