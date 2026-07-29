@@ -1623,15 +1623,40 @@ fn read_docset_manifests(path: &Path) -> Vec<DocsetManifest> {
         .collect()
 }
 
+/// 文本夹具的换行归一：CRLF/CR → LF。守卫按【内容】而非字节判定，才能跨平台成立——
+/// Windows 检出默认把文本转 CRLF，直接哈希原始字节会让同一提交在不同平台算出不同 hash
+/// （CI 上表现为「语料已变更但基线未同步」的误报）。.gitattributes 已关闭 fixtures 的 EOL
+/// 转换，这里是纵深防御：即便某处 checkout 设置漏网，守卫仍只对真实内容变更报警。
+/// 仅用于文本夹具；docx 等二进制字节【不得】做此替换。
+fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                out.push(b'\n');
+                // CRLF 视作一个换行
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
 fn sha256_of_file(p: &Path) -> String {
     let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("读取 {} 失败: {e}", p.display()));
-    crate::engine::normalize::sha256_hex(&bytes)
+    crate::engine::normalize::sha256_hex(&normalize_eol(&bytes))
 }
 
 /// docsets 内容 hash：清单字节 ++ 逐组逐份（id + 文件名 + docx 字节）。
 fn docsets_hash(dir: &Path) -> String {
     let manifest_path = dir.join("docsets.jsonl");
-    let mut buf = std::fs::read(&manifest_path).unwrap_or_default();
+    // 清单是文本 → 换行归一（见 normalize_eol）；下面的 docx 是二进制，按原始字节参与。
+    let mut buf = normalize_eol(&std::fs::read(&manifest_path).unwrap_or_default());
     for m in read_docset_manifests(&manifest_path) {
         for name in &m.docs {
             buf.extend_from_slice(m.docset_id.as_bytes());
@@ -3209,6 +3234,25 @@ mod tests {
                  请重跑 cargo run --bin corpusgen --features dev-tools -- fit-calib"
             );
         }
+    }
+
+    /// 语料 hash 守卫必须【跨平台】成立：Windows 检出会把文本夹具转成 CRLF，若按原始字节
+    /// 哈希，同一提交在 Windows 上算出的 pairs_hash/docsets_hash 与 macOS 落库的基线不同，
+    /// CI 会误报「语料已变更但基线未同步」（实测于 windows-latest）。故守卫按换行归一后的
+    /// 内容判定；本测试钉死 CRLF/CR/LF 三种换行的哈希一致，且不误伤二进制字节。
+    #[test]
+    fn corpus_hash_is_line_ending_agnostic() {
+        let lf = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
+        let crlf = b"{\"a\":1}\r\n{\"b\":2}\r\n".to_vec();
+        let cr = b"{\"a\":1}\r{\"b\":2}\r".to_vec();
+        let h = |b: &[u8]| crate::engine::normalize::sha256_hex(&normalize_eol(b));
+        assert_eq!(h(&lf), h(&crlf), "CRLF 与 LF 内容相同，哈希须一致");
+        assert_eq!(h(&lf), h(&cr), "CR 与 LF 内容相同，哈希须一致");
+        // 真实内容变更仍须被检出（守卫不能因归一而失灵）。
+        assert_ne!(h(&lf), h(b"{\"a\":2}\n{\"b\":2}\n"), "内容变更须改变哈希");
+        // 二进制（docx 的 zip 头）不参与归一：这里仅验证 normalize_eol 不改无 CR 的字节。
+        let zip_head = [0x50u8, 0x4B, 0x03, 0x04, 0x00, 0x0A];
+        assert_eq!(normalize_eol(&zip_head), zip_head.to_vec());
     }
 
     /// 语料的报价清单必须能被 M6 数值层解析——否则 docsets 注入的「等比乘系数」证据不可读，

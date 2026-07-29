@@ -1,0 +1,5 @@
+# 校准语料与夹具参与内容 hash 守卫（corpus_regression 的 pairs_hash / docsets_hash），
+# 且 seeds 文本直接决定生成产物——一旦被 Git 做 EOL 转换（Windows 检出默认 CRLF），
+# 同一提交在不同平台的字节就不同，守卫会误报「语料已变更但基线未同步」。
+# 故对 fixtures 全目录关闭 EOL 转换，保证跨平台逐字节一致。
+src-tauri/fixtures/** -text

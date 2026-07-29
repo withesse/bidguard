@@ -361,7 +361,9 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
     const parts = [`聚类·剔除后 ${cluster}%`, `未对减 ${original}%`];
     if (seg != null) parts.push(`区段 ${seg}%`);
     const spread = Math.max(cluster, original, seg ?? cluster) - Math.min(cluster, original, seg ?? cluster);
-    const tail = spread > 10 ? `　口径差异 ${spread}pp（>10pp，注意口径选择）` : "";
+    // 全角空格写成转义：ESLint no-irregular-whitespace 默认放行普通字符串、但不放行模板串
+    // (skipTemplates=false)，且 skipComments 默认亦为 false，故此注释也不能写字面全角空格。
+    const tail = spread > 10 ? `\u3000口径差异 ${spread}pp（>10pp，注意口径选择）` : "";
     return `${v.docs[r].tag}×${v.docs[c].tag} · ${parts.join(" · ")}${tail} · 点击查看对齐区段`;
   };
   const share = async () => {
