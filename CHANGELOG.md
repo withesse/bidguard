@@ -56,8 +56,8 @@
 
 ### 下载
 - macOS（Apple 芯片 / arm64）：`BidGuard_0.6.0_aarch64.dmg`（Intel Mac 暂不支持，见 BUILD.md）
-- Windows：`BidGuard_0.6.0_x64-setup.exe` 或 `BidGuard_0.6.0_x64_en-US.msi`
-- Linux：`.AppImage`、`.deb`、`.rpm`
+- Windows：`BidGuard_0.6.0_x64-setup.exe` 或 `BidGuard_0.6.0_x64_en-US.msi`（Win11-on-ARM 经系统 x64 仿真运行）
+- Linux：本版不提供构建
 
 ## v0.5.0 — 2026-07-02
 
