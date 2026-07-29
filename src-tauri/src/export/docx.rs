@@ -22,7 +22,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         &format!(
             "任务：{} · 生成于 {} · 引擎 v{}",
             data.job_name.as_deref().unwrap_or("未命名比对"),
-            &data.generated_at[..16].replace('T', " "),
+            data.generated_at[..16].replace('T', " "),
             data.app_version
         ),
         false,

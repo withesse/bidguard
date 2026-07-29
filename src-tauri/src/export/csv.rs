@@ -64,7 +64,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         &[esc(&format!(
             "# 任务：{} · 生成于 {} · 引擎 v{} · 报告格式 {}",
             data.job_name.as_deref().unwrap_or("未命名比对"),
-            &data.generated_at[..16].replace('T', " "),
+            data.generated_at[..16].replace('T', " "),
             data.app_version,
             data.report_version
         ))],

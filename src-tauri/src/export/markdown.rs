@@ -36,7 +36,7 @@ pub fn write(data: &ExportData, path: &str) -> Result<(), String> {
         m,
         "> 任务：{} · 生成于 {} · 引擎 v{}\n",
         data.job_name.as_deref().unwrap_or("未命名比对"),
-        &data.generated_at[..16].replace('T', " "),
+        data.generated_at[..16].replace('T', " "),
         data.app_version
     );
 

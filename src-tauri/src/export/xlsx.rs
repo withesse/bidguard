@@ -72,7 +72,7 @@ pub fn write(data: &ExportData, path: &str) -> R {
         s.write_string(r, 0, format!(
             "任务：{} · 生成于 {} · 引擎 v{}",
             data.job_name.as_deref().unwrap_or("未命名比对"),
-            &data.generated_at[..16].replace('T', " "),
+            data.generated_at[..16].replace('T', " "),
             data.app_version
         )).map_err(err)?;
         r += 2;

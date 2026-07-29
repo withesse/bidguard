@@ -3222,7 +3222,7 @@ mod tests {
             let topic = c.topic.as_deref().unwrap_or("");
             // 提取冲突字段名
             let kinds: Vec<&str> = ["amount","duration","date","percentage","subject"].iter().copied().filter(|k| fields.contains(*k)).collect();
-            println!("  [{}] {} | 字段={:?}", c.severity.as_deref().unwrap_or("?"), &topic.chars().take(24).collect::<String>(), kinds);
+            println!("  [{}] {} | 字段={:?}", c.severity.as_deref().unwrap_or("?"), topic.chars().take(24).collect::<String>(), kinds);
         }
 
         println!("\n========== 共有罕见词（前 10）==========");
