@@ -73,6 +73,12 @@ jobs:
   # 依赖供应链审计（非阻塞信息位；出 CVE 时 CI 变红提醒）
   audit:
     runs-on: ubuntu-latest
+    # rustsec/audit-check 会把结果写成 check-run（缺 checks: write 时报
+    # "Resource not accessible by integration"，即便无漏洞该 job 也红）。
+    # 就近声明而非放顶层：其余 job 保持默认权限，最小授权。
+    permissions:
+      contents: read # actions/checkout
+      checks: write # 创建审计结果的 check-run
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
