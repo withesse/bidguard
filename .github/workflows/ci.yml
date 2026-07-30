@@ -97,9 +97,11 @@ jobs:
       - name: 安装前端依赖（打包冒烟用）
         if: matrix.os == 'ubuntu-24.04'
         run: npm ci
+      # 关掉 createUpdaterArtifacts：更新产物需 TAURI_SIGNING_PRIVATE_KEY 签名，而签名私钥
+      # 只属于 release.yml，CI 不应持有。冒烟要验的是「能不能打出包」，不含签名。
       - name: 打包冒烟（Linux · debug · deb）
         if: matrix.os == 'ubuntu-24.04'
-        run: npm run tauri build -- --debug --bundles deb
+        run: npm run tauri build -- --debug --bundles deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
   # 依赖供应链审计（非阻塞信息位；出 CVE 时 CI 变红提醒）
   audit:
