@@ -16,15 +16,39 @@ npm run dev            # 仅前端（浏览器预览，降级到演示数据）
 cargo test --manifest-path src-tauri/Cargo.toml --lib                 # 引擎单元测试
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored    # 含语义/OCR（较慢，需模型）
 npm run build                                                          # 前端类型检查 + 打包
+npm run lint                                                           # ESLint（CI 会卡 error）
+```
+
+**语料回归门禁**——改动检测算法（阈值 / 权重 / 归一化 / 特征）前后必跑，CI 同样会跑：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools corpus_regression
+```
+
+它在内置合成对抗语料上比对召回率、per-label F1 与围标 AUC，任一指标漂移即失败。指标确应变化时用
+`BIDGUARD_WRITE_BASELINE=1` 重跑同一命令重写基线，并在提交信息里写明原因（基线 diff 进评审正是其用意）。
+语料本身可重新生成：
+
+```bash
+cargo run --example corpusgen --features dev-tools            # 段对语料 + 文档集
+cargo run --example corpusgen --features dev-tools -- fit-collusion   # 重新拟合围标融合权重
+cargo run --example corpusgen --features dev-tools -- fit-calib       # 重新拟合校准与三带阈值
 ```
 
 ## 本地打包
 
 ```bash
-npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.deb/.AppImage）
+npm run tauri build            # 当前平台产物（.app/.dmg 或 .msi/.exe）
 ```
 
-产物位于 `src-tauri/target/release/bundle/`。
+产物位于 `src-tauri/target/release/bundle/`。本机无更新签名私钥时结尾会报
+`A public key has been found, but no private key`——包已打好，仅未生成更新产物；要跳过可加
+`--config '{"bundle":{"createUpdaterArtifacts":false}}'`（CI 打包冒烟即如此）。
+
+> ⚠️ **包内必须只有一个 bin**。tauri 从 Cargo 清单的 bin 目标里挑主程序，且**不看
+> `required-features`**——多出一个 bin 就可能选错并在打包阶段失败（v0.6.0 首次发布即因 dev-tools
+> 门控的 `corpusgen` 被当成主程序而三平台全挂）。开发用 CLI 一律声明为 `[[example]]`；CI 有
+> 「单一应用二进制守卫」在提交时拦截。
 
 ## 随包原生资源（已入库，开箱即用）
 
@@ -54,13 +78,22 @@ npm run tauri build            # 当前平台产物（.app/.dmg、.msi/.exe、.d
 
 ## CI / 发布
 
-- `.github/workflows/ci.yml`：push / PR 时跑前端构建 + 引擎测试（macOS runner）。
+- `.github/workflows/ci.yml`（push / PR）：
+  - `test`（macOS）：前端类型检查 + 构建、ESLint、前端单测、Clippy（`-D warnings`）、引擎单测、语料回归门禁。
+  - `cross-check`（Ubuntu + Windows）：Windows 跑引擎测试验证平台分叉（路径分隔 / GBK 文件名 / pdfium.dll）；
+    Linux 编译检查 + **单一应用二进制守卫** + **打包冒烟**（debug 打到 `.deb`，覆盖资源路径 / 配置 schema /
+    beforeBuildCommand）。冒烟是补上「打包问题只在打 tag 才暴露」的缺口。
+  - `audit`：依赖供应链审计（`rustsec/audit-check`，需 `checks: write` 权限才能写 check-run）。
 - `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(arm64) / Windows(x64)
-  构建并发布为 GitHub Release 草稿。
+  构建并发布为 GitHub Release **草稿**（人工点发布才生效，是最后一道闸门）。
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0    # 触发构建发布
+git tag -a v0.6.0 -m "..." && git push origin v0.6.0    # 触发构建发布
 ```
+
+发布前先过 `docs/license-activation-scheme-v2.md` 的**发布前检查清单**——其 A 组（许可验签密钥换发）
+是硬性阻断项：当前二进制内嵌的仍是开发公钥 `lic-dev-2026a`，未换发即发布意味着任何持有该私钥的人
+都能伪造合法许可。
 
 ### macOS 代码签名 / 公证（可选，配置后自动启用）
 
@@ -75,13 +108,16 @@ git tag v0.1.0 && git push origin v0.1.0    # 触发构建发布
 
 未配置时产出未签名包（本地可用，分发到他机需用户手动放行 Gatekeeper）。
 
-### 自动更新（可选，需一次性配置）
+### 自动更新（**已启用**）
 
-1. 生成更新签名密钥：`npm run tauri signer generate -- -w ~/.bidguard/updater.key`
-2. 把生成的 **公钥** 填入 `tauri.conf.json` 的 `plugins.updater.pubkey`，并设置
-   `endpoints`（指向发布的 `latest.json`）。
-3. 把 **私钥** 与其密码加入仓库 Secrets：`TAURI_SIGNING_PRIVATE_KEY`、
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（`release.yml` 已预留）。
-4. 安装 `@tauri-apps/plugin-updater` 与 `tauri-plugin-updater`，在启动时检查更新。
+已完成配置，无需再设：`tauri.conf.json` 的 `plugins.updater.pubkey` 已填、`endpoints` 指向
+`releases/latest/download/latest.json`，`bundle.createUpdaterArtifacts=true`，前后端插件已装，
+签名私钥在仓库 Secrets（`TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD`）。
 
-> 自动更新依赖你的发布托管（GitHub Release / 自有服务器），故默认未开启，按需配置。
+运作方式与注意事项：
+
+- `release.yml` 随产物生成 `latest.json` 与各平台 `.sig`；**草稿发布后**该 `latest.json` 才对旧版本生效——
+  这正是草稿式发布作为闸门的意义：点发布 = 向存量安装推送更新。
+- 更新签名密钥与**许可验签密钥是两套东西**，不要混用：前者可进 GH Secrets，后者（license 私钥）
+  **绝不可**进任何仓库或 CI，见 `docs/license-activation-scheme-v2.md`。
+- 本地打包无私钥会在末尾报错，属预期；见「本地打包」一节的跳过写法。
