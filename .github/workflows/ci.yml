@@ -50,6 +50,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 打包冒烟需 node：tauri build 会执行 beforeBuildCommand（npm run build）。
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'ubuntu-24.04'
+        with:
+          node-version: 20
+          cache: npm
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
@@ -69,6 +75,31 @@ jobs:
       - name: Linux 编译检查
         if: matrix.os == 'ubuntu-24.04'
         run: cargo check --manifest-path src-tauri/Cargo.toml --lib
+
+      # 单一应用二进制守卫（秒级）：tauri 从清单的 bin 目标里挑主程序，且【不看
+      # required-features】——包内一旦多出第二个 bin，它就可能选错并在打包阶段失败
+      # （v0.6.0 首次发布即因 dev-tools 门控的 corpusgen 被当成主程序而三平台全挂）。
+      # 开发用 CLI 一律声明为 [[example]]：example 不属于应用二进制。
+      - name: 单一应用二进制守卫
+        shell: bash
+        run: |
+          bins=$(cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 \
+            | python3 -c "import json,sys; print(' '.join(t['name'] for p in json.load(sys.stdin)['packages'] for t in p['targets'] if 'bin' in t['kind']))")
+          echo "bin targets: [$bins]"
+          if [ "$bins" != "bidguard" ]; then
+            echo "::error::期望恰好一个应用二进制 bidguard，实得 [$bins]。tauri 会据此挑错二进制打包——请把开发用 CLI 改声明为 [[example]]（见 src-tauri/Cargo.toml 注释）。"
+            exit 1
+          fi
+
+      # 打包冒烟（Linux · debug）：真正跑一次 tauri build 到出 .deb，覆盖二进制选取之外的
+      # 打包配置问题（资源/图标路径、配置 schema、beforeBuildCommand）。用 debug 构建换速度；
+      # 正式产物仍由 release.yml 出。此前 CI 从不跑 tauri build，这类问题只有打 tag 才暴露。
+      - name: 安装前端依赖（打包冒烟用）
+        if: matrix.os == 'ubuntu-24.04'
+        run: npm ci
+      - name: 打包冒烟（Linux · debug · deb）
+        if: matrix.os == 'ubuntu-24.04'
+        run: npm run tauri build -- --debug --bundles deb
 
   # 依赖供应链审计（非阻塞信息位；出 CVE 时 CI 变红提醒）
   audit:
