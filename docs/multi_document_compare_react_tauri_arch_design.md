@@ -2097,7 +2097,7 @@ SQLite 负责本地持久化和缓存
 
 > 本附录记录设计文档落地为 BidGuard（原本·标书查重）后的**实际架构与偏差**。
 > 上文为设计蓝图；产品在保留全部设计能力的同时，针对「标书交叉比对/围标识别」做了领域增强。
-> 更新日期：2026-06-25（初版 2026-06-11；本附录为累积式里程碑，最新进展见 §28.7）。
+> 更新日期：2026-07-30（初版 2026-06-11；本附录为累积式里程碑，最新进展见 §28.10）。
 
 ### 28.1 与设计文档的主要偏差
 
@@ -2217,3 +2217,36 @@ GitHub Releases + tauri-plugin-updater。`tauri.conf.json` 配 `createUpdaterArt
 - **OCR 静默回落 / 硬上限未配置化**（rasterize 20 页、docx 图片 60 张）。
 - **`options_hash` 版本前缀与 `minhash_blob` 失效靠手工维护**，无编译期保障。
 - **CI 用 `@stable` 浮动版本** 与声明的 MSRV 1.95 可能漂移；`parse_meta` 命令仍返 `Result<_,String>` 与 AppError 契约不一致（历史遗留薄壳）。
+
+### 28.10 证据体系重构（v0.4 → v0.6.0，2026-07-30）
+
+本节记录设计蓝图**未曾预见**的一轮结构性演进。原设计把「相似度 + 事实冲突」当作证据全集，
+v0.6.0 将其扩为**三类正交证据**，并在其前后各加一层（剥离合法共享、对抗规避检测）：
+
+- **文本证据**（原设计范围内的强化）：新增逐字雷同区间（后缀自动机求跨文档极大公共子串，
+  给出可引用的起止位置）与 seed-chain-align 连续对齐区段（把散点雷同块成型为「甲 3.2 节 ↔
+  乙 3.2 节 · 覆盖 82%」），`engine/verbatim.rs`、`engine/align.rs`。
+- **取证证据**（与文本正交，改写洗不掉）：docx 修订标识 rsid 与包结构指纹、PDF 血缘
+  （XMP GUID / trailer ID / 字体子集）、内嵌图片同源、共同错误指纹，`engine/fingerprint.rs` 扩展。
+- **数值证据**：工程量清单按编码跨文档对齐，逐项单价雷同率、共享算术错误、等差/等比规律与
+  单价相关性，`engine/boq.rs`、`engine/mechanism.rs`（后者为描述性、不参与分级）。
+- **合法共享剥离**（前置）：导入招标文件与补遗后，投标方对其逐字应答的段落经 winnowing 指纹
+  识别并剔除，报告给出「原始 / 剔除后」双口径；`engine/winnow.rs`、`engine/background.rs`。
+- **入口对抗层**（前置）：不可见码点剥离、同形字折叠、PDF 隐藏文字层审计、文字层与渲染 OCR
+  交叉验证；`engine/confusables.rs`、`engine/pdf_audit.rs`、`engine/pdf_xcheck.rs`。
+
+**判定与呈现**：围标结论从「五信号线性加权」改为**语料拟合的融合分**（`collusion.rs` 的 LR 权重，
+`fixtures/calibration/`），对外以**证据强度口头等级**呈现而非概率数值；条款按「低优先级抽查 /
+需人工复核 / 重点标红」三带排队（`engine/calibrate.rs`）。**当前随包校准基于合成语料，标注为
+实验性**，且因合成语料无法区分「同源编制」与「合法共享」，三带暂以 review-all 运行（详见
+`bid-comparison-execution-plan.md`）。
+
+**工程**：新增合成对抗语料与回归门禁（`engine/corpusgen.rs` + `corpus_regression`，CI 每次提交
+比对召回率 / per-label F1 / 围标 AUC，漂移即失败）；迁移增至 V23；engine 模块由 19 增至 32。
+
+**§28.9 技术债的变化**：`useJobReport` 适配器已移除（结果屏原生消费 DTO）、Export/Matrix 的 MOCK
+回落已去除、OCR 页上限在交叉验证命中时解除、模型下载补 sha256 校验、CI 已覆盖三平台并新增打包冒烟。
+仍在的：Embedder 单槽串行、`options_hash` 版本靠手工维护、`parse_meta` 返回类型与 AppError 契约不一致。
+
+> 详细设计与逐条验收见 **[bid-comparison-execution-plan.md](bid-comparison-execution-plan.md)**；
+> 方法论与取舍见 **[bid-comparison-scheme.md](bid-comparison-scheme.md)**。
