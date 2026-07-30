@@ -10,7 +10,7 @@ jobs:
     # 用 macOS：仓库内置 libpdfium.dylib + ONNX Runtime 可用，pdfium / 引擎测试可真实运行
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -48,7 +48,7 @@ jobs:
         os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # 打包冒烟需 node：tauri build 会执行 beforeBuildCommand（npm run build）。
       - uses: actions/setup-node@v4
@@ -111,7 +111,7 @@ jobs:
       contents: read # actions/checkout
       checks: write # 创建审计结果的 check-run
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

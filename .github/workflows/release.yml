@@ -31,7 +31,7 @@ jobs:
           # 暂不构建 Linux(用户决定)
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
