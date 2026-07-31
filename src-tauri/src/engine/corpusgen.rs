@@ -1565,7 +1565,50 @@ fn docset_eval(
 }
 
 /// Mann-Whitney U（含并列平均秩）→ AUC；任一侧为空回落 0.5。
-fn auc_score(pos: &[f64], neg: &[f64]) -> f64 {
+/// 外部真值语料的连续分打分：复用生产打分口径（regr_build_chunk → 全语料 IDF →
+/// score_pair 取连续 final_score），返回 (final_score, 归一化真值 label) 序列，供
+/// extcalib 出 P-R/ROC/校准指标。
+///
+/// `semantic`：按 pairs 下标对齐的语义余弦。传 None 走词面档（W_LEXICAL）；传 Some 走
+/// 融合档（W_SEMANTIC，语义维占 0.35）。余弦由调用方批量预算（见测试侧 semantic_cosines），
+/// 而非逐对闭包——嵌入批处理远快于逐对推理，也避免模型可变借用穿过建块循环。
+///
+/// 注意：外部为裸句对，无 section_path / rel_pos 上下文 → structure 维恒 None、order 维恒
+/// 1.0。对 ROC/PR/Spearman 等排序指标无碍（常量项不改排序），但会系统性抬高绝对分，故
+/// 阈值处 P/R/F1 与 ECE 带此偏移，解读时须知（这也正是「裸句对 vs 章节块」的口径差异）。
+pub fn score_external_pairs(
+    jieba: &Jieba,
+    pairs: &[crate::engine::extcalib::ExternalPair],
+    semantic: Option<&[f32]>,
+) -> Vec<(f32, f32)> {
+    if let Some(s) = semantic {
+        assert_eq!(s.len(), pairs.len(), "语义余弦数量须与句对数一致");
+    }
+    // 先建齐全部句对两侧分块，再用【全语料 IDF】填 TF-IDF——与 pair_stats 同口径，
+    // 避免逐对局部 IDF 让 lexical 与 char_ngram 退化为近似同一信号。
+    let mut built: Vec<(CmpChunk, CmpChunk, Option<f32>, f32)> = Vec::with_capacity(pairs.len());
+    for (i, r) in pairs.iter().enumerate() {
+        let sem = semantic.map(|s| s[i]);
+        let a = regr_build_chunk(jieba, format!("ext{i}-a"), 0, 0.0, &r.text_a, Vec::new());
+        let b = regr_build_chunk(jieba, format!("ext{i}-b"), 1, 0.0, &r.text_b, Vec::new());
+        built.push((a, b, sem, r.label));
+    }
+    let idf = {
+        let lists = built.iter().flat_map(|(a, b, _, _)| [a.tokens.as_slice(), b.tokens.as_slice()]);
+        features::idf_of(lists)
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    for (a, b, sem, label) in built.iter_mut() {
+        a.tfidf = features::weighted_vec(&a.tokens, &idf);
+        b.tfidf = features::weighted_vec(&b.tokens, &idf);
+        let parts = scoring::score_pair(a, b, *sem);
+        out.push((parts.final_score, *label));
+    }
+    out
+}
+
+/// pub(crate)：extcalib 的 ROC-AUC 复用同一实现，避免重复。
+pub(crate) fn auc_score(pos: &[f64], neg: &[f64]) -> f64 {
     if pos.is_empty() || neg.is_empty() {
         return 0.5;
     }
@@ -2256,7 +2299,7 @@ pub fn lr_json(model: &collusion::LrModel, report: &FitReport) -> String {
         "version": model.version,
         "note": "实验性校准（合成语料）：权重由 fixtures/corpus/docsets 拟合，L2 向 v1 经验权重收缩；\
                  概率为合成语料校准值、不是串通概率；真实判例回测前不作为唯一依据。\
-                 重新生成：cargo run --bin corpusgen --features dev-tools -- fit-collusion",
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-collusion",
         "intercept": round(model.intercept),
         "weights": serde_json::Value::Object(weights),
         "levels": {
@@ -2697,7 +2740,7 @@ pub fn calib_json(model: &calibrate::CalibrationModel, report: &CalibReport) -> 
                  α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；\
                  低优先级抽查带只做排序与折叠，不隐藏任何条款。\
                  routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。\
-                 重新生成：cargo run --bin corpusgen --features dev-tools -- fit-calib",
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-calib",
         "fit": report,
     });
     if let (Some(obj), Some(p)) = (body.as_object_mut(), params.as_object()) {
@@ -3231,7 +3274,7 @@ mod tests {
                 shipped.get(key),
                 fresh.get(key),
                 "随包 score_calib.json 的 {key} 与当前语料/代码重拟合结果不一致：\
-                 请重跑 cargo run --bin corpusgen --features dev-tools -- fit-calib"
+                 请重跑 cargo run --example corpusgen --features dev-tools -- fit-calib"
             );
         }
     }
@@ -3377,5 +3420,620 @@ mod tests {
             }
         }
     }
+
+    // —— 外部真值相似度校准（打破合成同源循环）——
+
+    /// 外部标注语料目录：BIDGUARD_GT_DIR override（本地非提交数据）优先，否则仓库
+    /// committed fixtures/corpus/external/。注意与 BIDGUARD_CALIB_DIR（生成器种子）区分。
+    fn external_dir() -> PathBuf {
+        if let Ok(d) = std::env::var("BIDGUARD_GT_DIR") {
+            if !d.trim().is_empty() {
+                return PathBuf::from(d);
+            }
+        }
+        corpus_dir().join("external")
+    }
+
+    /// 语义档所用模型的 key：BIDGUARD_EMBED_MODEL override（如 "bge-large-zh"），
+    /// 默认 "bge-zh"（bge-small-zh-v1.5）。用于横比不同规模模型对判别力/误报的影响。
+    fn semantic_model_key() -> String {
+        std::env::var("BIDGUARD_EMBED_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "bge-zh".to_string())
+    }
+
+    /// 当前语义模型的 id（进 scorer 名，避免不同规模模型的基线撞键——指标本就是模型相关的）。
+    fn semantic_model_id() -> &'static str {
+        crate::engine::embed::resolve(&semantic_model_key()).id
+    }
+
+    /// 批量算语义余弦（按 pairs 下标对齐）。模型不可用时返回 None → 调用方只跑词面档。
+    /// 离线：allow_download=false，需 BIDGUARD_EMBED_DIR 或 ~/.cache/bidguard/embeddings/<id>/。
+    fn semantic_cosines(pairs: &[crate::engine::extcalib::ExternalPair]) -> Option<Vec<f32>> {
+        use crate::engine::embed;
+        let spec = embed::resolve(&semantic_model_key());
+        let mut slot: embed::LoadedEmbedder = None;
+        let model = embed::ensure(&mut slot, spec, false)?;
+        // 两侧文本摊平后按 EMBED_BATCH 分批，一次推理多条（远快于逐对）。
+        let flat: Vec<String> =
+            pairs.iter().flat_map(|p| [p.text_a.clone(), p.text_b.clone()]).collect();
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(flat.len());
+        for chunk in flat.chunks(128) {
+            vecs.extend(embed::embed_batch(model, chunk, spec.id)?);
+        }
+        if vecs.len() != flat.len() {
+            return None;
+        }
+        Some(vecs.chunks(2).map(|c| embed::cosine(&c[0], &c[1])).collect())
+    }
+
+    fn render_extcalib(ms: &[crate::engine::extcalib::ExtCalibMetrics]) -> String {
+        let mut s = String::from("外部真值相似度校准（@0.7=运行阈值）\n");
+        s.push_str(&format!(
+            "{:<12} {:<26} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
+            "source", "scorer", "n", "pos", "neg", "ROC", "PR", "P@.7", "R@.7", "F1@.7", "bestF1",
+            "bestThr", "ECE", "Spearman"
+        ));
+        for m in ms {
+            s.push_str(&format!(
+                "{:<12} {:<26} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
+                m.source, m.scorer, m.pairs_count, m.positives, m.negatives, m.roc_auc, m.pr_auc,
+                m.precision_at, m.recall_at, m.f1_at, m.best_f1, m.best_threshold, m.ece, m.spearman
+            ));
+        }
+        s
+    }
+
+    /// 外部真值门禁：按 source 逐一对照基线，单向回归即失败（判别力降 / 校准误差升）。
+    fn extcalib_gate_failures(
+        base: &[crate::engine::extcalib::ExtCalibMetrics],
+        cur: &[crate::engine::extcalib::ExtCalibMetrics],
+    ) -> Vec<String> {
+        const AUC_TOL: f64 = 0.03;
+        const F1_TOL: f64 = 0.02;
+        const ECE_TOL: f64 = 0.03;
+        // 按 (source, scorer) 配对：同一语料的词面/融合/纯余弦三档各有自己的基线。
+        let by_key: BTreeMap<(&str, &str), &crate::engine::extcalib::ExtCalibMetrics> =
+            base.iter().map(|m| ((m.source.as_str(), m.scorer.as_str()), m)).collect();
+        let mut fails = Vec::new();
+        for c in cur {
+            let k = (c.source.as_str(), c.scorer.as_str());
+            let Some(b) = by_key.get(&k) else {
+                fails.push(format!(
+                    "[{}/{}] 基线缺此档（新增语料/档位需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
+                    c.source, c.scorer
+                ));
+                continue;
+            };
+            let tag = format!("{}/{}", c.source, c.scorer);
+            if c.roc_auc < b.roc_auc - AUC_TOL {
+                fails.push(format!("[{tag}] ROC-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", b.roc_auc, c.roc_auc));
+            }
+            if c.pr_auc < b.pr_auc - AUC_TOL {
+                fails.push(format!("[{tag}] PR-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", b.pr_auc, c.pr_auc));
+            }
+            if c.best_f1 < b.best_f1 - F1_TOL {
+                fails.push(format!("[{tag}] bestF1 降 {:.3}→{:.3}（容差 {F1_TOL}）", b.best_f1, c.best_f1));
+            }
+            if c.ece > b.ece + ECE_TOL {
+                fails.push(format!("[{tag}] ECE 升 {:.3}→{:.3}（容差 {ECE_TOL}）", b.ece, c.ece));
+            }
+        }
+        fails
+    }
+
+    /// 外部真值相似度校准（本地/慢档，#[ignore]）：读【独立于合成生成器】的人工标注语料
+    /// （默认 fixtures/corpus/external/*.jsonl，可由 BIDGUARD_GT_DIR 覆盖为本地非提交数据），
+    /// 用词面 score_pair 打连续分，出 ROC-AUC/PR-AUC/阈值扫描/ECE/Spearman，对照
+    /// baseline_metrics_external.json；BIDGUARD_WRITE_BASELINE=1 时写基线。
+    /// 目的：用非同源人工标注真值评估打分器判别力，打破合成指标系统性偏乐观循环。
+    #[test]
+    #[ignore] // 词面档无需模型：cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools external_calib -- --ignored --nocapture
+    fn external_calib() {
+        use crate::engine::extcalib;
+        let jieba = Jieba::new();
+        let dir = external_dir();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取外部语料目录 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "外部语料目录 {} 下无 *.jsonl", dir.display());
+
+        let mut metrics: Vec<extcalib::ExtCalibMetrics> = Vec::new();
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f)
+                .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
+            if pairs.is_empty() {
+                continue;
+            }
+            let source = pairs
+                .first()
+                .map(|p| p.source.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| f.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+            // 词面档（无模型，恒可跑）
+            let lex = score_external_pairs(&jieba, &pairs, None);
+            metrics.push(extcalib::evaluate(&source, "lexical", &lex, 0.5, REGRESSION_THRESHOLD, 10));
+            // 语义两档（模型就绪才跑）：fused = 生产融合分（用户实际经历的）；
+            // cosine = 裸嵌入余弦（单独回答「嵌入本身判别力如何」）。
+            if let Some(cos) = semantic_cosines(&pairs) {
+                let mid = semantic_model_id();
+                let fused = score_external_pairs(&jieba, &pairs, Some(&cos));
+                metrics.push(extcalib::evaluate(
+                    &source,
+                    &format!("fused:{mid}"),
+                    &fused,
+                    0.5,
+                    REGRESSION_THRESHOLD,
+                    10,
+                ));
+                let raw: Vec<(f32, f32)> =
+                    cos.iter().zip(&pairs).map(|(c, p)| (*c, p.label)).collect();
+                metrics.push(extcalib::evaluate(
+                    &source,
+                    &format!("cosine:{mid}"),
+                    &raw,
+                    0.5,
+                    REGRESSION_THRESHOLD,
+                    10,
+                ));
+            } else {
+                eprintln!("[external_calib] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
+            }
+        }
+        metrics.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
+        eprintln!("{}", render_extcalib(&metrics));
+
+        let baseline_path = corpus_dir().join("baseline_metrics_external.json");
+        if baseline_write_mode() {
+            // 按 (source, scorer) 合并：本次只跑了部分档（如模型不可用只有 lexical，或换模型
+            // 只跑该模型的档），保留基线里其它档的条目，否则换个模型写基线会把上一个冲掉。
+            let mut merged: Vec<extcalib::ExtCalibMetrics> = std::fs::read_to_string(&baseline_path)
+                .ok()
+                .and_then(|r| serde_json::from_str(&r).ok())
+                .unwrap_or_default();
+            let fresh: BTreeSet<(String, String)> =
+                metrics.iter().map(|m| (m.source.clone(), m.scorer.clone())).collect();
+            merged.retain(|m| !fresh.contains(&(m.source.clone(), m.scorer.clone())));
+            merged.extend(metrics.iter().cloned());
+            merged.sort_by(|a, b| {
+                (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer))
+            });
+            let metrics = merged;
+            let body = serde_json::to_string_pretty(&metrics).expect("serialize ext metrics");
+            std::fs::write(&baseline_path, format!("{body}\n"))
+                .unwrap_or_else(|e| panic!("写外部基线 {} 失败: {e}", baseline_path.display()));
+            eprintln!("[external_calib] 已写入基线 → {}", baseline_path.display());
+            return;
+        }
+        let raw = match std::fs::read_to_string(&baseline_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "[external_calib] 无基线（{}）；仅打印报告。首次固化：BIDGUARD_WRITE_BASELINE=1 cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools external_calib -- --ignored",
+                    baseline_path.display()
+                );
+                return;
+            }
+        };
+        let base: Vec<extcalib::ExtCalibMetrics> =
+            serde_json::from_str(&raw).expect("解析 baseline_metrics_external.json");
+        let failures = extcalib_gate_failures(&base, &metrics);
+        if !failures.is_empty() {
+            panic!("外部真值门禁失败（{} 项）：\n{}", failures.len(), failures.join("\n"));
+        }
+        eprintln!("[external_calib] 通过（对照 {} 个来源基线）", base.len());
+    }
+
+    /// 样板误报探针（本地/慢档，#[ignore]）：读官方招标文件范本切出的【合法雷同】语料
+    /// （fixtures/corpus/template/*.jsonl），量化「多份标书照抄同一份官方范本」在默认阈值
+    /// 下的误报率。全部为负样本（合法共享 ≠ 串标），故用单边 FPR 探针而非 ROC/PR-AUC。
+    /// 对照 baseline_metrics_template_fp.json；BIDGUARD_WRITE_BASELINE=1 时写基线。
+    #[test]
+    #[ignore] // 词面档无需模型：cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools template_fp_probe -- --ignored --nocapture
+    fn template_fp_probe() {
+        use crate::engine::extcalib;
+        let jieba = Jieba::new();
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取样板语料目录 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "样板语料目录 {} 下无 *.jsonl", dir.display());
+
+        let mut probes: Vec<extcalib::FalsePositiveProbe> = Vec::new();
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f)
+                .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
+            if pairs.is_empty() {
+                continue;
+            }
+            assert!(
+                pairs.iter().all(|p| p.label == 0.0),
+                "{} 应全为负样本（合法共享的样板文本）",
+                f.display()
+            );
+            let source = pairs[0].source.clone();
+            let subs: BTreeSet<String> =
+                pairs.iter().map(|p| p.subclass.clone()).filter(|s| !s.is_empty()).collect();
+            // 各档分数：词面恒有；语义两档（融合 / 裸余弦）模型就绪才有。
+            let cos = semantic_cosines(&pairs);
+            if cos.is_none() {
+                eprintln!("[template_fp_probe] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
+            }
+            let mut lanes: Vec<(String, Vec<f32>)> = vec![(
+                "lexical".to_string(),
+                score_external_pairs(&jieba, &pairs, None).iter().map(|(s, _)| *s).collect(),
+            )];
+            if let Some(c) = &cos {
+                let mid = semantic_model_id();
+                lanes.push((
+                    format!("fused:{mid}"),
+                    score_external_pairs(&jieba, &pairs, Some(c)).iter().map(|(s, _)| *s).collect(),
+                ));
+                lanes.push((format!("cosine:{mid}"), c.clone()));
+            }
+            for (scorer, scores) in &lanes {
+                probes.push(extcalib::false_positive_probe(
+                    &source,
+                    scorer,
+                    "all",
+                    scores,
+                    REGRESSION_THRESHOLD,
+                ));
+                for sub in subs.iter() {
+                    let v: Vec<f32> = scores
+                        .iter()
+                        .zip(&pairs)
+                        .filter(|(_, p)| &p.subclass == sub)
+                        .map(|(s, _)| *s)
+                        .collect();
+                    probes.push(extcalib::false_positive_probe(
+                        &source,
+                        scorer,
+                        sub,
+                        &v,
+                        REGRESSION_THRESHOLD,
+                    ));
+                }
+            }
+        }
+        probes.sort_by(|a, b| {
+            (a.source.as_str(), a.scorer.as_str(), a.subclass.as_str())
+                .cmp(&(&b.source, &b.scorer, &b.subclass))
+        });
+
+        let mut table = String::from(
+            "官方范本「合法雷同」误报探针（阈值 0.7；全部为负样本，FPR 越低越好）\n",
+        );
+        table.push_str(&format!(
+            "{:<20} {:<26} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "source", "scorer", "subclass", "n", "flagged", "FPR", "mean", "median", "p90", "max"
+        ));
+        for p in &probes {
+            table.push_str(&format!(
+                "{:<20} {:<26} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
+                p.source, p.scorer, p.subclass, p.pairs_count, p.flagged, p.fpr, p.mean_score,
+                p.median_score, p.p90_score, p.max_score
+            ));
+        }
+        eprintln!("{table}");
+
+        let baseline_path = corpus_dir().join("baseline_metrics_template_fp.json");
+        if baseline_write_mode() {
+            // 按 (source, scorer) 合并——理由同 external_calib：换模型写基线不应冲掉其它档。
+            let mut merged: Vec<extcalib::FalsePositiveProbe> =
+                std::fs::read_to_string(&baseline_path)
+                    .ok()
+                    .and_then(|r| serde_json::from_str(&r).ok())
+                    .unwrap_or_default();
+            let fresh: BTreeSet<(String, String)> =
+                probes.iter().map(|p| (p.source.clone(), p.scorer.clone())).collect();
+            merged.retain(|p| !fresh.contains(&(p.source.clone(), p.scorer.clone())));
+            merged.extend(probes.iter().cloned());
+            merged.sort_by(|a, b| {
+                (a.source.as_str(), a.scorer.as_str(), a.subclass.as_str())
+                    .cmp(&(&b.source, &b.scorer, &b.subclass))
+            });
+            let probes = merged;
+            let body = serde_json::to_string_pretty(&probes).expect("serialize fp probes");
+            std::fs::write(&baseline_path, format!("{body}\n"))
+                .unwrap_or_else(|e| panic!("写样板基线 {} 失败: {e}", baseline_path.display()));
+            eprintln!("[template_fp_probe] 已写入基线 → {}", baseline_path.display());
+            return;
+        }
+        let raw = match std::fs::read_to_string(&baseline_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "[template_fp_probe] 无基线（{}）；仅打印报告。首次固化：BIDGUARD_WRITE_BASELINE=1 cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools template_fp_probe -- --ignored",
+                    baseline_path.display()
+                );
+                return;
+            }
+        };
+        let base: Vec<extcalib::FalsePositiveProbe> =
+            serde_json::from_str(&raw).expect("解析 baseline_metrics_template_fp.json");
+        // 门禁：误报率单向上升即失败（合法样板被误标的比例不得恶化）。
+        const FPR_TOL: f64 = 0.03;
+        let by_key: BTreeMap<(&str, &str, &str), &extcalib::FalsePositiveProbe> = base
+            .iter()
+            .map(|p| ((p.source.as_str(), p.scorer.as_str(), p.subclass.as_str()), p))
+            .collect();
+        let mut failures = Vec::new();
+        for c in &probes {
+            let k = (c.source.as_str(), c.scorer.as_str(), c.subclass.as_str());
+            let Some(b) = by_key.get(&k) else {
+                failures.push(format!(
+                    "[{}/{}/{}] 基线缺此分档（新增语料/档位需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
+                    c.source, c.scorer, c.subclass
+                ));
+                continue;
+            };
+            if c.fpr > b.fpr + FPR_TOL {
+                failures.push(format!(
+                    "[{}/{}/{}] 误报率升 {:.3}→{:.3}（容差 {FPR_TOL}）",
+                    c.source, c.scorer, c.subclass, b.fpr, c.fpr
+                ));
+            }
+        }
+        if !failures.is_empty() {
+            panic!("样板误报门禁失败（{} 项）：\n{}\n{table}", failures.len(), failures.join("\n"));
+        }
+        eprintln!("[template_fp_probe] 通过（对照 {} 个分档基线）", base.len());
+    }
+
+    /// V2 的三条泛用样板【覆盖不到】官方范本条款——这是 V16 补入官方表单的原始依据，
+    /// 保留为回归护栏：若日后有人把 V2 三条改宽泛到能命中正文条款，这里会立刻失败。
+    ///
+    /// 背景：生产确有模板抑制——chunker 用词频余弦 ≥ TEMPLATE_MATCH(0.7) 比对
+    /// source_templates，命中即标 is_template，compare 侧按 ignore_templates 在召回前剔除
+    /// （compare_service.rs `keep_template`）。但 V2 内置库只有 3 条泛用短句（法律法规引用 /
+    /// 资质证书目录 / 标准售后承诺，SEED_TEMPLATES_V2），实测对本语料 132 条官方条款最高
+    /// 余弦仅 0.223、命中 0 条，故【当时】逐字照抄的合法样板无法被抑制。
+    /// 已由 V16（OFFICIAL_TEMPLATES_V16）补入第八章「投标文件格式」的 6 条表单修复；
+    /// 修复的有效性与安全性见 official_seed_templates_match_forms_without_suppressing_body_text。
+    #[test]
+    #[ignore] // 与 template_fp_probe 同档（读 fixtures/corpus/template）：cargo test --features dev-tools official_template_not_covered_by_builtin_library -- --ignored --nocapture
+    fn official_template_not_covered_by_builtin_library() {
+        use crate::engine::extcalib;
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7; // 对齐 chunker::TEMPLATE_MATCH
+        // 内置库三条（migrations::SEED_TEMPLATES_V2 原文）
+        let builtin = [
+            "根据《中华人民共和国招标投标法》及其实施条例，以及《中华人民共和国政府采购法》的相关规定，本项目严格遵循公开、公平、公正和诚实信用的原则组织实施。",
+            "投标人具备独立法人资格，持有有效的营业执照、税务登记证及与本项目相适应的行业资质证书与质量管理体系认证，所有证照均在有效期内。",
+            "我方承诺提供 7×24 小时技术支持服务，质保期内免费维护，接到故障报修后及时响应并在约定时限内解决，确保系统稳定运行。",
+        ];
+        let jieba = Jieba::new();
+        let tpl_tokens: Vec<Vec<String>> =
+            builtin.iter().map(|t| tokenize_lang(&jieba, t, "auto")).collect();
+
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        let mut checked = 0usize;
+        let mut covered = 0usize;
+        let mut best_overall = 0.0f32;
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f).expect("读取样板语料");
+            for p in &pairs {
+                let toks = tokenize_lang(&jieba, &p.text_a, "auto");
+                let best =
+                    tpl_tokens.iter().map(|t| cosine(&toks, t)).fold(0.0f32, f32::max);
+                best_overall = best_overall.max(best);
+                checked += 1;
+                if best >= TEMPLATE_MATCH {
+                    covered += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[official_template_not_covered] 检查 {checked} 条官方范本条款：被内置库命中 {covered} 条；最高余弦 {best_overall:.3}（阈值 {TEMPLATE_MATCH}）"
+        );
+        assert!(checked > 0, "样板语料为空");
+        assert_eq!(
+            covered, 0,
+            "内置模板库已能覆盖官方范本条款（命中 {covered}/{checked}）——若已补入官方条款，请更新本测试与 template_fp_probe 基线"
+        );
+    }
+
+    /// V16 补入的官方表单样板：既要**命中**投标人逐字复制的表单，更要**不误压**该比对的正文。
+    ///
+    /// 标 is_template 的后果是段落被排除比对（compare_service 的 ignore_templates），所以
+    /// 过度收录会造成漏报——对查重工具而言比误报更糟。本测试守住两侧：
+    /// ①（有效性）每条官方样板与自身源文本余弦 = 1.0，即确实能命中照抄的表单；
+    /// ②（安全性）这些样板不得命中样板误报语料里的 132 条章节条款（投标人须知/评标办法/
+    ///   合同条款/工程量清单）——那些是正文语域，若被压掉就等于放过真实雷同。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools official_seed_templates -- --ignored --nocapture
+    fn official_seed_templates_match_forms_without_suppressing_body_text() {
+        use crate::engine::extcalib;
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7; // 对齐 chunker::TEMPLATE_MATCH
+        let jieba = Jieba::new();
+
+        // 从迁移常量里取 V16 实际入库的样板文本（与生产同源，避免测试与迁移各写一份）
+        let seeds = crate::db::migrations::official_seed_texts();
+        assert_eq!(seeds.len(), 9, "V16 六条施工表单 + V17 两条货物/服务投标函 + V18 北京授权委托书");
+        let seed_tokens: Vec<Vec<String>> =
+            seeds.iter().map(|(_, t)| tokenize_lang(&jieba, t, "auto")).collect();
+
+        // ① 有效性：自身命中（逐字照抄必然命中）
+        for ((id, text), toks) in seeds.iter().zip(&seed_tokens) {
+            let c = cosine(&tokenize_lang(&jieba, text, "auto"), toks);
+            assert!(c >= TEMPLATE_MATCH, "[{id}] 应命中自身文本，实测余弦 {c:.3}");
+        }
+
+        // ② 安全性：不得命中正文语域的章节条款
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        // 只检「正文条款」档：regional_variant 装的是官方表单本身，被样板命中是预期行为
+        // （那正是抑制该起作用的地方），不属于误压。
+        const BODY_SUBCLASSES: [&str; 3] = ["verbatim", "sibling", "cross_chapter"];
+        let (mut checked, mut suppressed, mut worst) = (0usize, Vec::new(), 0.0f32);
+        for f in &files {
+            for p in extcalib::read_external_pairs(f).expect("读取样板语料") {
+                if !BODY_SUBCLASSES.contains(&p.subclass.as_str()) {
+                    continue;
+                }
+                let toks = tokenize_lang(&jieba, &p.text_a, "auto");
+                let (mut best, mut best_id) = (0.0f32, "");
+                for ((id, _), st) in seeds.iter().zip(&seed_tokens) {
+                    let c = cosine(&toks, st);
+                    if c > best {
+                        best = c;
+                        best_id = id;
+                    }
+                }
+                worst = worst.max(best);
+                checked += 1;
+                if best >= TEMPLATE_MATCH {
+                    // 按字符而非字节截断：中文一字多字节，字节切片会落在字中间 panic
+                    let head: String = p.text_a.chars().take(60).collect();
+                    suppressed.push(format!("{best_id} ⟵ {best:.3} ⟵ {head}"));
+                }
+            }
+        }
+        eprintln!(
+            "[official_seed_templates] 正文条款 {checked} 条：被官方样板命中 {} 条；最高余弦 {worst:.3}（阈值 {TEMPLATE_MATCH}）",
+            suppressed.len()
+        );
+        assert!(
+            suppressed.is_empty(),
+            "官方样板误压正文条款（会导致漏报）：\n{}",
+            suppressed.join("\n")
+        );
+    }
+
+    /// V17 只收 2 条代表样板（货物采购 / 工程服务），实测它们能否覆盖 2017 年版五个标准
+    /// 招标文件的**全部五个语域**（设备采购/材料采购/勘察/设计/监理）。
+    ///
+    /// 依据：五份投标函彼此高度重合（勘察/设计/监理 92–94%、设备/材料 87%），逐域各收一条
+    /// 是冗余——模板集是分块期的逐块比对项，每多一条就给每个分块加一次余弦。但"够不够"
+    /// 不能靠估计，这里用真实 tokenize+cosine 把覆盖率钉死：任一语域掉出阈值即失败，
+    /// 提示需要补收该域样板。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools official_form_templates_cover -- --ignored --nocapture
+    fn official_form_templates_cover_all_domains() {
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7;
+        #[derive(serde::Deserialize)]
+        struct Form {
+            id: String,
+            domain: String,
+            text: String,
+        }
+        let path = corpus_dir().join("template/ndrc2017-bidletters.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+        let forms: Vec<Form> = serde_json::from_str(&raw).expect("解析 ndrc2017-bidletters.json");
+        assert_eq!(forms.len(), 5, "应有五个语域的投标函");
+
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let seed_tokens: Vec<(String, Vec<String>)> =
+            seeds.iter().map(|(id, t)| (id.clone(), tokenize_lang(&jieba, t, "auto"))).collect();
+
+        let mut misses = Vec::new();
+        for f in &forms {
+            let toks = tokenize_lang(&jieba, &f.text, "auto");
+            let (mut best, mut who) = (0.0f32, "");
+            for (id, st) in &seed_tokens {
+                let c = cosine(&toks, st);
+                if c > best {
+                    best = c;
+                    who = id;
+                }
+            }
+            eprintln!("  {:<8} 最高 {best:.3} ← {who}", f.domain);
+            if best < TEMPLATE_MATCH {
+                misses.push(format!("{}（{}）最高仅 {best:.3}", f.domain, f.id));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "以下语域未被现有样板覆盖，需在迁移中补收该域投标函：\n{}",
+            misses.join("\n")
+        );
+    }
+
+    /// 地区变体的抑制覆盖：只收了发改委版样板，外地范本（北京2025 / 浙江2023）的同名表单
+    /// 是否也能被抑制？
+    ///
+    /// 这是实务上最要紧的问题：全国范本被各省市改编后同名表单开头结尾常一字不差、中段按
+    /// 地方规则增删（如北京授权委托书加"参加开标会""身份证号"）。两地投标人各用本地范本，
+    /// 产出的样板必然近重复却绝非串标。若只有发改委版能被抑制，跨省项目仍会误报。
+    ///
+    /// 本测试**不做硬断言**而是打印覆盖情况：变体覆盖与否是选型信息（要不要逐地区补样板），
+    /// 不是对错——真断言留给 official_seed_templates（不误压正文）与 cover_all_domains（语域覆盖）。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools regional_variant_suppression -- --ignored --nocapture
+    fn regional_variant_suppression_coverage() {
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7;
+        let path = corpus_dir().join("template/regional-forms.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+        // {表单类型: {地区: 正文}}
+        let forms: BTreeMap<String, BTreeMap<String, String>> =
+            serde_json::from_str(&raw).expect("解析 regional-forms.json");
+
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let seed_tokens: Vec<(String, Vec<String>)> =
+            seeds.iter().map(|(id, t)| (id.clone(), tokenize_lang(&jieba, t, "auto"))).collect();
+
+        eprintln!("地区变体被现有（发改委版）样板抑制的情况，阈值 {TEMPLATE_MATCH}：");
+        let (mut covered, mut total) = (0usize, 0usize);
+        for (kind, byreg) in &forms {
+            for (region, text) in byreg {
+                let toks = tokenize_lang(&jieba, text, "auto");
+                let (mut best, mut who) = (0.0f32, "");
+                for (id, st) in &seed_tokens {
+                    let c = cosine(&toks, st);
+                    if c > best {
+                        best = c;
+                        who = id;
+                    }
+                }
+                total += 1;
+                let hit = best >= TEMPLATE_MATCH;
+                if hit {
+                    covered += 1;
+                }
+                eprintln!(
+                    "  {kind:<11} {region:<13} {:.3} {} {}",
+                    best,
+                    if hit { "✓抑制" } else { "✗漏网" },
+                    who
+                );
+            }
+        }
+        eprintln!("  合计 {covered}/{total} 被抑制");
+        // 发改委版自身必须被抑制（否则 V16/V17 的收录本身出了问题）
+        for (kind, byreg) in &forms {
+            if let Some(text) = byreg.get("ndrc2007") {
+                let toks = tokenize_lang(&jieba, text, "auto");
+                let best = seed_tokens.iter().map(|(_, st)| cosine(&toks, st)).fold(0.0f32, f32::max);
+                assert!(best >= TEMPLATE_MATCH, "[{kind}] 发改委版自身应被抑制，实测 {best:.3}");
+            }
+        }
+    }
+
 }
 

@@ -654,6 +654,50 @@ mod tests {
         assert!(normal.template_id.is_none());
     }
 
+    /// V16 官方表单样板必须扛得住「投标人填空」：真实标书里的投标函不是空白范本，
+    /// 而是填入了单位名/金额/工期/质量等级的成品。若只有逐字空白范本才命中，这条修复
+    /// 在真实数据上就是空转——多份标书照抄的同一份投标函仍会被当成雷同证据。
+    #[test]
+    fn official_bid_letter_template_still_matches_after_bidder_fills_blanks() {
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let (_, bidletter) =
+            seeds.iter().find(|(id, _)| id == "t-ndrc-bidletter").expect("V16 应含投标函样板");
+        let opts = ChunkerOptions {
+            templates: vec![("t-ndrc-bidletter".to_string(), tokenize(&jieba, bidletter))],
+            ..Default::default()
+        };
+        // 同一份官方投标函，由投标人填入具体信息后的成品（占位符替换为真实值）
+        let filled = "1．我方已仔细研究了 滨海新区市政道路改造工程 标段施工招标文件的全部内容，\
+愿意以人民币（大写）叁仟贰佰壹拾万元整 元（¥32100000.00）的投标总报价，工期 240 日历天，\
+按合同约定实施和完成承包工程，修补工程中的任何缺陷，工程质量达到 合格 。\
+2．我方承诺在投标有效期内不修改、撤销投标文件。\
+3．随同本投标函提交投标保证金一份，金额为人民币（大写）陆拾万元整 元（¥600000.00）。\
+4．如我方中标： （1）我方承诺在收到中标通知书后，在中标通知书规定的期限内与你方签订合同。\
+（2）随同本投标函递交的投标函附录属于合同文件的组成部分。\
+（3）我方承诺按照招标文件规定向你方递交履约担保。\
+（4）我方承诺在合同约定的期限内完成并移交全部合同工程。\
+5．我方在此声明，所递交的投标文件及有关资料内容完整、真实和准确，\
+且不存在第二章“投标人须知”第1.4.3项规定的任何一种情形。";
+        let text = format!("{filled}\n\n本工程拟采用装配式施工与BIM协同管理，自主研发的进度纠偏算法可将工期压缩12%。");
+        let chunks = chunk(&jieba, &blocks_md(&text), &opts);
+        let letter = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("投标总报价"))
+            .expect("应有投标函分块");
+        assert!(
+            letter.is_template,
+            "填空后的官方投标函仍应命中样板（否则真实标书里的照抄表单不会被抑制）"
+        );
+        assert_eq!(letter.template_id.as_deref(), Some("t-ndrc-bidletter"));
+        // 反向：投标人自撰的技术内容不得被样板压掉（压掉=漏报）
+        let own = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("BIM"))
+            .expect("应有自撰内容分块");
+        assert!(!own.is_template, "投标人自撰技术内容不得被标为样板");
+    }
+
     #[test]
     fn tokens_come_from_sanitized_text() {
         // W2-1「全部特征基于清洗后文本」：token_json 也是特征列。词内零宽拆词

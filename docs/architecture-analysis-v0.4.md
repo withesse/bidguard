@@ -3,6 +3,22 @@
 > 分析日期：2026-07-02 · 基线：v0.4.0（main d277dad）· 生成方式：7 个子系统读码 agent 并行深读全仓源码后合成，所有结论附 file:line 依据。
 > 注意：本文是时点快照——file:line 引用与"风险与短板"随代码演进会过时，修复后请更新或标记对应条目。
 
+> ## ⚠️ 本文为 v0.4.0 历史快照（截至 2026-07-30 已被 v0.6.0 大幅超越）
+>
+> 保留原文不改，作为「当时看到了什么」的记录；**正文里的 file:line 与代码描述多数已不成立**，
+> 请勿据此判断现状。§7 风险清单已逐条标注当前状态（✅ 已修 / 🟡 部分 / ⬜ 未动 / ➖ 已失效），
+> §8 的演进建议大部分已实施。
+>
+> 当前架构与算法请看：
+> - **[bid-comparison-scheme.md](bid-comparison-scheme.md)** — 比对方案与改进路线
+> - **[bid-comparison-execution-plan.md](bid-comparison-execution-plan.md)** — M0–M7 执行方案与逐条设计明细（含全局裁决与产品纪律）
+> - **[bid-comparison-sota-survey.md](bid-comparison-sota-survey.md)** — 学界与工业界方案调研
+>
+> v0.6.0 相对本快照的结构性变化（详见 CHANGELOG）：证据从「单一文本相似度」扩为**文本 / 取证 /
+> 数值三类正交证据**；新增**招标文件对减**（剥离合法共享内容）与**入口对抗层**（规避检测）；
+> 围标结论从加权和改为**语料拟合的融合分 + 证据强度口头等级 + 复核三带**；新增**语料回归门禁**，
+> 阈值改动从此有机械护栏。
+
 > 基于 v0.4.0 源码逐层深读（Rust 后端 62 文件 13,163 行 / 前端 52 文件约 9,959 行），所有结论均有 file:line 依据。
 
 ---
@@ -143,35 +159,47 @@ engine/ 的护城河不在算法新颖度（DSU、TF-IDF、MinHash 都是教科�
 
 ## 7. 风险与短板（按严重度排序）
 
+> **状态标注（2026-07-30，基线 v0.6.0）**：✅ 已修 · 🟡 部分改善 · ⬜ 未动 · ➖ 前提已变。
+> 逐条状态见各条目行首标记，依据为当前源码核对而非记忆。
+
+
 **S1 — 业务结论可信度类**
 
-1. **围标权重与分级线全是未校准魔法数**：0.4/0.25/0.15/0.1 各信号权重与 0.6/0.35/0.1 分级线（`collusion.rs:26-115`）无任何标注样本或实案回测支撑。"high"是本产品最重的输出，其可信度目前只有直觉背书。
-2. **大写金额盲区**：CN_DIGITS 不含法定大写"壹贰叁肆伍陆柒捌玖拾佰仟"（`normalize.rs:91`），金额正则不识别千分位与"¥"前缀（`features.rs:110`）——"人民币壹佰万元整（¥1,000,000.00）"两种写法都抽不出实体，**事实冲突检测对最正式的报价条款失明**。chunker 测试里恰有"壹佰万元整"样例却只测了大小写（`chunker.rs:560`），未暴露此问题。
-3. **报价梯度信号取"全文最大金额"当投标价**（`compare_service.rs:641-655`）：注册资本、历史业绩合同额会劫持该值，既漏报真陪标价也可能拿注册资本巧合误报，缺"投标报价"上下文锚定。
-4. **共有特征词信号名不副实**：文案说"罕见特征词"（`collusion.rs:73`），实现只有"≥4 字且被 ≥2 文档共用"，无任何 IDF 过滤（`compare_service.rs:766-783`）——"技术方案""项目管理"必然凑满 5 个，信号④实为**常开的 +0.1 噪声权重**。同类问题：信号③文案称"作者/修改人/制作软件一致"但实现只比 author/last_modified_by（`fingerprint.rs:12-19`），且不关联"同源的是哪几份"与其他信号指向是否一致；办公环境默认用户名（Administrator）可稳定误触发。
-5. **日期粒度误报**："2026年6月"与"2026年6月10日"互不为子集 → 兼容的粗细粒度被判 high 冲突（`fact.rs:195-208`）。
+1. 🟡 **围标权重与分级线全是未校准魔法数**：0.4/0.25/0.15/0.1 各信号权重与 0.6/0.35/0.1 分级线（`collusion.rs:26-115`）无任何标注样本或实案回测支撑。"high"是本产品最重的输出，其可信度目前只有直觉背书。
+2. ✅ **大写金额盲区**：CN_DIGITS 不含法定大写"壹贰叁肆伍陆柒捌玖拾佰仟"（`normalize.rs:91`），金额正则不识别千分位与"¥"前缀（`features.rs:110`）——"人民币壹佰万元整（¥1,000,000.00）"两种写法都抽不出实体，**事实冲突检测对最正式的报价条款失明**。chunker 测试里恰有"壹佰万元整"样例却只测了大小写（`chunker.rs:560`），未暴露此问题。
+3. ✅ **报价梯度信号取"全文最大金额"当投标价**（`compare_service.rs:641-655`）：注册资本、历史业绩合同额会劫持该值，既漏报真陪标价也可能拿注册资本巧合误报，缺"投标报价"上下文锚定。
+4. ✅ **共有特征词信号名不副实**：文案说"罕见特征词"（`collusion.rs:73`），实现只有"≥4 字且被 ≥2 文档共用"，无任何 IDF 过滤（`compare_service.rs:766-783`）——"技术方案""项目管理"必然凑满 5 个，信号④实为**常开的 +0.1 噪声权重**。同类问题：信号③文案称"作者/修改人/制作软件一致"但实现只比 author/last_modified_by（`fingerprint.rs:12-19`），且不关联"同源的是哪几份"与其他信号指向是否一致；办公环境默认用户名（Administrator）可稳定误触发。
+5. ✅ **日期粒度误报**："2026年6月"与"2026年6月10日"互不为子集 → 兼容的粗细粒度被判 high 冲突（`fact.rs:195-208`）。
 
 **S2 — 对抗鲁棒性与正确性类**
 
-6. **扫描件 PDF 静默截断 20 页**（`parse.rs:412-414`）：第 21 页起完全不参与比对且无任何警告——对"把关键差异藏在后半本"的对抗场景是实质漏洞。同族问题：OCR medium 档未就绪静默回落 small 且 parse_method 仍记 'ocr'（设计文档 §28.7 自认）。
-7. **离线承诺的缝隙**：`embed::ensure` 用 `model_cached()`（任一模型有 .onnx 即真）做下载闸门（`embed.rs:168`）——缓存了模型 A、禁联网时选未缓存的模型 B，闸门误放行触发联网尝试。
-8. **cancel 竞态可把 completed 覆写成 cancelled**：`JobManager::cancel` 的孤儿分支调用无状态守卫的 `finish`（`jobs/mod.rs:232-241`, `job_repo.rs:134-139`）；另 spawn 的 has_active 检查非原子（双击即可建重复任务，`jobs/mod.rs:183-192`）。
+6. ✅ **扫描件 PDF 静默截断 20 页**（`parse.rs:412-414`）：第 21 页起完全不参与比对且无任何警告——对"把关键差异藏在后半本"的对抗场景是实质漏洞。同族问题：OCR medium 档未就绪静默回落 small 且 parse_method 仍记 'ocr'（设计文档 §28.7 自认）。
+7. ✅ **离线承诺的缝隙**：`embed::ensure` 用 `model_cached()`（任一模型有 .onnx 即真）做下载闸门（`embed.rs:168`）——缓存了模型 A、禁联网时选未缓存的模型 B，闸门误放行触发联网尝试。
+8. ✅ **cancel 竞态可把 completed 覆写成 cancelled**：`JobManager::cancel` 的孤儿分支调用无状态守卫的 `finish`（`jobs/mod.rs:232-241`, `job_repo.rs:134-139`）；另 spawn 的 has_active 检查非原子（双击即可建重复任务，`jobs/mod.rs:183-192`）。
 
 **S3 — 安全纵深类**
 
-9. **CSP 为 null**（`tauri.conf.json:26`）：XSS 防线只剩 React 转义 + DOMPurify 一层，任何渲染库（如 docx-preview）失守即可 invoke 全部 48 个命令。且存在放大链：`export_report` 接受任意写盘路径无 scope 校验 + opener 权限 path 为 `"**"`（`capabilities/default.json:12-19`）——webview 失守时"任意路径写文件 + 任意路径交系统打开"可落地执行。
-10. **模型下载无完整性校验**（`ocr.rs:151-171` 只认 tar 内第一个 .onnx）：对结论敏感的取证工具，被投毒的模型可系统性压低相似度。
+9. ✅ **CSP 为 null**（`tauri.conf.json:26`）：XSS 防线只剩 React 转义 + DOMPurify 一层，任何渲染库（如 docx-preview）失守即可 invoke 全部 48 个命令。且存在放大链：`export_report` 接受任意写盘路径无 scope 校验 + opener 权限 path 为 `"**"`（`capabilities/default.json:12-19`）——webview 失守时"任意路径写文件 + 任意路径交系统打开"可落地执行。
+10. ✅ **模型下载无完整性校验**（`ocr.rs:151-171` 只认 tar 内第一个 .onnx）：对结论敏感的取证工具，被投毒的模型可系统性压低相似度。
 
 **S4 — 性能与可维护性类**
 
-11. **embedding 召回是 O(N²) 暴力余弦**（`candidate.rs:151-166`），无 ANN/分桶——句子级粒度 10k chunk 即 5000 万次高维余弦，是五通道里唯一没有索引结构的性能悬崖；`cohesive_split` 最坏 O(E²)（`clustering.rs:85-117`）是第二个。
-12. **candidate_edges 是只写表**：6 分数列 + 4 索引（其中 3 个无任何消费者，`migrations.rs:150-153`），却是比对事务最大写入项。
-13. **前端积债**：无键 `invalidateQueries()` 连 staleTime:Infinity 的文档 ArrayBuffer 都重取（`progressStore.ts:50`）；render 体内调 `fetchNextPage()`（`ClustersScreen.tsx:66-70`）；暗色配色未进 tokens 全仓手写三元；设置双源（localStorage 与 DB）并存只迁移了一半（`main.tsx:33-55`）；"span 当 button"+ 交互控件嵌套违反 ARIA 蔓延 10+ 文件。
-14. **发布链路缺口**：CI 只编译 macOS，Windows/Linux 首次编译验证在打 tag 时；`binaries/` 无 libpdfium.so → **Linux 永远静默走 pdf-extract 弱回落**（`parse.rs:484-492`）；BUILD.md 声称 universal 实际只产 aarch64，Intel Mac 无包。
+11. ✅ **embedding 召回是 O(N²) 暴力余弦**（`candidate.rs:151-166`），无 ANN/分桶——句子级粒度 10k chunk 即 5000 万次高维余弦，是五通道里唯一没有索引结构的性能悬崖；`cohesive_split` 最坏 O(E²)（`clustering.rs:85-117`）是第二个。
+12. 🟡 **candidate_edges 是只写表**：6 分数列 + 4 索引（其中 3 个无任何消费者，`migrations.rs:150-153`），却是比对事务最大写入项。
+13. 🟡 **前端积债**：无键 `invalidateQueries()` 连 staleTime:Infinity 的文档 ArrayBuffer 都重取（`progressStore.ts:50`）；render 体内调 `fetchNextPage()`（`ClustersScreen.tsx:66-70`）；暗色配色未进 tokens 全仓手写三元；设置双源（localStorage 与 DB）并存只迁移了一半（`main.tsx:33-55`）；"span 当 button"+ 交互控件嵌套违反 ARIA 蔓延 10+ 文件。
+14. 🟡 **发布链路缺口**：CI 只编译 macOS，Windows/Linux 首次编译验证在打 tag 时；`binaries/` 无 libpdfium.so → **Linux 永远静默走 pdf-extract 弱回落**（`parse.rs:484-492`）；BUILD.md 声称 universal 实际只产 aarch64，Intel Mac 无包。
 
 ---
 
 ## 8. 到 v1.0 的演进建议（架构视角）
+
+> **实施情况（2026-07-30，基线 v0.6.0）**：第一优先的校准集与门禁已建（M3 语料 + `corpus_regression`），
+> 权重改为语料拟合，但**语料是合成的、非真实判例**，故第 1 条仍标 🟡；金额 / 报价锚定 / 罕见度过滤 /
+> 日期粒度 / 元数据同源均已落地。第二优先全部完成（截断提示、离线闸门、状态守卫、CSP、opener 权衡见
+> SECURITY.md、模型 sha256）。第三优先：embedding 已换 SimHash LSH 分桶（非 HNSW，但性能悬崖已消），
+> `candidate_edges` 索引已精简但表仍保留。第四优先：CI 已补三平台与打包冒烟，Linux 仍按决定不构建。
+> 此外新增了本节未预见的方向：招标文件对减、入口对抗层、逐字/区段证据、商务标数值层、复核三带。
+
 
 **第一优先：让"high"结论配得上公信力（对应 S1）**
 - 建立**围标判定校准集**：收集/构造有标注的真实案例语料，把 `collusion.rs` 的五组权重与三条分级线从魔法数变成回测过的参数；现有的 calibrate_real_corpus 门禁机制是现成骨架，扩充它。
