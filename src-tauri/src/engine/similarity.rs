@@ -3,11 +3,14 @@ use jieba_rs::Jieba;
 use std::collections::HashMap;
 
 /// 中文分词，过滤标点与单字噪声。
+///
+/// jieba-rs 0.10 起 `cut` 返回 `Token`（带 byte_start/byte_end 位置）而非 `&str`，
+/// 故取 `.word`；切分结果本身与 0.7 一致（见回归门禁与语料基线，指标逐位未变）。
 pub fn tokenize(jieba: &Jieba, text: &str) -> Vec<String> {
     jieba
         .cut(text, true)
         .into_iter()
-        .map(|s| s.trim().to_string())
+        .map(|t| t.word.trim().to_string())
         .filter(|s| s.chars().count() >= 2 && s.chars().any(|c| c.is_alphanumeric()))
         .collect()
 }

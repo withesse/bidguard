@@ -96,8 +96,9 @@ pub fn char_diff(a: &str, b: &str) -> Vec<DiffOp> {
 }
 
 fn word_diff(jieba: &Jieba, a: &str, b: &str) -> Vec<DiffOp> {
-    let aw = jieba.cut(a, false);
-    let bw = jieba.cut(b, false);
+    // jieba-rs 0.10 的 cut 返回 Token；TextDiff::from_slices 要 &[&str]，故先取 .word。
+    let aw: Vec<&str> = jieba.cut(a, false).into_iter().map(|t| t.word).collect();
+    let bw: Vec<&str> = jieba.cut(b, false).into_iter().map(|t| t.word).collect();
     let diff = TextDiff::from_slices(&aw, &bw);
     let mut ops = Vec::new();
     for ch in diff.iter_all_changes() {
