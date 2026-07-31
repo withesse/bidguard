@@ -24,6 +24,9 @@ pub struct ExternalPair {
     /// 来源数据集标识（如 "pawsx-zh" / "stsb"），供报告分组与许可声明。
     #[serde(default)]
     pub source: String,
+    /// 可选子类（如样板语料的 verbatim / sibling / cross_chapter），供分档报告。
+    #[serde(default)]
+    pub subclass: String,
 }
 
 /// 把 label ≥ `pos_threshold` 视为正类（二分类度量用）。
@@ -281,6 +284,67 @@ pub fn evaluate(
     }
 }
 
+/// 单边误报探针：全负样本语料（合法共享的样板文本）在运行阈值处的误报率与分数分布。
+///
+/// 为什么不套用 ROC/PR-AUC：这类语料【没有正类】——官方范本条款在多份标书中重复出现是
+/// 合法的，不是串标证据。两侧判别指标在此无定义（AUC 回落 0.5、PR-AUC 恒 0），会把
+/// 「无正类」误读成「判别失败」。这里要回答的是另一个问题：**多大比例的合法样板会越过
+/// 阈值被标记**——即误报代价。
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FalsePositiveProbe {
+    pub source: String,
+    pub scorer: String,
+    /// 子类（verbatim / sibling / cross_chapter；"all" 为该来源汇总）。
+    pub subclass: String,
+    pub pairs_count: usize,
+    pub threshold: f32,
+    /// 分数 ≥ 阈值的对数（会被判为可疑）。
+    pub flagged: usize,
+    /// 误报率 = flagged / pairs_count。
+    pub fpr: f64,
+    pub mean_score: f64,
+    pub median_score: f64,
+    pub p90_score: f64,
+    pub max_score: f64,
+}
+
+fn quantile(sorted: &[f32], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    sorted[idx.min(sorted.len() - 1)] as f64
+}
+
+/// 汇总一组（全负样本）分数在 `threshold` 处的误报率与分布。
+pub fn false_positive_probe(
+    source: &str,
+    scorer: &str,
+    subclass: &str,
+    scores: &[f32],
+    threshold: f32,
+) -> FalsePositiveProbe {
+    let n = scores.len();
+    let flagged = scores.iter().filter(|s| **s >= threshold).count();
+    let mut sorted: Vec<f32> = scores.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mean = if n == 0 { 0.0 } else { scores.iter().map(|s| *s as f64).sum::<f64>() / n as f64 };
+    FalsePositiveProbe {
+        source: source.to_string(),
+        scorer: scorer.to_string(),
+        subclass: subclass.to_string(),
+        pairs_count: n,
+        threshold,
+        flagged,
+        fpr: if n == 0 { 0.0 } else { flagged as f64 / n as f64 },
+        mean_score: mean,
+        median_score: quantile(&sorted, 0.5),
+        p90_score: quantile(&sorted, 0.9),
+        max_score: sorted.last().copied().unwrap_or(0.0) as f64,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +447,35 @@ mod tests {
         assert_eq!(pairs[0].label, 1.0);
         assert_eq!(pairs[0].source, "pawsx-zh");
         assert_eq!(pairs[1].label, 0.0);
+    }
+
+    #[test]
+    fn false_positive_probe_counts_and_distribution() {
+        // 5 个合法样板对，3 个越过 0.7 → FPR 0.6。
+        let scores = vec![0.95f32, 0.80, 0.72, 0.40, 0.10];
+        let p = false_positive_probe("tpl", "lexical", "verbatim", &scores, 0.7);
+        assert_eq!(p.pairs_count, 5);
+        assert_eq!(p.flagged, 3);
+        assert!((p.fpr - 0.6).abs() < 1e-9);
+        assert!((p.max_score - 0.95).abs() < 1e-6);
+        assert!((p.median_score - 0.72).abs() < 1e-6);
+        assert!(p.mean_score > 0.5 && p.mean_score < 0.7);
+    }
+
+    #[test]
+    fn false_positive_probe_all_clean_is_zero() {
+        let scores = vec![0.10f32, 0.20, 0.30];
+        let p = false_positive_probe("tpl", "lexical", "cross_chapter", &scores, 0.7);
+        assert_eq!(p.flagged, 0);
+        assert_eq!(p.fpr, 0.0);
+    }
+
+    #[test]
+    fn false_positive_probe_empty_is_safe() {
+        let p = false_positive_probe("tpl", "lexical", "all", &[], 0.7);
+        assert_eq!(p.pairs_count, 0);
+        assert_eq!(p.fpr, 0.0);
+        assert_eq!(p.max_score, 0.0);
     }
 
     #[test]

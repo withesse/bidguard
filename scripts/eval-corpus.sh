@@ -12,6 +12,7 @@
 #   scripts/eval-corpus.sh fast           # 仅快档
 #   scripts/eval-corpus.sh full           # 仅慢档（需 BIDGUARD_EMBED_DIR）
 #   scripts/eval-corpus.sh external       # 仅外部真值档（词面，无需模型）
+#   scripts/eval-corpus.sh template       # 仅官方范本误报档（合法雷同，无需模型）
 #   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh fast       # 重写快档基线（改算法后）
 #   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh external   # 重写外部真值基线
 #   BIDGUARD_GT_DIR=/path/to/gt scripts/eval-corpus.sh external # 用本地非提交真值数据
@@ -46,10 +47,19 @@ run_external() {
     engine::corpusgen::tests::external_calib --nocapture
 }
 
+run_template() {
+  echo "==== 官方范本误报档（合法雷同，全负样本，无需模型）===="
+  cargo test --manifest-path "$MANIFEST" --lib --features dev-tools \
+    -- --ignored --nocapture \
+    engine::corpusgen::tests::template_fp_probe \
+    engine::corpusgen::tests::official_template_not_covered_by_builtin_library
+}
+
 case "$LANE" in
   fast) run_fast ;;
   full) run_full ;;
   external) run_external ;;
+  template) run_template ;;
   both) run_fast; run_full ;;
-  *) echo "未知参数：$LANE（应为 fast|full|external|both）" >&2; exit 2 ;;
+  *) echo "未知参数：$LANE（应为 fast|full|external|template|both）" >&2; exit 2 ;;
 esac

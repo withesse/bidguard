@@ -1,0 +1,54 @@
+[
+  {
+    "source": "ndrc2007-template",
+    "scorer": "lexical",
+    "subclass": "all",
+    "pairsCount": 132,
+    "threshold": 0.7,
+    "flagged": 41,
+    "fpr": 0.3106060606060606,
+    "meanScore": 0.40458353840266215,
+    "medianScore": 0.15345750749111176,
+    "p90Score": 1.0,
+    "maxScore": 1.0
+  },
+  {
+    "source": "ndrc2007-template",
+    "scorer": "lexical",
+    "subclass": "cross_chapter",
+    "pairsCount": 41,
+    "threshold": 0.7,
+    "flagged": 1,
+    "fpr": 0.024390243902439025,
+    "meanScore": 0.12111116545956309,
+    "medianScore": 0.09851047396659851,
+    "p90Score": 0.14639338850975037,
+    "maxScore": 0.8074387311935425
+  },
+  {
+    "source": "ndrc2007-template",
+    "scorer": "lexical",
+    "subclass": "sibling",
+    "pairsCount": 51,
+    "threshold": 0.7,
+    "flagged": 0,
+    "fpr": 0.0,
+    "meanScore": 0.16547983431932972,
+    "medianScore": 0.1410689651966095,
+    "p90Score": 0.22450606524944305,
+    "maxScore": 0.6428800821304321
+  },
+  {
+    "source": "ndrc2007-template",
+    "scorer": "lexical",
+    "subclass": "verbatim",
+    "pairsCount": 40,
+    "threshold": 0.7,
+    "flagged": 40,
+    "fpr": 1.0,
+    "meanScore": 0.9999999433755875,
+    "medianScore": 1.0,
+    "p90Score": 1.0,
+    "maxScore": 1.0
+  }
+]

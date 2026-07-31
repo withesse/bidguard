@@ -2119,6 +2119,188 @@ mod tests {
         eprintln!("[external_calib] 通过（对照 {} 个来源基线）", base.len());
     }
 
+    /// 样板误报探针（本地/慢档，#[ignore]）：读官方招标文件范本切出的【合法雷同】语料
+    /// （fixtures/corpus/template/*.jsonl），量化「多份标书照抄同一份官方范本」在默认阈值
+    /// 下的误报率。全部为负样本（合法共享 ≠ 串标），故用单边 FPR 探针而非 ROC/PR-AUC。
+    /// 对照 baseline_metrics_template_fp.json；BIDGUARD_WRITE_BASELINE=1 时写基线。
+    #[test]
+    #[ignore] // 词面档无需模型：cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools template_fp_probe -- --ignored --nocapture
+    fn template_fp_probe() {
+        use crate::engine::extcalib;
+        let jieba = Jieba::new();
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取样板语料目录 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "样板语料目录 {} 下无 *.jsonl", dir.display());
+
+        let mut probes: Vec<extcalib::FalsePositiveProbe> = Vec::new();
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f)
+                .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
+            if pairs.is_empty() {
+                continue;
+            }
+            assert!(
+                pairs.iter().all(|p| p.label == 0.0),
+                "{} 应全为负样本（合法共享的样板文本）",
+                f.display()
+            );
+            let source = pairs[0].source.clone();
+            let scored = score_external_pairs(&jieba, &pairs, |_, _| None);
+            // 汇总 + 按子类分档
+            let all: Vec<f32> = scored.iter().map(|(s, _)| *s).collect();
+            probes.push(extcalib::false_positive_probe(
+                &source,
+                "lexical",
+                "all",
+                &all,
+                REGRESSION_THRESHOLD,
+            ));
+            let mut subs: BTreeSet<String> =
+                pairs.iter().map(|p| p.subclass.clone()).filter(|s| !s.is_empty()).collect();
+            for sub in subs.iter() {
+                let v: Vec<f32> = scored
+                    .iter()
+                    .zip(&pairs)
+                    .filter(|(_, p)| &p.subclass == sub)
+                    .map(|((s, _), _)| *s)
+                    .collect();
+                probes.push(extcalib::false_positive_probe(
+                    &source,
+                    "lexical",
+                    sub,
+                    &v,
+                    REGRESSION_THRESHOLD,
+                ));
+            }
+            subs.clear();
+        }
+        probes.sort_by(|a, b| (a.source.as_str(), a.subclass.as_str()).cmp(&(&b.source, &b.subclass)));
+
+        let mut table = String::from(
+            "官方范本「合法雷同」误报探针（词面 score_pair 档；阈值 0.7；全部为负样本）\n",
+        );
+        table.push_str(&format!(
+            "{:<22} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "source", "subclass", "n", "flagged", "FPR", "mean", "median", "p90", "max"
+        ));
+        for p in &probes {
+            table.push_str(&format!(
+                "{:<22} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
+                p.source, p.subclass, p.pairs_count, p.flagged, p.fpr, p.mean_score,
+                p.median_score, p.p90_score, p.max_score
+            ));
+        }
+        eprintln!("{table}");
+
+        let baseline_path = corpus_dir().join("baseline_metrics_template_fp.json");
+        if baseline_write_mode() {
+            let body = serde_json::to_string_pretty(&probes).expect("serialize fp probes");
+            std::fs::write(&baseline_path, format!("{body}\n"))
+                .unwrap_or_else(|e| panic!("写样板基线 {} 失败: {e}", baseline_path.display()));
+            eprintln!("[template_fp_probe] 已写入基线 → {}", baseline_path.display());
+            return;
+        }
+        let raw = match std::fs::read_to_string(&baseline_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "[template_fp_probe] 无基线（{}）；仅打印报告。首次固化：BIDGUARD_WRITE_BASELINE=1 cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools template_fp_probe -- --ignored",
+                    baseline_path.display()
+                );
+                return;
+            }
+        };
+        let base: Vec<extcalib::FalsePositiveProbe> =
+            serde_json::from_str(&raw).expect("解析 baseline_metrics_template_fp.json");
+        // 门禁：误报率单向上升即失败（合法样板被误标的比例不得恶化）。
+        const FPR_TOL: f64 = 0.03;
+        let by_key: BTreeMap<(&str, &str), &extcalib::FalsePositiveProbe> =
+            base.iter().map(|p| ((p.source.as_str(), p.subclass.as_str()), p)).collect();
+        let mut failures = Vec::new();
+        for c in &probes {
+            let Some(b) = by_key.get(&(c.source.as_str(), c.subclass.as_str())) else {
+                failures.push(format!(
+                    "[{}/{}] 基线缺此分档（新增语料需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
+                    c.source, c.subclass
+                ));
+                continue;
+            };
+            if c.fpr > b.fpr + FPR_TOL {
+                failures.push(format!(
+                    "[{}/{}] 误报率升 {:.3}→{:.3}（容差 {FPR_TOL}）",
+                    c.source, c.subclass, b.fpr, c.fpr
+                ));
+            }
+        }
+        if !failures.is_empty() {
+            panic!("样板误报门禁失败（{} 项）：\n{}\n{table}", failures.len(), failures.join("\n"));
+        }
+        eprintln!("[template_fp_probe] 通过（对照 {} 个分档基线）", base.len());
+    }
+
+    /// 官方范本条款【不被】内置模板库覆盖——解释 template_fp_probe 里 verbatim 档 FPR=1.0
+    /// 的成因，并把它钉成可执行结论。
+    ///
+    /// 生产确有模板抑制：chunker 用词频余弦 ≥ TEMPLATE_MATCH(0.7) 比对 source_templates，
+    /// 命中即标 is_template，compare 侧按 ignore_templates 在召回前剔除
+    /// （compare_service.rs `keep_template`）。但内置库只有 3 条泛用短句（法律法规引用 /
+    /// 资质证书目录 / 标准售后承诺，migrations SEED_TEMPLATES_V2），而发改委《标准施工招标
+    /// 文件》这类【全国强制适用】的范本条款不在其中——故这些逐字照抄的合法样板无法被抑制，
+    /// 会一路走到评分层拿满分。结论：模板库需补入官方标准条款，否则样板雷同必然误报。
+    #[test]
+    #[ignore] // 与 template_fp_probe 同档（读 fixtures/corpus/template）：cargo test --features dev-tools official_template_not_covered_by_builtin_library -- --ignored --nocapture
+    fn official_template_not_covered_by_builtin_library() {
+        use crate::engine::extcalib;
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7; // 对齐 chunker::TEMPLATE_MATCH
+        // 内置库三条（migrations::SEED_TEMPLATES_V2 原文）
+        let builtin = [
+            "根据《中华人民共和国招标投标法》及其实施条例，以及《中华人民共和国政府采购法》的相关规定，本项目严格遵循公开、公平、公正和诚实信用的原则组织实施。",
+            "投标人具备独立法人资格，持有有效的营业执照、税务登记证及与本项目相适应的行业资质证书与质量管理体系认证，所有证照均在有效期内。",
+            "我方承诺提供 7×24 小时技术支持服务，质保期内免费维护，接到故障报修后及时响应并在约定时限内解决，确保系统稳定运行。",
+        ];
+        let jieba = Jieba::new();
+        let tpl_tokens: Vec<Vec<String>> =
+            builtin.iter().map(|t| tokenize_lang(&jieba, t, "auto")).collect();
+
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        let mut checked = 0usize;
+        let mut covered = 0usize;
+        let mut best_overall = 0.0f32;
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f).expect("读取样板语料");
+            for p in &pairs {
+                let toks = tokenize_lang(&jieba, &p.text_a, "auto");
+                let best =
+                    tpl_tokens.iter().map(|t| cosine(&toks, t)).fold(0.0f32, f32::max);
+                best_overall = best_overall.max(best);
+                checked += 1;
+                if best >= TEMPLATE_MATCH {
+                    covered += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[official_template_not_covered] 检查 {checked} 条官方范本条款：被内置库命中 {covered} 条；最高余弦 {best_overall:.3}（阈值 {TEMPLATE_MATCH}）"
+        );
+        assert!(checked > 0, "样板语料为空");
+        assert_eq!(
+            covered, 0,
+            "内置模板库已能覆盖官方范本条款（命中 {covered}/{checked}）——若已补入官方条款，请更新本测试与 template_fp_probe 基线"
+        );
+    }
+
     /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。
     /// 打印含语义的分层全表；有 baseline_metrics_full.json 时对照门禁，否则仅速览。
     /// 围标层 AUC 仍走无模型层（取证信号为主，语义对其影响可忽略）。
