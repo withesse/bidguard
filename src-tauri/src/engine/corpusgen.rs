@@ -2440,7 +2440,7 @@ mod tests {
 
         // 从迁移常量里取 V16 实际入库的样板文本（与生产同源，避免测试与迁移各写一份）
         let seeds = crate::db::migrations::official_seed_texts();
-        assert_eq!(seeds.len(), 8, "V16 的 6 条施工表单 + V17 的 2 条货物/服务投标函");
+        assert_eq!(seeds.len(), 9, "V16 六条施工表单 + V17 两条货物/服务投标函 + V18 北京授权委托书");
         let seed_tokens: Vec<Vec<String>> =
             seeds.iter().map(|(_, t)| tokenize_lang(&jieba, t, "auto")).collect();
 
@@ -2458,9 +2458,15 @@ mod tests {
             .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
             .collect();
         files.sort();
+        // 只检「正文条款」档：regional_variant 装的是官方表单本身，被样板命中是预期行为
+        // （那正是抑制该起作用的地方），不属于误压。
+        const BODY_SUBCLASSES: [&str; 3] = ["verbatim", "sibling", "cross_chapter"];
         let (mut checked, mut suppressed, mut worst) = (0usize, Vec::new(), 0.0f32);
         for f in &files {
             for p in extcalib::read_external_pairs(f).expect("读取样板语料") {
+                if !BODY_SUBCLASSES.contains(&p.subclass.as_str()) {
+                    continue;
+                }
                 let toks = tokenize_lang(&jieba, &p.text_a, "auto");
                 let (mut best, mut best_id) = (0.0f32, "");
                 for ((id, _), st) in seeds.iter().zip(&seed_tokens) {
@@ -2473,7 +2479,9 @@ mod tests {
                 worst = worst.max(best);
                 checked += 1;
                 if best >= TEMPLATE_MATCH {
-                    suppressed.push(format!("{best_id} ⟵ {:.3} ⟵ {}", best, &p.text_a[..60.min(p.text_a.len())]));
+                    // 按字符而非字节截断：中文一字多字节，字节切片会落在字中间 panic
+                    let head: String = p.text_a.chars().take(60).collect();
+                    suppressed.push(format!("{best_id} ⟵ {best:.3} ⟵ {head}"));
                 }
             }
         }
@@ -2538,6 +2546,69 @@ mod tests {
             "以下语域未被现有样板覆盖，需在迁移中补收该域投标函：\n{}",
             misses.join("\n")
         );
+    }
+
+    /// 地区变体的抑制覆盖：只收了发改委版样板，外地范本（北京2025 / 浙江2023）的同名表单
+    /// 是否也能被抑制？
+    ///
+    /// 这是实务上最要紧的问题：全国范本被各省市改编后同名表单开头结尾常一字不差、中段按
+    /// 地方规则增删（如北京授权委托书加"参加开标会""身份证号"）。两地投标人各用本地范本，
+    /// 产出的样板必然近重复却绝非串标。若只有发改委版能被抑制，跨省项目仍会误报。
+    ///
+    /// 本测试**不做硬断言**而是打印覆盖情况：变体覆盖与否是选型信息（要不要逐地区补样板），
+    /// 不是对错——真断言留给 official_seed_templates（不误压正文）与 cover_all_domains（语域覆盖）。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools regional_variant_suppression -- --ignored --nocapture
+    fn regional_variant_suppression_coverage() {
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7;
+        let path = corpus_dir().join("template/regional-forms.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+        // {表单类型: {地区: 正文}}
+        let forms: BTreeMap<String, BTreeMap<String, String>> =
+            serde_json::from_str(&raw).expect("解析 regional-forms.json");
+
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let seed_tokens: Vec<(String, Vec<String>)> =
+            seeds.iter().map(|(id, t)| (id.clone(), tokenize_lang(&jieba, t, "auto"))).collect();
+
+        eprintln!("地区变体被现有（发改委版）样板抑制的情况，阈值 {TEMPLATE_MATCH}：");
+        let (mut covered, mut total) = (0usize, 0usize);
+        for (kind, byreg) in &forms {
+            for (region, text) in byreg {
+                let toks = tokenize_lang(&jieba, text, "auto");
+                let (mut best, mut who) = (0.0f32, "");
+                for (id, st) in &seed_tokens {
+                    let c = cosine(&toks, st);
+                    if c > best {
+                        best = c;
+                        who = id;
+                    }
+                }
+                total += 1;
+                let hit = best >= TEMPLATE_MATCH;
+                if hit {
+                    covered += 1;
+                }
+                eprintln!(
+                    "  {kind:<11} {region:<13} {:.3} {} {}",
+                    best,
+                    if hit { "✓抑制" } else { "✗漏网" },
+                    who
+                );
+            }
+        }
+        eprintln!("  合计 {covered}/{total} 被抑制");
+        // 发改委版自身必须被抑制（否则 V16/V17 的收录本身出了问题）
+        for (kind, byreg) in &forms {
+            if let Some(text) = byreg.get("ndrc2007") {
+                let toks = tokenize_lang(&jieba, text, "auto");
+                let best = seed_tokens.iter().map(|(_, st)| cosine(&toks, st)).fold(0.0f32, f32::max);
+                assert!(best >= TEMPLATE_MATCH, "[{kind}] 发改委版自身应被抑制，实测 {best:.3}");
+            }
+        }
     }
 
     /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。

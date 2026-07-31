@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     DOCUMENT_IMAGES_V15,
     OFFICIAL_TEMPLATES_V16,
     OFFICIAL_TEMPLATES_V17,
+    OFFICIAL_TEMPLATES_V18,
 ];
 
 pub fn run(conn: &mut Connection) -> AppResult<()> {
@@ -422,6 +423,21 @@ INSERT OR IGNORE INTO source_templates (id, name, text, enabled, category, creat
 ('t-ndrc17-bidletter-survey', '投标函·工程服务（发改委范本）', '我方已仔细研究了（项目名称）勘察招标项目招标文件的全部内容，愿意以人民币（大写）（¥）的投标总报价（其中，增值税税 率为），勘察服务期限：日历天，按合同约定完成勘察工作。2. 我方的投标文件包括下列内容：（1）投标函及投标函附录；（2）法定代表人身份证明或授权委托书；（3）联合体协议书（如有）；（4）投标保证金（如有）；（5）勘察费用清单；（6）资格审查资料；（7）勘察纲要；…… 投标文件的上述组成部分如存在内容不一致的，以投标函为准。3．我方承诺在招标文件规定的投标有效期内不撤销投标文件。4．如我方中标，我方承诺：（1）在收到中标通知书后，在中标通知书规定的期限内与你方签订合同；（2）在签订合同时不向你方提出附加条件；（3）按照招标文件要求提交履约保证金；（4）在合同约定的期限内完成合同规定的全部义务。5．我方在此声明，所递交的投标文件及有关资料内容完整、真实和准确，且不存在第二章 “投标人须知”第 1.4.3 项规定的任何一种情形。6．（其他补充说明）。', 1, '投标文件格式', '2026-07-31T00:00:00Z');
 ";
 
+// V18：补北京 2025 版授权委托书——短表单的地区变体会掉出阈值。
+// 实测（regional_variant_suppression_coverage）：全国范本被各地改编后，长表单仍能被发改委版
+// 样板抑制（联合体协议书：北京 0.843 / 浙江 0.863），但**短表单不行**——北京版授权委托书
+// 仅 0.678，差 0.022 卡在 TEMPLATE_MATCH(0.7) 之下。原因是该表单仅百余字，token 量小，
+// 北京按地方规则增加的"参加开标会/身份证号/其他事项"就足以把余弦推下阈值。
+//
+// 选择补样板而非调低阈值：阈值是全局的，调低会让所有文本更容易被判为样板，
+// 即全局增加**漏报**；补一条样板的代价仅是每个分块多一次余弦。
+// 一般规律（供后续补收参考）：长表单跨地区可复用一条，短表单需按地区各收。
+const OFFICIAL_TEMPLATES_V18: &str = "
+INSERT OR IGNORE INTO source_templates (id, name, text, enabled, category, created_at) VALUES
+('t-bj2025-poa', '授权委托书·北京2025（地区变体）', '（投标人名称）的法定代表人，现委托我单位（姓名）身份证号：为我方代理人。代理人根据授权，就（工程 名称）以我方名义参加开标会、签署开标记录和下文载明的其他事项，其法律后果由我方承 担。其他事项：。委托期限：。代理人无转委托权。', 1, '投标文件格式', '2026-07-31T00:00:00Z');
+";
+
+
 
 
 /// V16 官方表单样板的 (id, text)，从迁移 SQL 现解析而来。
@@ -431,10 +447,10 @@ INSERT OR IGNORE INTO source_templates (id, name, text, enabled, category, creat
 #[cfg(any(test, feature = "dev-tools"))]
 pub fn official_seed_texts() -> Vec<(String, String)> {
     // 行形如：('id', 'name', 'text', 1, 'category', 'ts'),
-    [OFFICIAL_TEMPLATES_V16, OFFICIAL_TEMPLATES_V17]
+    [OFFICIAL_TEMPLATES_V16, OFFICIAL_TEMPLATES_V17, OFFICIAL_TEMPLATES_V18]
         .concat()
         .lines()
-        .filter(|l| l.trim_start().starts_with("('t-ndrc"))
+        .filter(|l| l.trim_start().starts_with("('t-"))
         .filter_map(|l| {
             // 按未转义的单引号切分：SQL 里内嵌单引号写作 '' ，这里先还原再取字段
             let cells: Vec<&str> = l.split('\'').collect();
@@ -479,15 +495,15 @@ mod tests {
         let tpl: i64 = conn
             .query_row("SELECT COUNT(*) FROM source_templates WHERE enabled = 1", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(tpl, 11, "3 条默认模板 + V16 的 6 条施工表单 + V17 的 2 条货物/服务投标函");
+        assert_eq!(tpl, 12, "3 条默认模板 + V16 的 6 条施工表单 + V17 的 2 条货物/服务投标函");
         let official: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM source_templates WHERE id LIKE 't-ndrc%' AND enabled = 1",
+                "SELECT COUNT(*) FROM source_templates WHERE id NOT IN ('t-law','t-qual','t-after') AND enabled = 1",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(official, 8, "V16 补 6 条 + V17 补 2 条");
+        assert_eq!(official, 9, "V16 补 6 条 + V17 补 2 条");
     }
 
     /// V16 可叠加到「已有 V15 的老库」上，且幂等（INSERT OR IGNORE）。
@@ -511,7 +527,7 @@ mod tests {
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM source_templates", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(after, 11, "升级后补齐官方表单");
+        assert_eq!(after, 12, "升级后补齐官方表单");
         // 分类与内容非空（前端按 category 分组展示）
         let cat: String = conn
             .query_row(
@@ -525,7 +541,7 @@ mod tests {
         let again: i64 = conn
             .query_row("SELECT COUNT(*) FROM source_templates", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(again, 11, "重跑不重复插入");
+        assert_eq!(again, 12, "重跑不重复插入");
     }
 
     #[test]
