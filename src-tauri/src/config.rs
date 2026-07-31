@@ -22,10 +22,26 @@ pub struct CompareDefaults {
     pub detect_moved_paragraph: bool,
     pub scope: String, // full | tech | business（比对范围，BidGuard 扩展项）
     pub ignore_templates: bool, // 剔除查重源模板段落（BidGuard 扩展项）
+    /// 剔除招标文件内容（W3-2 招标对减）：工作区存在招标/补遗文档时，识别投标对招标条款的
+    /// 合法逐字应答并从残差比对中剥离；风险分级与围标信号采用剔除后口径。默认开。
+    pub subtract_tender: bool,
+    /// 商务标数值层（W5-1，M6）：识别报价清单表、跨文档行对齐并落库为数值证据。
+    /// 无清单表（纯技术标/扫描件 PDF）时自然空转。默认开。
+    pub enable_numeric: bool,
+    /// 逐项单价雷同率告警线（W5-2，M6）。默认 0.80——参照地方（青岛/贵州等）雷同认定口径，
+    /// 但该口径原文针对「电子投标文件相同内容占比」，此处落到「逐项单价相同率」，
+    /// 故仅作告警提示，不作串通认定（§1.5 产品纪律）。可配（0.5–1.0）。
+    pub identical_rate_alarm: f64,
     /// 分词语言：auto（按 CJK 占比逐块判定）| zh（恒 jieba）| en（恒单词切分）。
     pub language: String,
     /// 语义模型：bge-zh（默认）| bge-large-zh | e5-large | e5-small | e5-base（见 engine::embed::MODELS）。
     pub embedding_model: String,
+    /// cross-encoder 复核带（W6-2，M7）：对 uncertain 簇产出【复核建议分】用于排序复核队列。
+    /// 【默认关闭】：模型需按需下载（默认档 int8 ~300MB）且每簇推理有明显延迟；它只影响
+    /// 复核顺序、不改判分类（§1.5-3），因此不该是默认成本。
+    pub enable_rerank: bool,
+    /// 复核模型：bge-reranker-base-int8（默认）| bge-reranker-v2-m3（见 engine::rerank::RERANK_MODELS）。
+    pub rerank_model: String,
 }
 
 impl Default for CompareDefaults {
@@ -42,8 +58,13 @@ impl Default for CompareDefaults {
             detect_moved_paragraph: true,
             scope: "full".into(),
             ignore_templates: true,
+            subtract_tender: true,
+            enable_numeric: true,
+            identical_rate_alarm: 0.80,
             language: "auto".into(),
             embedding_model: "bge-zh".into(),
+            enable_rerank: false,
+            rerank_model: "bge-reranker-base-int8".into(),
         }
     }
 }
@@ -60,6 +81,10 @@ pub struct ParserDefaults {
     /// 扫描件/图片 OCR 档位（PP-OCRv6 tiny/small/medium）。
     pub ocr_model: String,
     pub min_paragraph_length: usize,
+    /// PDF 渲染-OCR 抽样交叉验证（字体重映射/坐标乱序检出，W2-4）。
+    /// 本版本仅预置配置键并计入导入配置指纹——执行方案全局裁决 1 要求 options_hash
+    /// 只 bump 一次（v5→v6），键先带默认值入哈希，交叉验证行为在 M2 实现。
+    pub pdf_cross_check: bool,
 }
 
 impl Default for ParserDefaults {
@@ -71,6 +96,7 @@ impl Default for ParserDefaults {
             ocr_docx_images: true,
             ocr_model: "v6-small".into(),
             min_paragraph_length: 10,
+            pdf_cross_check: true,
         }
     }
 }
@@ -165,6 +191,7 @@ mod tests {
         assert!(!c.compare.enable_semantic);
         assert!(c.compare.enable_fact_conflict);
         assert_eq!(c.parser.min_paragraph_length, 10);
+        assert!(c.parser.pdf_cross_check, "W2-4 预置键默认开启（行为 M2 实现）");
         assert_eq!(c.export.default_format, "html");
         assert!(!c.security.allow_cloud_model);
     }

@@ -2,7 +2,7 @@
 // 资源管理动作（与「设置」的偏好分开）：让 OCR/语义模型从「写死摸黑」变「可见可管」。
 use super::conn;
 use crate::db::repo::embedding_repo;
-use crate::engine::{embed, ocr};
+use crate::engine::{embed, ocr, rerank};
 use crate::error::{AppError, AppErrorCode, AppResult};
 use crate::state::AppState;
 use serde::Serialize;
@@ -17,6 +17,18 @@ pub struct EmbedModelStatus {
     pub size_bytes: u64,
 }
 
+/// 复核模型（cross-encoder，W6-2）的本地状态。size_label 是【标称】体积（未下载时也要能
+/// 告诉用户要占多少盘），size_bytes 是【实测】占用（未就绪为 0）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RerankModelStatus {
+    pub key: String,
+    pub label: String,
+    pub size_label: String,
+    pub cached: bool,
+    pub size_bytes: u64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
@@ -24,9 +36,11 @@ pub struct ModelStatus {
     pub ocr_location: Option<String>,
     pub embed_cache_dir: Option<String>,
     pub embedding_models: Vec<EmbedModelStatus>,
+    pub rerank_cache_dir: Option<String>,
+    pub rerank_models: Vec<RerankModelStatus>,
 }
 
-/// OCR 与各语义模型的本地状态（工具屏「模型管理」）。
+/// OCR / 语义 / 复核模型的本地状态（工具屏「模型管理」）。
 #[tauri::command]
 pub async fn get_model_status() -> AppResult<ModelStatus> {
     Ok(ModelStatus {
@@ -42,7 +56,47 @@ pub async fn get_model_status() -> AppResult<ModelStatus> {
                 size_bytes: embed::model_cache_bytes(m),
             })
             .collect(),
+        rerank_cache_dir: rerank::cache_dir_path().map(|p| p.to_string_lossy().into_owned()),
+        rerank_models: rerank::RERANK_MODELS
+            .iter()
+            .map(|m| RerankModelStatus {
+                key: m.key.to_string(),
+                label: m.label.to_string(),
+                size_label: m.size_label.to_string(),
+                cached: rerank::model_cached_for(m),
+                size_bytes: rerank::model_cache_bytes(m),
+            })
+            .collect(),
     })
+}
+
+/// 预热下载某复核模型（工具屏显式发起 = 授权联网）。有自托管源先拉本地（带 sha256 校验），
+/// 否则回落 HF。与语义模型不同【不做加载预热】：复核模型不常驻（8GB 机型串行加载纪律），
+/// 预热加载只会白占几百 MB 内存。
+#[tauri::command]
+pub async fn download_reranker_model(model_key: String) -> AppResult<u64> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let spec = rerank::resolve(&model_key);
+        if spec.download_url.is_some() {
+            return rerank::download_model(spec).map_err(|e| {
+                AppError::new(AppErrorCode::CompareFailed, "复核模型下载失败").with_detail(e)
+            });
+        }
+        // 无自托管源：走 HF 回落，由 fastembed 拉到 ~/.cache/bidguard/fastembed
+        let mut slot: rerank::LoadedReranker = None;
+        rerank::ensure(&mut slot, spec, true).ok_or_else(|| {
+            AppError::new(AppErrorCode::CompareFailed, "复核模型下载/加载失败（检查网络或磁盘）")
+        })?;
+        Ok(rerank::model_cache_bytes(spec))
+    })
+    .await
+    .map_err(|e| AppError::new(AppErrorCode::Unknown, "下载任务失败").with_detail(e.to_string()))?
+}
+
+/// 删除某复核模型的本地缓存。返回释放字节数。
+#[tauri::command]
+pub async fn clear_reranker_model(model_key: String) -> AppResult<u64> {
+    Ok(rerank::clear_model_cache(rerank::resolve(&model_key)))
 }
 
 /// 预热下载某语义模型（直接阻塞命令，前端转圈等待）。

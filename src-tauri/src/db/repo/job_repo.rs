@@ -154,7 +154,9 @@ pub fn finish(
     Ok(())
 }
 
-/// 比对聚合结果落库（五个 JSON 列，总览/矩阵/围标/共有词/章节热力）。
+/// 比对聚合结果落库（六个 JSON 列，总览/矩阵/围标/共有词/章节热力/商务标数值）。
+/// numeric_json 为 None 时写 NULL（数值层关闭或全无清单表——前端据此隐藏数值面板）。
+#[allow(clippy::too_many_arguments)] // 结果列的固有集合（六个 JSON 列一次落库），拆结构体无收益
 pub fn set_compare_results(
     conn: &rusqlite::Connection,
     id: &str,
@@ -163,11 +165,20 @@ pub fn set_compare_results(
     collusion_json: &str,
     shared_terms_json: &str,
     sections_json: &str,
+    numeric_json: Option<&str>,
 ) -> AppResult<()> {
     conn.execute(
         "UPDATE jobs SET summary_json = ?2, matrix_json = ?3, collusion_json = ?4,
-         shared_terms_json = ?5, sections_json = ?6 WHERE id = ?1",
-        params![id, summary_json, matrix_json, collusion_json, shared_terms_json, sections_json],
+         shared_terms_json = ?5, sections_json = ?6, numeric_json = ?7 WHERE id = ?1",
+        params![
+            id,
+            summary_json,
+            matrix_json,
+            collusion_json,
+            shared_terms_json,
+            sections_json,
+            numeric_json
+        ],
     )?;
     Ok(())
 }
@@ -180,12 +191,14 @@ pub struct JobResultJsons {
     pub collusion_json: Option<String>,
     pub shared_terms_json: Option<String>,
     pub sections_json: Option<String>,
+    /// 商务标数值证据（W5-2，M6）；旧任务/无清单表为 None。
+    pub numeric_json: Option<String>,
 }
 
 pub fn get_result_jsons(conn: &rusqlite::Connection, id: &str) -> AppResult<JobResultJsons> {
     conn.query_row(
-        "SELECT summary_json, matrix_json, collusion_json, shared_terms_json, sections_json
-         FROM jobs WHERE id = ?1",
+        "SELECT summary_json, matrix_json, collusion_json, shared_terms_json, sections_json,
+         numeric_json FROM jobs WHERE id = ?1",
         [id],
         |r| {
             Ok(JobResultJsons {
@@ -194,6 +207,7 @@ pub fn get_result_jsons(conn: &rusqlite::Connection, id: &str) -> AppResult<JobR
                 collusion_json: r.get(2)?,
                 shared_terms_json: r.get(3)?,
                 sections_json: r.get(4)?,
+                numeric_json: r.get(5)?,
             })
         },
     )

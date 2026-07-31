@@ -7,10 +7,16 @@ mod engine;
 pub mod error;
 mod export;
 pub mod jobs;
+pub mod license;
 pub mod services;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
+
+// dev-tools/测试专用：合成对抗语料生成器（供 bin/corpusgen.rs 与回归 harness 调用）。
+// 门控与 engine::corpusgen 一致，不进发布二进制。
+#[cfg(any(test, feature = "dev-tools"))]
+pub use engine::corpusgen;
 
 use tauri::Manager;
 
@@ -74,7 +80,9 @@ pub fn run() {
                 }
                 Err(e) => log::error!("启动清理取连接失败：{e}"),
             }
-            app.manage(state::AppState::new(pool));
+            // 授权装载：指纹 + 状态双写读取 + 已装许可验签 + 启动次数对账（进程被杀致未退款的补退）
+            let license = std::sync::Arc::new(license::LicenseManager::load(&base, &pool));
+            app.manage(state::AppState::new(pool, license));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -106,7 +114,13 @@ pub fn run() {
             commands::compare::list_clusters,
             commands::compare::get_cluster_detail,
             commands::compare::set_cluster_review_status,
+            commands::compare::list_aligned_segments,
+            commands::compare::get_segment_detail,
+            commands::compare::get_cluster_segments,
             commands::compare::get_pair_detail,
+            commands::license::get_license_status,
+            commands::license::get_machine_code,
+            commands::license::import_license,
             commands::settings::get_app_settings,
             commands::settings::set_app_settings,
             commands::settings::get_app_info,
@@ -120,6 +134,8 @@ pub fn run() {
             commands::tools::get_model_status,
             commands::tools::download_embedding_model,
             commands::tools::clear_embedding_model,
+            commands::tools::download_reranker_model,
+            commands::tools::clear_reranker_model,
             commands::tools::download_ocr_model,
             commands::tools::clear_ocr_model,
             commands::tools::get_storage_info,

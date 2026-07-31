@@ -12,6 +12,33 @@ export interface Fingerprint {
   revision: string | null;
   totalEditMinutes: number | null;
   riskFlags: string[];
+  // —— M1 取证扩展（可选：旧任务的 fingerprint_json 无这些字段）——
+  /** w:rsids 修订会话标识（去重、大写归一） */
+  rsids?: string[];
+  /** w:rsidRoot：相同即高度指示派生自同一母文件 */
+  rsidRoot?: string | null;
+  /** docProps/app.xml Template 模板名 */
+  templateName?: string | null;
+  /** zip 条目序列 sha256（同一生成工具/打包管线稳定一致） */
+  zipEntryFp?: string | null;
+  zipEntryCount?: number | null;
+  // —— M1 PDF 血缘取证 ——
+  /** PDF trailer /ID 首半（hex）：创建时生成、再保存不变的血缘键 */
+  pdfIdFirst?: string | null;
+  /** PDF trailer /ID 次半（hex）：每次保存变化，供人工核对 */
+  pdfIdSecond?: string | null;
+  /** XMP xmpMM:DocumentID 文档 GUID */
+  xmpDocumentId?: string | null;
+  /** XMP xmpMM:InstanceID 保存实例 GUID */
+  xmpInstanceId?: string | null;
+  /** XMP xmpMM:DerivedFrom → 母文件 GUID */
+  xmpDerivedFrom?: string | null;
+  /** XMP xmp:CreatorTool 生成工具 */
+  creatorTool?: string | null;
+  /** 逐页 BaseFont 全集（去重排序） */
+  pdfFonts?: string[];
+  /** 子集内嵌字体标签（如 ABCDEF+SimSun） */
+  fontSubsetTags?: string[];
 }
 
 export interface DiffOp {
@@ -20,7 +47,9 @@ export interface DiffOp {
 }
 
 export interface CollusionSignal {
-  kind: string; // similarity | cluster | metadata | sharedTerms | facts
+  // similarity | cluster | metadata | sharedTerms | facts
+  // | rsid | pdfLineage | imageReuse | sharedErrors（M1 取证）| evasion（M2 规避）
+  kind: string;
   detail: string;
   weight: number;
 }
