@@ -1,0 +1,19 @@
+[
+  {
+    "source": "pawsx-zh",
+    "scorer": "lexical",
+    "pairsCount": 300,
+    "positives": 123,
+    "negatives": 177,
+    "rocAuc": 0.5755362638372147,
+    "prAuc": 0.4966609614783187,
+    "threshold": 0.7,
+    "precisionAt": 0.4766355140186916,
+    "recallAt": 0.4146341463414634,
+    "f1At": 0.4434782608695652,
+    "bestThreshold": 0.12046018,
+    "bestF1": 0.5913461538461537,
+    "ece": 0.2314232841382424,
+    "spearman": 0.1286967214382138
+  }
+]

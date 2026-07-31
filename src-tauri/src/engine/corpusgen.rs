@@ -1307,6 +1307,44 @@ where
     (recall_rate, recall_by_label, labels, macro_f1)
 }
 
+/// 外部真值语料的连续分打分：复用生产打分口径（regr_build_chunk → 全语料 IDF →
+/// score_pair 取连续 final_score），返回 (final_score, 归一化真值 label) 序列，供
+/// extcalib 出 P-R/ROC/校准指标。词面档传 `|_, _| None`；语义档传返回余弦的闭包。
+///
+/// 注意：外部为裸句对，无 section_path / rel_pos 上下文 → structure 维恒 None、order 维恒
+/// 1.0。对 ROC/PR/Spearman 等排序指标无碍（常量项不改排序），但会系统性抬高绝对分，故
+/// 阈值处 P/R/F1 与 ECE 带此偏移，解读时须知（这也正是「裸句对 vs 章节块」的口径差异）。
+pub fn score_external_pairs<F>(
+    jieba: &Jieba,
+    pairs: &[crate::engine::extcalib::ExternalPair],
+    mut sem_provider: F,
+) -> Vec<(f32, f32)>
+where
+    F: FnMut(&str, &str) -> Option<f32>,
+{
+    // 先建齐全部句对两侧分块，再用【全语料 IDF】填 TF-IDF——与 pair_stats 同口径，
+    // 避免逐对局部 IDF 让 lexical 与 char_ngram 退化为近似同一信号。
+    let mut built: Vec<(CmpChunk, CmpChunk, Option<f32>, f32)> = Vec::with_capacity(pairs.len());
+    for (i, r) in pairs.iter().enumerate() {
+        let sem = sem_provider(&r.text_a, &r.text_b);
+        let a = regr_build_chunk(jieba, format!("ext{i}-a"), 0, 0.0, &r.text_a, Vec::new());
+        let b = regr_build_chunk(jieba, format!("ext{i}-b"), 1, 0.0, &r.text_b, Vec::new());
+        built.push((a, b, sem, r.label));
+    }
+    let idf = {
+        let lists = built.iter().flat_map(|(a, b, _, _)| [a.tokens.as_slice(), b.tokens.as_slice()]);
+        features::idf_of(lists)
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    for (a, b, sem, label) in built.iter_mut() {
+        a.tfidf = features::weighted_vec(&a.tokens, &idf);
+        b.tfidf = features::weighted_vec(&b.tokens, &idf);
+        let parts = scoring::score_pair(a, b, *sem);
+        out.push((parts.final_score, *label));
+    }
+    out
+}
+
 /// 文档级隐形码点摘要（无 M2 全管线，用 sanitize_with_stats 逐文档聚合后交 grade 判级）。
 fn regr_evasion(text: &str) -> Option<EvasionSummary> {
     let (_, st) = crate::engine::normalize::sanitize_with_stats(text);
@@ -1428,7 +1466,8 @@ fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
 }
 
 /// Mann-Whitney U（含并列平均秩）→ AUC；任一侧为空回落 0.5。
-fn auc_score(pos: &[f64], neg: &[f64]) -> f64 {
+/// pub(crate)：extcalib 的 ROC-AUC 复用同一实现，避免重复。
+pub(crate) fn auc_score(pos: &[f64], neg: &[f64]) -> f64 {
     if pos.is_empty() || neg.is_empty() {
         return 0.5;
     }
@@ -1952,6 +1991,132 @@ mod tests {
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "召回率不降不触发");
         assert!(!gate_failures(&base, &mk(0.90, 1.00, 0.95)).is_empty(), "AUC 降 0.05 触发");
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "AUC 不降不触发");
+    }
+
+    // —— 外部真值相似度校准（打破合成同源循环）——
+
+    /// 外部标注语料目录：BIDGUARD_GT_DIR override（本地非提交数据）优先，否则仓库
+    /// committed fixtures/corpus/external/。注意与 BIDGUARD_CALIB_DIR（生成器种子）区分。
+    fn external_dir() -> PathBuf {
+        if let Ok(d) = std::env::var("BIDGUARD_GT_DIR") {
+            if !d.trim().is_empty() {
+                return PathBuf::from(d);
+            }
+        }
+        corpus_dir().join("external")
+    }
+
+    fn render_extcalib(ms: &[crate::engine::extcalib::ExtCalibMetrics]) -> String {
+        let mut s = String::from("外部真值相似度校准（词面 score_pair 档；@0.7=运行阈值）\n");
+        s.push_str(&format!(
+            "{:<12} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
+            "source", "n", "pos", "neg", "ROC", "PR", "P@.7", "R@.7", "F1@.7", "bestF1", "bestThr",
+            "ECE", "Spearman"
+        ));
+        for m in ms {
+            s.push_str(&format!(
+                "{:<12} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
+                m.source, m.pairs_count, m.positives, m.negatives, m.roc_auc, m.pr_auc,
+                m.precision_at, m.recall_at, m.f1_at, m.best_f1, m.best_threshold, m.ece, m.spearman
+            ));
+        }
+        s
+    }
+
+    /// 外部真值门禁：按 source 逐一对照基线，单向回归即失败（判别力降 / 校准误差升）。
+    fn extcalib_gate_failures(
+        base: &[crate::engine::extcalib::ExtCalibMetrics],
+        cur: &[crate::engine::extcalib::ExtCalibMetrics],
+    ) -> Vec<String> {
+        const AUC_TOL: f64 = 0.03;
+        const F1_TOL: f64 = 0.02;
+        const ECE_TOL: f64 = 0.03;
+        let by_src: BTreeMap<&str, &crate::engine::extcalib::ExtCalibMetrics> =
+            base.iter().map(|m| (m.source.as_str(), m)).collect();
+        let mut fails = Vec::new();
+        for c in cur {
+            let Some(b) = by_src.get(c.source.as_str()) else {
+                fails.push(format!("[{}] 基线缺此来源（新增语料需 BIDGUARD_WRITE_BASELINE=1 重写基线）", c.source));
+                continue;
+            };
+            if c.roc_auc < b.roc_auc - AUC_TOL {
+                fails.push(format!("[{}] ROC-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", c.source, b.roc_auc, c.roc_auc));
+            }
+            if c.pr_auc < b.pr_auc - AUC_TOL {
+                fails.push(format!("[{}] PR-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", c.source, b.pr_auc, c.pr_auc));
+            }
+            if c.best_f1 < b.best_f1 - F1_TOL {
+                fails.push(format!("[{}] bestF1 降 {:.3}→{:.3}（容差 {F1_TOL}）", c.source, b.best_f1, c.best_f1));
+            }
+            if c.ece > b.ece + ECE_TOL {
+                fails.push(format!("[{}] ECE 升 {:.3}→{:.3}（容差 {ECE_TOL}）", c.source, b.ece, c.ece));
+            }
+        }
+        fails
+    }
+
+    /// 外部真值相似度校准（本地/慢档，#[ignore]）：读【独立于合成生成器】的人工标注语料
+    /// （默认 fixtures/corpus/external/*.jsonl，可由 BIDGUARD_GT_DIR 覆盖为本地非提交数据），
+    /// 用词面 score_pair 打连续分，出 ROC-AUC/PR-AUC/阈值扫描/ECE/Spearman，对照
+    /// baseline_metrics_external.json；BIDGUARD_WRITE_BASELINE=1 时写基线。
+    /// 目的：用非同源人工标注真值评估打分器判别力，打破合成指标系统性偏乐观循环。
+    #[test]
+    #[ignore] // 词面档无需模型：cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools external_calib -- --ignored --nocapture
+    fn external_calib() {
+        use crate::engine::extcalib;
+        let jieba = Jieba::new();
+        let dir = external_dir();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取外部语料目录 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "外部语料目录 {} 下无 *.jsonl", dir.display());
+
+        let mut metrics: Vec<extcalib::ExtCalibMetrics> = Vec::new();
+        for f in &files {
+            let pairs = extcalib::read_external_pairs(f)
+                .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
+            if pairs.is_empty() {
+                continue;
+            }
+            let source = pairs
+                .first()
+                .map(|p| p.source.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| f.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+            let scored = score_external_pairs(&jieba, &pairs, |_, _| None);
+            metrics.push(extcalib::evaluate(&source, "lexical", &scored, 0.5, REGRESSION_THRESHOLD, 10));
+        }
+        metrics.sort_by(|a, b| a.source.cmp(&b.source));
+        eprintln!("{}", render_extcalib(&metrics));
+
+        let baseline_path = corpus_dir().join("baseline_metrics_external.json");
+        if baseline_write_mode() {
+            let body = serde_json::to_string_pretty(&metrics).expect("serialize ext metrics");
+            std::fs::write(&baseline_path, format!("{body}\n"))
+                .unwrap_or_else(|e| panic!("写外部基线 {} 失败: {e}", baseline_path.display()));
+            eprintln!("[external_calib] 已写入基线 → {}", baseline_path.display());
+            return;
+        }
+        let raw = match std::fs::read_to_string(&baseline_path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "[external_calib] 无基线（{}）；仅打印报告。首次固化：BIDGUARD_WRITE_BASELINE=1 cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools external_calib -- --ignored",
+                    baseline_path.display()
+                );
+                return;
+            }
+        };
+        let base: Vec<extcalib::ExtCalibMetrics> =
+            serde_json::from_str(&raw).expect("解析 baseline_metrics_external.json");
+        let failures = extcalib_gate_failures(&base, &metrics);
+        if !failures.is_empty() {
+            panic!("外部真值门禁失败（{} 项）：\n{}", failures.len(), failures.join("\n"));
+        }
+        eprintln!("[external_calib] 通过（对照 {} 个来源基线）", base.len());
     }
 
     /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。
