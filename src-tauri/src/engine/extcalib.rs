@@ -345,6 +345,171 @@ pub fn false_positive_probe(
     }
 }
 
+// —— 概率校准（执行方案 item 4）——
+//
+// 打分器 emit 的是 [0,1] 的加权相似度，不是概率：`0.8` 不代表「80% 概率是雷同」。
+// 实测 ECE 佐证了这点（词面档 0.231、裸余弦 0.495）。校准就是学一个单调映射
+// score → P(正类)，让分数能当置信度读，也让「标红/待复核/放行」三带阈值有据可依。
+//
+// 两种做法各有取舍：Platt 拟合单个 sigmoid，参数少、外推平滑，但假定 logit 与分数线性；
+// isotonic 只要求单调、能贴任意形状，代价是易过拟合且在数据稀疏处呈阶梯。
+
+/// Platt scaling 参数：P(y=1|s) = 1 / (1 + exp(a·s + b))。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct PlattParams {
+    pub a: f64,
+    pub b: f64,
+}
+
+impl PlattParams {
+    pub fn apply(&self, score: f32) -> f32 {
+        (1.0 / (1.0 + (self.a * score as f64 + self.b).exp())) as f32
+    }
+}
+
+/// 用牛顿法拟合 Platt scaling（Lin/Weng/Lin 2007 的正则化目标：以 t± 替代 0/1 硬标签，
+/// 避免完全可分时参数发散）。样本不足或退化时回落恒等映射的近似参数。
+pub fn fit_platt(scored: &[(f32, bool)]) -> PlattParams {
+    let (np, nn) = (
+        scored.iter().filter(|(_, y)| *y).count() as f64,
+        scored.iter().filter(|(_, y)| !*y).count() as f64,
+    );
+    if np == 0.0 || nn == 0.0 {
+        return PlattParams { a: -1.0, b: 0.0 };
+    }
+    // 目标值：正类 (np+1)/(np+2)，负类 1/(nn+2)
+    let (hi, lo) = ((np + 1.0) / (np + 2.0), 1.0 / (nn + 2.0));
+    let t: Vec<f64> = scored.iter().map(|(_, y)| if *y { hi } else { lo }).collect();
+    let s: Vec<f64> = scored.iter().map(|(x, _)| *x as f64).collect();
+
+    let (mut a, mut b) = (-1.0f64, (nn / np).ln().max(-10.0).min(10.0));
+    for _ in 0..100 {
+        let (mut g1, mut g2, mut h11, mut h22, mut h12) = (0.0, 0.0, 1e-12, 1e-12, 0.0);
+        for (si, ti) in s.iter().zip(&t) {
+            let z = a * si + b;
+            let p = 1.0 / (1.0 + z.exp());
+            // dL/dz = t - p（由 dL/dp · dp/dz 推得，dp/dz = -p(1-p) 抵消了负号）。
+            // 写成 p - t 会让牛顿步朝梯度上升走，拟合出反向映射。
+            let d = ti - p;
+            let w = p * (1.0 - p);
+            g1 += si * d;
+            g2 += d;
+            h11 += si * si * w;
+            h22 += w;
+            h12 += si * w;
+        }
+        if g1.abs() < 1e-9 && g2.abs() < 1e-9 {
+            break;
+        }
+        let det = h11 * h22 - h12 * h12;
+        if det.abs() < 1e-18 {
+            break;
+        }
+        a -= (h22 * g1 - h12 * g2) / det;
+        b -= (h11 * g2 - h12 * g1) / det;
+    }
+    PlattParams { a, b }
+}
+
+/// Isotonic 回归（PAV，保序合并）产出的分段常数映射：(分数上界, 概率) 升序。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct IsotonicMap {
+    pub points: Vec<(f32, f32)>,
+}
+
+impl IsotonicMap {
+    /// 查表：落在哪一段取该段概率；超出右端取最后一段（单调外推）。
+    pub fn apply(&self, score: f32) -> f32 {
+        if self.points.is_empty() {
+            return score;
+        }
+        for (ub, p) in &self.points {
+            if score <= *ub {
+                return *p;
+            }
+        }
+        self.points.last().map(|(_, p)| *p).unwrap_or(score)
+    }
+}
+
+/// PAV（pool adjacent violators）拟合保序回归。
+pub fn fit_isotonic(scored: &[(f32, bool)]) -> IsotonicMap {
+    if scored.is_empty() {
+        return IsotonicMap::default();
+    }
+    let mut v: Vec<(f32, f64)> =
+        scored.iter().map(|(s, y)| (*s, if *y { 1.0 } else { 0.0 })).collect();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    // 每块：(分数上界, 和, 计数)
+    let mut blocks: Vec<(f32, f64, f64)> = Vec::with_capacity(v.len());
+    for (s, y) in v {
+        blocks.push((s, y, 1.0));
+        // 违反单调则与前一块合并
+        while blocks.len() >= 2 {
+            let n = blocks.len();
+            let (_, s2, c2) = blocks[n - 1];
+            let (_, s1, c1) = blocks[n - 2];
+            if s1 / c1 <= s2 / c2 {
+                break;
+            }
+            let ub = blocks[n - 1].0;
+            blocks.truncate(n - 2);
+            blocks.push((ub, s1 + s2, c1 + c2));
+        }
+    }
+    IsotonicMap {
+        points: blocks.iter().map(|(ub, s, c)| (*ub, (s / c) as f32)).collect(),
+    }
+}
+
+/// 校准前后的 ECE 对照（含训练/测试切分，避免在拟合数据上自评）。
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationReport {
+    pub source: String,
+    pub scorer: String,
+    pub train_count: usize,
+    pub test_count: usize,
+    /// 未校准分数在测试集上的 ECE。
+    pub ece_raw: f64,
+    pub ece_platt: f64,
+    pub ece_isotonic: f64,
+    pub platt: PlattParams,
+    /// 校准是单调变换，不改排序 → ROC-AUC 不变，这里记录以便核对。
+    pub roc_auc: f64,
+}
+
+/// 交替取样切分（按分数排序后隔一取一），保证训练/测试的分数分布一致——
+/// 随机切分需要 RNG，而本 harness 要求确定性可复现。
+pub fn calibrate_report(
+    source: &str,
+    scorer: &str,
+    scored: &[(f32, bool)],
+    ece_bins: usize,
+) -> CalibrationReport {
+    let mut v: Vec<(f32, bool)> = scored.to_vec();
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    let train: Vec<(f32, bool)> = v.iter().step_by(2).copied().collect();
+    let test: Vec<(f32, bool)> = v.iter().skip(1).step_by(2).copied().collect();
+
+    let platt = fit_platt(&train);
+    let iso = fit_isotonic(&train);
+    let p_test: Vec<(f32, bool)> = test.iter().map(|(s, y)| (platt.apply(*s), *y)).collect();
+    let i_test: Vec<(f32, bool)> = test.iter().map(|(s, y)| (iso.apply(*s), *y)).collect();
+
+    CalibrationReport {
+        source: source.to_string(),
+        scorer: scorer.to_string(),
+        train_count: train.len(),
+        test_count: test.len(),
+        ece_raw: ece(&test, ece_bins),
+        ece_platt: ece(&p_test, ece_bins),
+        ece_isotonic: ece(&i_test, ece_bins),
+        platt,
+        roc_auc: roc_auc(&test),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +642,91 @@ mod tests {
         assert_eq!(p.fpr, 0.0);
         assert_eq!(p.max_score, 0.0);
     }
+
+    #[test]
+    fn platt_maps_scores_monotonically_to_probabilities() {
+        // 低分多负、高分多正 → 拟合出的映射应单调递增且把两端拉向 0/1
+        let mut data = Vec::new();
+        for i in 0..50 {
+            let s = i as f32 / 50.0;
+            data.push((s, i >= 30)); // 0.6 以上为正
+        }
+        let p = fit_platt(&data);
+        let (lo, mid, hi) = (p.apply(0.1), p.apply(0.6), p.apply(0.95));
+        assert!(lo < mid && mid < hi, "应单调递增: {lo:.3} {mid:.3} {hi:.3}");
+        assert!(lo < 0.3, "低分应映射到低概率，实测 {lo:.3}");
+        assert!(hi > 0.7, "高分应映射到高概率，实测 {hi:.3}");
+    }
+
+    #[test]
+    fn platt_handles_single_class_without_diverging() {
+        let allneg = vec![(0.2f32, false), (0.5, false), (0.9, false)];
+        let p = fit_platt(&allneg);
+        assert!(p.a.is_finite() && p.b.is_finite(), "单类不应产生 NaN/inf");
+    }
+
+    #[test]
+    fn isotonic_is_monotone_and_fits_steps() {
+        let data = vec![
+            (0.1f32, false), (0.2, false), (0.3, false),
+            (0.7, true), (0.8, true), (0.9, true),
+        ];
+        let iso = fit_isotonic(&data);
+        let (a, b) = (iso.apply(0.15), iso.apply(0.85));
+        assert!(a < b, "应单调: {a:.3} < {b:.3}");
+        assert!(a < 0.2 && b > 0.8, "完全可分时两端应贴近 0/1: {a:.3} {b:.3}");
+    }
+
+    #[test]
+    fn isotonic_pools_violators() {
+        // 分数升序但标签下降 → PAV 必须合并成同一概率（否则不单调）
+        let data = vec![(0.4f32, true), (0.5, false), (0.6, true), (0.7, false)];
+        let iso = fit_isotonic(&data);
+        let ps: Vec<f32> = [0.4f32, 0.5, 0.6, 0.7].iter().map(|s| iso.apply(*s)).collect();
+        for w in ps.windows(2) {
+            assert!(w[1] >= w[0] - 1e-6, "输出必须非降: {ps:?}");
+        }
+    }
+
+    #[test]
+    fn calibration_reduces_ece_on_held_out_split() {
+        // 两组都系统性偏离：0.9 组实际只有 1/3 为正（高估），0.1 组也有 1/3（低估）。
+        // 标签周期取 3 而非 2：交替切分的周期是 2，若标签也按奇偶分布会导致训练/测试
+        // 标签完全反相（训练全正、测试全负），那是构造出来的假象而非校准失效。
+        let mut data = Vec::new();
+        for i in 0..120 {
+            data.push((0.9f32, i % 3 == 0));
+        }
+        for i in 0..120 {
+            data.push((0.1f32, i % 3 == 0));
+        }
+        let r = calibrate_report("unit", "lexical", &data, 10);
+        assert!(r.train_count > 0 && r.test_count > 0);
+        assert!(r.ece_raw > 0.15, "构造数据原始 ECE 应偏高，实测 {:.3}", r.ece_raw);
+        assert!(
+            r.ece_platt < r.ece_raw && r.ece_isotonic < r.ece_raw,
+            "校准应降低留出集 ECE：raw {:.3} platt {:.3} iso {:.3}",
+            r.ece_raw, r.ece_platt, r.ece_isotonic
+        );
+    }
+
+    #[test]
+    fn calibration_preserves_ranking_when_signal_exists() {
+        // 校准是分数的单调变换，不改排序 → AUC 不变。这正是校准【不能】提升判别力的原因：
+        // 它只重标刻度，不重排样本。
+        // 注意前提：Platt 拟合到正相关（a<0）时才是单调【递增】。若数据本身无信号，
+        // 拟出的斜率是噪声，可能得到单调递减映射而把 AUC 翻成 1-AUC——那不是实现问题，
+        // 而是「对随机数据谈保序方向」本就没有意义。故这里用带信号的数据。
+        let data: Vec<(f32, bool)> =
+            (0..60).map(|i| (i as f32 / 60.0, (i % 10) < (i / 10))).collect();
+        let before = roc_auc(&data);
+        assert!(before > 0.6, "前置条件：数据须带正相关信号，实测 AUC {before:.3}");
+        let p = fit_platt(&data);
+        assert!(p.a < 0.0, "正相关数据应拟合出单调递增映射（a<0），实测 a={:.3}", p.a);
+        let after: Vec<(f32, bool)> = data.iter().map(|(s, y)| (p.apply(*s), *y)).collect();
+        assert!((roc_auc(&after) - before).abs() < 1e-9, "Platt 不应改变 AUC");
+    }
+
 
     #[test]
     fn evaluate_end_to_end() {

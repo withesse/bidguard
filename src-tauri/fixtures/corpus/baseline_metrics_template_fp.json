@@ -23,7 +23,7 @@
     "meanScore": 0.6901829577073818,
     "medianScore": 0.669285237789154,
     "p90Score": 0.7770415544509888,
-    "maxScore": 0.9446267485618591
+    "maxScore": 0.9446267485618592
   },
   {
     "source": "ndrc2007-template",
@@ -84,11 +84,11 @@
     "pairsCount": 51,
     "threshold": 0.7,
     "flagged": 20,
-    "fpr": 0.392156862745098,
+    "fpr": 0.39215686274509803,
     "meanScore": 0.676777214980593,
     "medianScore": 0.6664395332336426,
     "p90Score": 0.7693427801132202,
-    "maxScore": 0.947567105293274
+    "maxScore": 0.9475671052932739
   },
   {
     "source": "ndrc2007-template",
@@ -112,7 +112,7 @@
     "flagged": 42,
     "fpr": 0.3181818181818182,
     "meanScore": 0.5992586926528902,
-    "medianScore": 0.44900184869766235,
+    "medianScore": 0.4490018486976623,
     "p90Score": 1.0,
     "maxScore": 1.0
   },
@@ -124,7 +124,7 @@
     "threshold": 0.7,
     "flagged": 1,
     "fpr": 0.024390243902439025,
-    "meanScore": 0.39459168838291636,
+    "meanScore": 0.3945916883829163,
     "medianScore": 0.379141241312027,
     "p90Score": 0.4446401000022888,
     "maxScore": 0.8805033564567566
@@ -137,7 +137,7 @@
     "threshold": 0.7,
     "flagged": 1,
     "fpr": 0.0196078431372549,
-    "meanScore": 0.44948801807328764,
+    "meanScore": 0.4494880180732877,
     "medianScore": 0.43841275572776794,
     "p90Score": 0.49730440974235535,
     "maxScore": 0.7865414023399353
@@ -150,7 +150,7 @@
     "threshold": 0.7,
     "flagged": 40,
     "fpr": 1.0,
-    "meanScore": 0.9999999821186065,
+    "meanScore": 0.9999999821186064,
     "medianScore": 1.0,
     "p90Score": 1.0,
     "maxScore": 1.0
@@ -163,7 +163,7 @@
     "threshold": 0.7,
     "flagged": 42,
     "fpr": 0.3181818181818182,
-    "meanScore": 0.5736573002103603,
+    "meanScore": 0.57365729975881,
     "medianScore": 0.410032719373703,
     "p90Score": 1.0,
     "maxScore": 1.0
@@ -176,7 +176,7 @@
     "threshold": 0.7,
     "flagged": 1,
     "fpr": 0.024390243902439025,
-    "meanScore": 0.3583863079547882,
+    "meanScore": 0.3583863065010164,
     "medianScore": 0.3459237515926361,
     "p90Score": 0.40320730209350586,
     "maxScore": 0.8771845102310181
@@ -189,7 +189,7 @@
     "threshold": 0.7,
     "flagged": 1,
     "fpr": 0.0196078431372549,
-    "meanScore": 0.41233186978919834,
+    "meanScore": 0.4123318686204798,
     "medianScore": 0.40196722745895386,
     "p90Score": 0.4944077134132385,
     "maxScore": 0.7424924969673157
@@ -202,7 +202,7 @@
     "threshold": 0.7,
     "flagged": 40,
     "fpr": 1.0,
-    "meanScore": 0.9999999910593032,
+    "meanScore": 0.9999999925494194,
     "medianScore": 1.0,
     "p90Score": 1.0,
     "maxScore": 1.0
@@ -215,7 +215,7 @@
     "threshold": 0.7,
     "flagged": 41,
     "fpr": 0.3106060606060606,
-    "meanScore": 0.4045835371608987,
+    "meanScore": 0.40458353851554973,
     "medianScore": 0.15345750749111176,
     "p90Score": 1.0,
     "maxScore": 1.0
@@ -228,9 +228,9 @@
     "threshold": 0.7,
     "flagged": 1,
     "fpr": 0.024390243902439025,
-    "meanScore": 0.12111116800366378,
+    "meanScore": 0.1211111670950564,
     "medianScore": 0.09851047396659851,
-    "p90Score": 0.14639337360858917,
+    "p90Score": 0.14639338850975037,
     "maxScore": 0.8074387907981873
   },
   {
@@ -241,10 +241,10 @@
     "threshold": 0.7,
     "flagged": 0,
     "fpr": 0.0,
-    "meanScore": 0.16547983139753342,
+    "meanScore": 0.16547983563413807,
     "medianScore": 0.1410689651966095,
-    "p90Score": 0.22450606524944305,
-    "maxScore": 0.6428799629211426
+    "p90Score": 0.22450609505176544,
+    "maxScore": 0.6428801417350769
   },
   {
     "source": "ndrc2007-template",
@@ -258,5 +258,83 @@
     "medianScore": 1.0,
     "p90Score": 1.0,
     "maxScore": 1.0
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "cosine:bge-small-zh-v1.5",
+    "subclass": "all",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 4,
+    "fpr": 1.0,
+    "meanScore": 0.9578818678855896,
+    "medianScore": 0.9590250253677368,
+    "p90Score": 0.9628592133522034,
+    "maxScore": 0.9628592133522034
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "cosine:bge-small-zh-v1.5",
+    "subclass": "regional_variant",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 4,
+    "fpr": 1.0,
+    "meanScore": 0.9578818678855896,
+    "medianScore": 0.9590250253677368,
+    "p90Score": 0.9628592133522034,
+    "maxScore": 0.9628592133522034
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "fused:bge-small-zh-v1.5",
+    "subclass": "all",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 4,
+    "fpr": 1.0,
+    "meanScore": 0.7611086219549179,
+    "medianScore": 0.784464418888092,
+    "p90Score": 0.7873514294624329,
+    "maxScore": 0.7873514294624329
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "fused:bge-small-zh-v1.5",
+    "subclass": "regional_variant",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 4,
+    "fpr": 1.0,
+    "meanScore": 0.7611086219549179,
+    "medianScore": 0.784464418888092,
+    "p90Score": 0.7873514294624329,
+    "maxScore": 0.7873514294624329
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "lexical",
+    "subclass": "all",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 0,
+    "fpr": 0.0,
+    "meanScore": 0.5705145597457886,
+    "medianScore": 0.6113409399986267,
+    "p90Score": 0.6150478720664978,
+    "maxScore": 0.6150478720664978
+  },
+  {
+    "source": "official-regional-variant",
+    "scorer": "lexical",
+    "subclass": "regional_variant",
+    "pairsCount": 4,
+    "threshold": 0.7,
+    "flagged": 0,
+    "fpr": 0.0,
+    "meanScore": 0.5705145597457886,
+    "medianScore": 0.6113409399986267,
+    "p90Score": 0.6150478720664978,
+    "maxScore": 0.6150478720664978
   }
 ]

@@ -2119,6 +2119,7 @@ mod tests {
         assert!(!files.is_empty(), "外部语料目录 {} 下无 *.jsonl", dir.display());
 
         let mut metrics: Vec<extcalib::ExtCalibMetrics> = Vec::new();
+        let mut calib: Vec<extcalib::CalibrationReport> = Vec::new();
         for f in &files {
             let pairs = extcalib::read_external_pairs(f)
                 .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
@@ -2133,6 +2134,10 @@ mod tests {
             // 词面档（无模型，恒可跑）
             let lex = score_external_pairs(&jieba, &pairs, None);
             metrics.push(extcalib::evaluate(&source, "lexical", &lex, 0.5, REGRESSION_THRESHOLD, 10));
+            let bin = |v: &[(f32, f32)]| -> Vec<(f32, bool)> {
+                v.iter().map(|(s, l)| (*s, extcalib::is_positive(*l, 0.5))).collect()
+            };
+            calib.push(extcalib::calibrate_report(&source, "lexical", &bin(&lex), 10));
             // 语义两档（模型就绪才跑）：fused = 生产融合分（用户实际经历的）；
             // cosine = 裸嵌入余弦（单独回答「嵌入本身判别力如何」）。
             if let Some(cos) = semantic_cosines(&pairs) {
@@ -2146,6 +2151,12 @@ mod tests {
                     REGRESSION_THRESHOLD,
                     10,
                 ));
+                calib.push(extcalib::calibrate_report(
+                    &source,
+                    &format!("fused:{mid}"),
+                    &bin(&fused),
+                    10,
+                ));
                 let raw: Vec<(f32, f32)> =
                     cos.iter().zip(&pairs).map(|(c, p)| (*c, p.label)).collect();
                 metrics.push(extcalib::evaluate(
@@ -2156,11 +2167,35 @@ mod tests {
                     REGRESSION_THRESHOLD,
                     10,
                 ));
+                calib.push(extcalib::calibrate_report(
+                    &source,
+                    &format!("cosine:{mid}"),
+                    &bin(&raw),
+                    10,
+                ));
             } else {
                 eprintln!("[external_calib] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
             }
         }
         metrics.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
+        if !calib.is_empty() {
+            calib.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
+            let mut t = String::from(
+                "\n概率校准（训练/测试 = 按分数排序后隔一取一；ECE 为留出集上的值）\n",
+            );
+            t.push_str(&format!(
+                "{:<12} {:<26} {:>6} {:>6} {:>8} {:>8} {:>9} {:>8}\n",
+                "source", "scorer", "train", "test", "ECE原始", "ECE_Platt", "ECE_保序", "ROC"
+            ));
+            for c in &calib {
+                t.push_str(&format!(
+                    "{:<12} {:<26} {:>6} {:>6} {:>8.3} {:>8.3} {:>9.3} {:>8.3}\n",
+                    c.source, c.scorer, c.train_count, c.test_count, c.ece_raw, c.ece_platt,
+                    c.ece_isotonic, c.roc_auc
+                ));
+            }
+            eprintln!("{t}");
+        }
         eprintln!("{}", render_extcalib(&metrics));
 
         let baseline_path = corpus_dir().join("baseline_metrics_external.json");
