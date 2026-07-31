@@ -16,6 +16,9 @@
 #   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh fast       # 重写快档基线（改算法后）
 #   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh external   # 重写外部真值基线
 #   BIDGUARD_GT_DIR=/path/to/gt scripts/eval-corpus.sh external # 用本地非提交真值数据
+#   BIDGUARD_EMBED_MODEL=bge-large-zh scripts/eval-corpus.sh external  # 换语义模型横比
+#     （external/template 两档会自动追加 fused:<模型> / cosine:<模型>；模型缺失则只跑词面。
+#      基线按 scorer 合并，换模型写基线不会冲掉其它档。注意 bge-large 在长条款上慢两个量级。）
 #   BIDGUARD_EMBED_DIR=/path/to/models scripts/eval-corpus.sh full
 set -euo pipefail
 

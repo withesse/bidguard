@@ -2010,11 +2010,25 @@ mod tests {
         corpus_dir().join("external")
     }
 
+    /// 语义档所用模型的 key：BIDGUARD_EMBED_MODEL override（如 "bge-large-zh"），
+    /// 默认 "bge-zh"（bge-small-zh-v1.5）。用于横比不同规模模型对判别力/误报的影响。
+    fn semantic_model_key() -> String {
+        std::env::var("BIDGUARD_EMBED_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "bge-zh".to_string())
+    }
+
+    /// 当前语义模型的 id（进 scorer 名，避免不同规模模型的基线撞键——指标本就是模型相关的）。
+    fn semantic_model_id() -> &'static str {
+        crate::engine::embed::resolve(&semantic_model_key()).id
+    }
+
     /// 批量算语义余弦（按 pairs 下标对齐）。模型不可用时返回 None → 调用方只跑词面档。
     /// 离线：allow_download=false，需 BIDGUARD_EMBED_DIR 或 ~/.cache/bidguard/embeddings/<id>/。
     fn semantic_cosines(pairs: &[crate::engine::extcalib::ExternalPair]) -> Option<Vec<f32>> {
         use crate::engine::embed;
-        let spec = embed::resolve("bge-zh");
+        let spec = embed::resolve(&semantic_model_key());
         let mut slot: embed::LoadedEmbedder = None;
         let model = embed::ensure(&mut slot, spec, false)?;
         // 两侧文本摊平后按 EMBED_BATCH 分批，一次推理多条（远快于逐对）。
@@ -2033,13 +2047,13 @@ mod tests {
     fn render_extcalib(ms: &[crate::engine::extcalib::ExtCalibMetrics]) -> String {
         let mut s = String::from("外部真值相似度校准（@0.7=运行阈值）\n");
         s.push_str(&format!(
-            "{:<12} {:<8} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
+            "{:<12} {:<26} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
             "source", "scorer", "n", "pos", "neg", "ROC", "PR", "P@.7", "R@.7", "F1@.7", "bestF1",
             "bestThr", "ECE", "Spearman"
         ));
         for m in ms {
             s.push_str(&format!(
-                "{:<12} {:<8} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
+                "{:<12} {:<26} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
                 m.source, m.scorer, m.pairs_count, m.positives, m.negatives, m.roc_auc, m.pr_auc,
                 m.precision_at, m.recall_at, m.f1_at, m.best_f1, m.best_threshold, m.ece, m.spearman
             ));
@@ -2122,11 +2136,26 @@ mod tests {
             // 语义两档（模型就绪才跑）：fused = 生产融合分（用户实际经历的）；
             // cosine = 裸嵌入余弦（单独回答「嵌入本身判别力如何」）。
             if let Some(cos) = semantic_cosines(&pairs) {
+                let mid = semantic_model_id();
                 let fused = score_external_pairs(&jieba, &pairs, Some(&cos));
-                metrics.push(extcalib::evaluate(&source, "fused", &fused, 0.5, REGRESSION_THRESHOLD, 10));
+                metrics.push(extcalib::evaluate(
+                    &source,
+                    &format!("fused:{mid}"),
+                    &fused,
+                    0.5,
+                    REGRESSION_THRESHOLD,
+                    10,
+                ));
                 let raw: Vec<(f32, f32)> =
                     cos.iter().zip(&pairs).map(|(c, p)| (*c, p.label)).collect();
-                metrics.push(extcalib::evaluate(&source, "cosine", &raw, 0.5, REGRESSION_THRESHOLD, 10));
+                metrics.push(extcalib::evaluate(
+                    &source,
+                    &format!("cosine:{mid}"),
+                    &raw,
+                    0.5,
+                    REGRESSION_THRESHOLD,
+                    10,
+                ));
             } else {
                 eprintln!("[external_calib] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
             }
@@ -2136,6 +2165,20 @@ mod tests {
 
         let baseline_path = corpus_dir().join("baseline_metrics_external.json");
         if baseline_write_mode() {
+            // 按 (source, scorer) 合并：本次只跑了部分档（如模型不可用只有 lexical，或换模型
+            // 只跑该模型的档），保留基线里其它档的条目，否则换个模型写基线会把上一个冲掉。
+            let mut merged: Vec<extcalib::ExtCalibMetrics> = std::fs::read_to_string(&baseline_path)
+                .ok()
+                .and_then(|r| serde_json::from_str(&r).ok())
+                .unwrap_or_default();
+            let fresh: BTreeSet<(String, String)> =
+                metrics.iter().map(|m| (m.source.clone(), m.scorer.clone())).collect();
+            merged.retain(|m| !fresh.contains(&(m.source.clone(), m.scorer.clone())));
+            merged.extend(metrics.iter().cloned());
+            merged.sort_by(|a, b| {
+                (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer))
+            });
+            let metrics = merged;
             let body = serde_json::to_string_pretty(&metrics).expect("serialize ext metrics");
             std::fs::write(&baseline_path, format!("{body}\n"))
                 .unwrap_or_else(|e| panic!("写外部基线 {} 失败: {e}", baseline_path.display()));
@@ -2199,16 +2242,17 @@ mod tests {
             if cos.is_none() {
                 eprintln!("[template_fp_probe] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
             }
-            let mut lanes: Vec<(&str, Vec<f32>)> = vec![(
-                "lexical",
+            let mut lanes: Vec<(String, Vec<f32>)> = vec![(
+                "lexical".to_string(),
                 score_external_pairs(&jieba, &pairs, None).iter().map(|(s, _)| *s).collect(),
             )];
             if let Some(c) = &cos {
+                let mid = semantic_model_id();
                 lanes.push((
-                    "fused",
+                    format!("fused:{mid}"),
                     score_external_pairs(&jieba, &pairs, Some(c)).iter().map(|(s, _)| *s).collect(),
                 ));
-                lanes.push(("cosine", c.clone()));
+                lanes.push((format!("cosine:{mid}"), c.clone()));
             }
             for (scorer, scores) in &lanes {
                 probes.push(extcalib::false_positive_probe(
@@ -2244,12 +2288,12 @@ mod tests {
             "官方范本「合法雷同」误报探针（阈值 0.7；全部为负样本，FPR 越低越好）\n",
         );
         table.push_str(&format!(
-            "{:<22} {:<8} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "{:<20} {:<26} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
             "source", "scorer", "subclass", "n", "flagged", "FPR", "mean", "median", "p90", "max"
         ));
         for p in &probes {
             table.push_str(&format!(
-                "{:<22} {:<8} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
+                "{:<20} {:<26} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
                 p.source, p.scorer, p.subclass, p.pairs_count, p.flagged, p.fpr, p.mean_score,
                 p.median_score, p.p90_score, p.max_score
             ));
@@ -2258,6 +2302,21 @@ mod tests {
 
         let baseline_path = corpus_dir().join("baseline_metrics_template_fp.json");
         if baseline_write_mode() {
+            // 按 (source, scorer) 合并——理由同 external_calib：换模型写基线不应冲掉其它档。
+            let mut merged: Vec<extcalib::FalsePositiveProbe> =
+                std::fs::read_to_string(&baseline_path)
+                    .ok()
+                    .and_then(|r| serde_json::from_str(&r).ok())
+                    .unwrap_or_default();
+            let fresh: BTreeSet<(String, String)> =
+                probes.iter().map(|p| (p.source.clone(), p.scorer.clone())).collect();
+            merged.retain(|p| !fresh.contains(&(p.source.clone(), p.scorer.clone())));
+            merged.extend(probes.iter().cloned());
+            merged.sort_by(|a, b| {
+                (a.source.as_str(), a.scorer.as_str(), a.subclass.as_str())
+                    .cmp(&(&b.source, &b.scorer, &b.subclass))
+            });
+            let probes = merged;
             let body = serde_json::to_string_pretty(&probes).expect("serialize fp probes");
             std::fs::write(&baseline_path, format!("{body}\n"))
                 .unwrap_or_else(|e| panic!("写样板基线 {} 失败: {e}", baseline_path.display()));
