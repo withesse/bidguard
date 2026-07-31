@@ -2440,7 +2440,7 @@ mod tests {
 
         // 从迁移常量里取 V16 实际入库的样板文本（与生产同源，避免测试与迁移各写一份）
         let seeds = crate::db::migrations::official_seed_texts();
-        assert_eq!(seeds.len(), 6, "V16 应有 6 条官方表单样板");
+        assert_eq!(seeds.len(), 8, "V16 的 6 条施工表单 + V17 的 2 条货物/服务投标函");
         let seed_tokens: Vec<Vec<String>> =
             seeds.iter().map(|(_, t)| tokenize_lang(&jieba, t, "auto")).collect();
 
@@ -2485,6 +2485,58 @@ mod tests {
             suppressed.is_empty(),
             "官方样板误压正文条款（会导致漏报）：\n{}",
             suppressed.join("\n")
+        );
+    }
+
+    /// V17 只收 2 条代表样板（货物采购 / 工程服务），实测它们能否覆盖 2017 年版五个标准
+    /// 招标文件的**全部五个语域**（设备采购/材料采购/勘察/设计/监理）。
+    ///
+    /// 依据：五份投标函彼此高度重合（勘察/设计/监理 92–94%、设备/材料 87%），逐域各收一条
+    /// 是冗余——模板集是分块期的逐块比对项，每多一条就给每个分块加一次余弦。但"够不够"
+    /// 不能靠估计，这里用真实 tokenize+cosine 把覆盖率钉死：任一语域掉出阈值即失败，
+    /// 提示需要补收该域样板。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools official_form_templates_cover -- --ignored --nocapture
+    fn official_form_templates_cover_all_domains() {
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7;
+        #[derive(serde::Deserialize)]
+        struct Form {
+            id: String,
+            domain: String,
+            text: String,
+        }
+        let path = corpus_dir().join("template/ndrc2017-bidletters.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+        let forms: Vec<Form> = serde_json::from_str(&raw).expect("解析 ndrc2017-bidletters.json");
+        assert_eq!(forms.len(), 5, "应有五个语域的投标函");
+
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let seed_tokens: Vec<(String, Vec<String>)> =
+            seeds.iter().map(|(id, t)| (id.clone(), tokenize_lang(&jieba, t, "auto"))).collect();
+
+        let mut misses = Vec::new();
+        for f in &forms {
+            let toks = tokenize_lang(&jieba, &f.text, "auto");
+            let (mut best, mut who) = (0.0f32, "");
+            for (id, st) in &seed_tokens {
+                let c = cosine(&toks, st);
+                if c > best {
+                    best = c;
+                    who = id;
+                }
+            }
+            eprintln!("  {:<8} 最高 {best:.3} ← {who}", f.domain);
+            if best < TEMPLATE_MATCH {
+                misses.push(format!("{}（{}）最高仅 {best:.3}", f.domain, f.id));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "以下语域未被现有样板覆盖，需在迁移中补收该域投标函：\n{}",
+            misses.join("\n")
         );
     }
 

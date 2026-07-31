@@ -98,6 +98,30 @@
 总平面图的编制要求：它们紧邻 BidGuard 必须比对的核心内容，标 `is_template` 会把段落
 **排除比对**，误压真实雷同的**漏报**代价高于误报。
 
+### V17：扩到货物采购 / 工程服务语域
+
+V16 的表单绑定施工语域（工期/日历天/工程质量）。2017 年版五个标准招标文件
+（设备/材料/勘察/设计/监理，发改法规〔2017〕1606 号）的投标函另有专属清单
+（增值税税率、设备名称及技术服务、勘察纲要 / 设计方案 / 监理大纲），词面差异大，
+V16 样板匹配不上，故 V17 补入。
+
+**只收 2 条而非 5 条**：五份投标函彼此高度重合（勘察/设计/监理 92–94%、设备/材料 87%），
+各语域取一条代表即可。模板集是分块期的逐块比对项，每多一条就给每个分块加一次余弦，
+冗余样板只增成本不加召回。覆盖率不靠估计——
+`official_form_templates_cover_all_domains` 用真实 tokenize+cosine 实测五个语域：
+
+| 语域 | 最高余弦 | 命中样板 |
+| --- | --- | --- |
+| 设备采购 | 1.000 | `t-ndrc17-bidletter-equip` |
+| 材料采购 | 0.954 | `t-ndrc17-bidletter-equip` |
+| 勘察 | 1.000 | `t-ndrc17-bidletter-survey` |
+| 设计 | 0.939 | `t-ndrc17-bidletter-survey` |
+| 监理 | 0.924 | `t-ndrc17-bidletter-survey` |
+
+任一语域掉出 0.7 阈值即测试失败，提示需补收该域样板。五份投标函原文存于
+`ndrc2017-bidletters.json` 供该测试比对（来源同为发改委官网公开 PDF，
+依《著作权法》第五条不受著作权限制）。
+
 两侧验证见 `official_seed_templates_match_forms_without_suppressing_body_text`：
 ①每条样板命中自身文本；②对本语料 132 条正文条款**命中 0 条**（最高余弦 0.560 < 0.7）。
 另有 `chunker::official_bid_letter_template_still_matches_after_bidder_fills_blanks`
