@@ -310,7 +310,8 @@ fn synonym_replace(
     rng: &mut Rng,
 ) -> (String, usize) {
     let spans = features::entity_spans(text);
-    let tokens = jieba.cut(text, false);
+    // jieba-rs 0.10 的 cut 返回 Token；这里按字节偏移与实体区间求交，仍用词面字符串。
+    let tokens: Vec<&str> = jieba.cut(text, false).into_iter().map(|t| t.word).collect();
     let mut out = String::with_capacity(text.len());
     let mut off = 0usize;
     let mut swaps = 0usize;
