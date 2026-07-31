@@ -2364,15 +2364,16 @@ mod tests {
         eprintln!("[template_fp_probe] 通过（对照 {} 个分档基线）", base.len());
     }
 
-    /// 官方范本条款【不被】内置模板库覆盖——解释 template_fp_probe 里 verbatim 档 FPR=1.0
-    /// 的成因，并把它钉成可执行结论。
+    /// V2 的三条泛用样板【覆盖不到】官方范本条款——这是 V16 补入官方表单的原始依据，
+    /// 保留为回归护栏：若日后有人把 V2 三条改宽泛到能命中正文条款，这里会立刻失败。
     ///
-    /// 生产确有模板抑制：chunker 用词频余弦 ≥ TEMPLATE_MATCH(0.7) 比对 source_templates，
-    /// 命中即标 is_template，compare 侧按 ignore_templates 在召回前剔除
-    /// （compare_service.rs `keep_template`）。但内置库只有 3 条泛用短句（法律法规引用 /
-    /// 资质证书目录 / 标准售后承诺，migrations SEED_TEMPLATES_V2），而发改委《标准施工招标
-    /// 文件》这类【全国强制适用】的范本条款不在其中——故这些逐字照抄的合法样板无法被抑制，
-    /// 会一路走到评分层拿满分。结论：模板库需补入官方标准条款，否则样板雷同必然误报。
+    /// 背景：生产确有模板抑制——chunker 用词频余弦 ≥ TEMPLATE_MATCH(0.7) 比对
+    /// source_templates，命中即标 is_template，compare 侧按 ignore_templates 在召回前剔除
+    /// （compare_service.rs `keep_template`）。但 V2 内置库只有 3 条泛用短句（法律法规引用 /
+    /// 资质证书目录 / 标准售后承诺，SEED_TEMPLATES_V2），实测对本语料 132 条官方条款最高
+    /// 余弦仅 0.223、命中 0 条，故【当时】逐字照抄的合法样板无法被抑制。
+    /// 已由 V16（OFFICIAL_TEMPLATES_V16）补入第八章「投标文件格式」的 6 条表单修复；
+    /// 修复的有效性与安全性见 official_seed_templates_match_forms_without_suppressing_body_text。
     #[test]
     #[ignore] // 与 template_fp_probe 同档（读 fixtures/corpus/template）：cargo test --features dev-tools official_template_not_covered_by_builtin_library -- --ignored --nocapture
     fn official_template_not_covered_by_builtin_library() {
@@ -2419,6 +2420,71 @@ mod tests {
         assert_eq!(
             covered, 0,
             "内置模板库已能覆盖官方范本条款（命中 {covered}/{checked}）——若已补入官方条款，请更新本测试与 template_fp_probe 基线"
+        );
+    }
+
+    /// V16 补入的官方表单样板：既要**命中**投标人逐字复制的表单，更要**不误压**该比对的正文。
+    ///
+    /// 标 is_template 的后果是段落被排除比对（compare_service 的 ignore_templates），所以
+    /// 过度收录会造成漏报——对查重工具而言比误报更糟。本测试守住两侧：
+    /// ①（有效性）每条官方样板与自身源文本余弦 = 1.0，即确实能命中照抄的表单；
+    /// ②（安全性）这些样板不得命中样板误报语料里的 132 条章节条款（投标人须知/评标办法/
+    ///   合同条款/工程量清单）——那些是正文语域，若被压掉就等于放过真实雷同。
+    #[test]
+    #[ignore] // 读 fixtures/corpus/template：cargo test --features dev-tools official_seed_templates -- --ignored --nocapture
+    fn official_seed_templates_match_forms_without_suppressing_body_text() {
+        use crate::engine::extcalib;
+        use crate::engine::similarity::{cosine, tokenize_lang};
+        const TEMPLATE_MATCH: f32 = 0.7; // 对齐 chunker::TEMPLATE_MATCH
+        let jieba = Jieba::new();
+
+        // 从迁移常量里取 V16 实际入库的样板文本（与生产同源，避免测试与迁移各写一份）
+        let seeds = crate::db::migrations::official_seed_texts();
+        assert_eq!(seeds.len(), 6, "V16 应有 6 条官方表单样板");
+        let seed_tokens: Vec<Vec<String>> =
+            seeds.iter().map(|(_, t)| tokenize_lang(&jieba, t, "auto")).collect();
+
+        // ① 有效性：自身命中（逐字照抄必然命中）
+        for ((id, text), toks) in seeds.iter().zip(&seed_tokens) {
+            let c = cosine(&tokenize_lang(&jieba, text, "auto"), toks);
+            assert!(c >= TEMPLATE_MATCH, "[{id}] 应命中自身文本，实测余弦 {c:.3}");
+        }
+
+        // ② 安全性：不得命中正文语域的章节条款
+        let dir = corpus_dir().join("template");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .collect();
+        files.sort();
+        let (mut checked, mut suppressed, mut worst) = (0usize, Vec::new(), 0.0f32);
+        for f in &files {
+            for p in extcalib::read_external_pairs(f).expect("读取样板语料") {
+                let toks = tokenize_lang(&jieba, &p.text_a, "auto");
+                let (mut best, mut best_id) = (0.0f32, "");
+                for ((id, _), st) in seeds.iter().zip(&seed_tokens) {
+                    let c = cosine(&toks, st);
+                    if c > best {
+                        best = c;
+                        best_id = id;
+                    }
+                }
+                worst = worst.max(best);
+                checked += 1;
+                if best >= TEMPLATE_MATCH {
+                    suppressed.push(format!("{best_id} ⟵ {:.3} ⟵ {}", best, &p.text_a[..60.min(p.text_a.len())]));
+                }
+            }
+        }
+        eprintln!(
+            "[official_seed_templates] 正文条款 {checked} 条：被官方样板命中 {} 条；最高余弦 {worst:.3}（阈值 {TEMPLATE_MATCH}）",
+            suppressed.len()
+        );
+        assert!(
+            suppressed.is_empty(),
+            "官方样板误压正文条款（会导致漏报）：\n{}",
+            suppressed.join("\n")
         );
     }
 
