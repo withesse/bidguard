@@ -131,6 +131,8 @@ mod tests {
             minhash: Vec::new(),
             entities: crate::engine::features::extract_entities(&norm),
             tfidf: HashMap::new(),
+            tender_coverage: 0.0,
+            boiler_fraction: 0.0,
         }
     }
 

@@ -434,6 +434,40 @@ export function Settings() {
             </Row>
           </Card>
 
+          {/* 概率校准与复核路由（W6-4）：只读台账。α/β 与阈值随包固化，不开放运行时调整
+              ——改 α 即改「带内错误率」的承诺语义，须走版本发布。 */}
+          <Card title="概率校准与复核路由" cardBg={cardBg} border={border} mute={mute}>
+            <Row
+              label="校准版本"
+              sub={
+                appInfo?.calibration?.available
+                  ? `${appInfo.calibration.kind === "experimental-synthetic" ? "实验性校准（合成语料）" : appInfo.calibration.kind} · ${appInfo.calibration.calibrator} · 语料 ${appInfo.calibration.corpusHash.slice(0, 8)}`
+                  : "随包校准文件不可用"
+              }
+              ink={ink}
+              mute={mute}
+            >
+              <span style={{ fontSize: 11.5, color: mute }}>
+                {appInfo?.calibration?.available ? appInfo.calibration.version : "—"}
+              </span>
+            </Row>
+            <Row
+              label="分流模式"
+              sub={appInfo?.calibration?.note ?? "读取中…"}
+              ink={ink}
+              mute={mute}
+              last
+            >
+              <span style={{ fontSize: 11.5, color: mute }}>
+                {appInfo?.calibration?.routing === "three-band"
+                  ? `三带 · α=${Math.round((appInfo.calibration.alpha ?? 0) * 100)}% β=${Math.round((appInfo.calibration.beta ?? 0) * 100)}%`
+                  : appInfo?.calibration?.routing === "review-all"
+                    ? "全部需人工复核"
+                    : "—"}
+              </span>
+            </Row>
+          </Card>
+
           {/* 关于与更新 */}
           <Card title="关于" cardBg={cardBg} border={border} mute={mute}>
             <Row label="检查更新" sub="从 GitHub Releases 获取签名更新包" ink={ink} mute={mute} last>

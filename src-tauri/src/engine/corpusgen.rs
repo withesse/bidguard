@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 // —— 回归门禁（W6-5）：无模型层跑全语料算出分层指标，与 baseline_metrics.json 逐项对比 ——
 use crate::engine::corpus::{fill_tfidf, CmpChunk};
 use crate::engine::report::{Cluster as RCluster, ClusterSeg, DocInfo, EvasionSummary};
-use crate::engine::{clustering, collusion, diff, fingerprint, matrix, parse, scoring};
+use crate::engine::{calibrate, clustering, collusion, diff, fingerprint, matrix, parse, scoring};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// 每个标签的目标产出对数。5 标签 × 350 = 1750 对（≥1500），四类核心标签各 ≥300。
@@ -836,22 +836,56 @@ fn body_xml(paragraphs: &[String], price_rows: &[Vec<String>]) -> String {
     b
 }
 
-/// 报价明细行：单价整组乘同一系数 ratio_pct/100（等比）。base_units 为各行基准单价。
-fn price_rows(base_units: &[i64], ratio_pct: i64) -> Vec<Vec<String>> {
+/// 报价清单明细行数：需 ≥10 以越过 W5-3/W5-4 规律性与相关性的 n≥10 门槛（少于此则数值层
+/// 只出 insufficient，注入的等比证据无法被检出）。
+const BOQ_ROWS: usize = 12;
+
+/// 报价清单明细行（M6 数值层可解析口径）。表头用规范列名（项目编码/项目名称/单位/工程量/
+/// 综合单价/合价）——旧版表头「序号|设备名称及服务内容|单价（元）|工期」只有 2 列能被
+/// boq::extract_document 识别（&lt;3 列即判非清单表），注入的「等比乘系数」证据实际不可读，
+/// 数值信号在门禁中恒不触发。
+/// - 围标组（jitter=None）：各份共用同一基准单价序列、整组乘 ratio ⇒ 份间严格等比（y=kx），
+///   触发 numericPattern/numericCorrelation。
+/// - 独立组（jitter=Some(seed)）：逐行独立扰动 ⇒ 份间无线性关系，作负样本。
+fn price_rows(base_units: &[i64], ratio_pct: i64, jitter: Option<u64>) -> Vec<Vec<String>> {
     let mut rows = vec![vec![
-        "序号".into(),
-        "设备名称及服务内容".into(),
-        "单价（元）".into(),
-        "工期".into(),
+        "项目编码".into(),
+        "项目名称".into(),
+        "单位".into(),
+        "工程量".into(),
+        "综合单价".into(),
+        "合价".into(),
     ]];
-    let items = ["核心交换机及配套光模块安装调试", "机房精密空调供货与调试", "综合布线及线缆敷设"];
-    for (i, &base) in base_units.iter().enumerate() {
-        let unit = base * ratio_pct / 100;
+    let items = [
+        "核心交换机及配套光模块安装调试",
+        "机房精密空调供货与调试",
+        "综合布线及线缆敷设",
+        "UPS 不间断电源及电池组",
+        "防火墙及入侵检测设备",
+        "机柜及配电单元安装",
+    ];
+    let units = ["台", "项", "米", "套"];
+    for i in 0..BOQ_ROWS {
+        let seed_base = base_units[i % base_units.len()];
+        let base = match jitter {
+            // 围标组：确定性展开，份间一致 ⇒ 仅 ratio 造成差异。
+            None => seed_base + (i as i64) * 137,
+            // 独立组：逐行哈希扰动，破坏线性关系。
+            Some(s) => {
+                seed_base + (features::hash64(&format!("{s}|{i}")) % 900) as i64 + (i as i64) * 11
+            }
+        };
+        let unit_price = base * ratio_pct / 100;
+        let qty = 1 + (i as i64) % 5;
         rows.push(vec![
-            (i + 1).to_string(),
+            // 12 位清单编码，份间一致 ⇒ 按编码精确对齐。
+            format!("0304120{:05}", 1000 + i),
             items[i % items.len()].to_string(),
-            unit.to_string(),
-            "30天".into(),
+            units[i % units.len()].to_string(),
+            qty.to_string(),
+            unit_price.to_string(),
+            // 合价 = 工程量 × 综合单价（严格自洽，不植入算术错误）。
+            (qty * unit_price).to_string(),
         ]);
     }
     rows
@@ -887,7 +921,7 @@ fn build_collusion_set(
         let paragraphs = vec![format!("投标人：{company}"), edited, commit];
         // 等比：整组乘同一 ratio（份间不同 ratio，行内同 ratio）。
         let ratio = 100 + (d as i64) * 8; // 100% / 108% / 116%
-        let rows = price_rows(&base_units, ratio);
+        let rows = price_rows(&base_units, ratio, None);
         // 创建时间邻近：同日、分钟差 < 阈值。
         let created = format!("2024-03-15T09:{:02}:00Z", d * 3);
         let parts = vec![
@@ -946,8 +980,12 @@ fn build_independent_set(
         let root = format!("{tag:04X}FFFF");
         let rsids: Vec<String> = (0..RSIDS_PER_DOC).map(|j| format!("{tag:04X}{j:04X}")).collect();
         let png = make_png(features::hash64(&format!("independent-img|{docset_id}|{d}")));
-        // 报价无系数关系：各行独立取值。
-        let rows = price_rows(&[900 + (d as i64) * 137, 3100 + (g as i64) * 91, 760], 100);
+        // 报价无系数关系：各行独立扰动（jitter 按文档取种子）⇒ 份间无线性关系。
+        let rows = price_rows(
+            &[900 + (d as i64) * 137, 3100 + (g as i64) * 91, 760],
+            100,
+            Some(features::hash64(&format!("{docset_id}|{d}"))),
+        );
         let created = format!("202{}-0{}-1{}T1{}:20:00Z", d % 4 + 1, d % 8 + 1, g % 9, d % 9);
         // 唯一惰性部件：打乱 zip 条目名集合 → zip_entry_fp 各份互异（避免假「打包结构相同」）。
         let note = format!("word/note_{tag:04X}.xml");
@@ -1098,6 +1136,14 @@ pub fn run_cli() {
             let manifest = dir.parent().map(|p| p.join("docsets.jsonl")).unwrap_or_else(default_docsets_manifest);
             write_docsets_to(&dir, &manifest);
         }
+        Some("fit-collusion") => {
+            let out = args.get(2).map(PathBuf::from).unwrap_or_else(default_lr_path);
+            write_collusion_lr_to(&out);
+        }
+        Some("fit-calib") => {
+            let out = args.get(2).map(PathBuf::from).unwrap_or_else(default_calib_path);
+            write_calib_to(&out);
+        }
         Some(other) if !other.starts_with('-') => write_pairs_to(&PathBuf::from(other)),
         Some(_) => {
             write_pairs_to(&default_pairs_path());
@@ -1123,6 +1169,8 @@ pub fn run_cli() {
 
 /// docsets 组内聚类的相似阈值：对齐 compare 默认 similarity_threshold（config.rs=0.7）。
 const REGRESSION_THRESHOLD: f32 = 0.7;
+/// 数值层逐项雷同率告警线：对齐 compare 默认 identical_rate_alarm（config.rs=0.80）。
+const REGRESSION_ALARM_LINE: f64 = 0.80;
 /// 计入「召回层召回率」的正类标签（unrelated 是负类，不计召回）。
 const POSITIVE_LABELS: [&str; 4] = ["same", "minor_change", "changed", "rewrite"];
 /// 评分层 per-label 指标覆盖的全部五类（含负类 unrelated）。
@@ -1136,6 +1184,27 @@ pub struct LabelMetric {
     pub recall: f64,
     pub f1: f64,
     pub support: usize,
+}
+
+/// 复核路由三带指标（W6-4）：把【随包生效的 score_calib.json】作用在全量段对上，
+/// 量出「低优先级抽查带漏了多少正样本」「重点标红带误收了多少负样本」「复核带有多宽」。
+/// 与拟合侧留出集指标的区别：这里跑【全量语料 + 落盘后的最终参数】，是门禁口径——
+/// 任何改动 normalize/features/scoring 或换校准文件都会在这三个数上显形。
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BandMetrics {
+    /// three-band = 分流生效；review-all = 分流未启用（全部落需人工复核）；空 = 无校准文件。
+    pub routing: String,
+    /// 目标漏检率/误报率（【在合成校准语料上测得】）。
+    pub alpha: f64,
+    pub beta: f64,
+    /// 正样本落入「低优先级抽查」带的比例（漏检率）。
+    pub pass_fnr: f64,
+    /// 负样本落入「重点标红」带的比例（误报率）。
+    pub flag_fpr: f64,
+    pub pass_share: f64,
+    pub review_share: f64,
+    pub flag_share: f64,
 }
 
 /// 一次回归评测的分层指标 + 语料 hash + 生成元数据（写入/读取 baseline_metrics.json）。
@@ -1152,6 +1221,10 @@ pub struct RegressionMetrics {
     pub labels: BTreeMap<String, LabelMetric>,
     /// 五类 F1 宏平均（速览用，不单独设门禁）。
     pub macro_f1: f64,
+    /// 复核路由三带层（W6-4）：随包 score_calib.json 作用在全量段对上的分带结果。
+    /// 旧基线缺该块 → serde 默认全零（首次跑门禁会因漂移提示重新入库基线）。
+    #[serde(default)]
+    pub bands: BandMetrics,
     /// 围标层 AUC：docsets 上 collusion score 对 collusion(正)/independent(负) 的判别力。
     pub collusion_auc: f64,
     pub mean_collusion_score: f64,
@@ -1190,7 +1263,7 @@ fn map_pred(cluster_type: &str) -> &'static str {
 }
 
 /// 文本 → 无模型层 CmpChunk（严格对齐 chunker::make 的特征口径：sanitize→normalize→
-/// tokenize_lang→extract_entities→char_ngrams→minhash；section_kind 由 segment::classify）。
+/// tokenize_lang→extract_entities→char_ngrams→minhash；section_kind 由 segment::classify_zone）。
 fn regr_build_chunk(
     jieba: &Jieba,
     id: String,
@@ -1204,12 +1277,11 @@ fn regr_build_chunk(
     let (sanitized, _st) = normalize::sanitize_with_stats(text);
     let normalized = normalize::normalize_sanitized(&sanitized, &NormalizeOptions::default());
     let tokens = similarity::tokenize_lang(jieba, &sanitized, "auto");
-    let section_kind = match segment::classify(text) {
-        segment::Section::Tech => "tech",
-        segment::Section::Business => "business",
-        segment::Section::Other => "other",
-    };
     let entities = features::extract_entities(&normalized);
+    // 五区分类（§5 W3-5）：与 chunker::make / corpus::from_row 同口径（标题优先、金额表格行→price），
+    // 使回归语料反映分区阈值分层。regr 语料无表格行，is_table_row 恒 false。
+    let has_amount = entities.iter().any(|e| e.kind == "amount");
+    let section_kind = segment::section_kind_str(segment::classify_zone(&section_path, text, false, has_amount));
     let ngrams = features::char_ngrams(&normalized);
     let minhash = features::minhash(&ngrams);
     CmpChunk {
@@ -1229,8 +1301,47 @@ fn regr_build_chunk(
         minhash,
         entities,
         tfidf: HashMap::new(),
+        tender_coverage: 0.0,
+        boiler_fraction: 0.0,
         text: text.to_string(),
     }
+}
+
+/// 段对语料 → 两侧分块（TF-IDF 已按【全语料 IDF】填好）+ 可选语义。
+///
+/// 先建齐全部段对的两侧分块，再用全语料 IDF 填 TF-IDF——与生产 fill_tfidf 同口径。
+/// 关键：逐对局部 IDF 会让 lexical(tfidf 余弦) 与 char_ngram(jaccard) 退化为近似同一信号，
+/// W_LEXICAL/W_CHAR_NGRAM 的权重再分配对最终分几乎无影响（门禁对权重改动失灵）；全语料 IDF
+/// 下常见模板词权重被压低，lexical 变为「区分性词」信号，与 ngram 分离，权重改动才真正传导。
+///
+/// 回归指标（pair_stats）与概率校准拟合（calib_samples）共用本函数：拟合所依据的分与门禁
+/// 所测的分必须出自同一口径，否则校准阈值与运行时打分脱节。
+#[allow(clippy::type_complexity)]
+fn build_pair_chunks<F>(
+    jieba: &Jieba,
+    pairs: &[PairRecord],
+    mut sem_provider: F,
+) -> Vec<(Vec<CmpChunk>, Option<f32>, Option<Vec<Option<Vec<f32>>>>)>
+where
+    F: FnMut(&str, &str) -> (Option<f32>, Option<Vec<Option<Vec<f32>>>>),
+{
+    let mut built: Vec<(Vec<CmpChunk>, Option<f32>, Option<Vec<Option<Vec<f32>>>>)> =
+        Vec::with_capacity(pairs.len());
+    for r in pairs {
+        let (sem_cos, embs) = sem_provider(&r.text_a, &r.text_b);
+        let a = regr_build_chunk(jieba, format!("{}-a", r.id), 0, 0.0, &r.text_a, Vec::new());
+        let b = regr_build_chunk(jieba, format!("{}-b", r.id), 1, 0.0, &r.text_b, Vec::new());
+        built.push((vec![a, b], sem_cos, embs));
+    }
+    let idf = {
+        let lists = built.iter().flat_map(|(v, _, _)| v.iter().map(|c| c.tokens.as_slice()));
+        features::idf_of(lists)
+    };
+    for (v, _, _) in built.iter_mut() {
+        v[0].tfidf = features::weighted_vec(&v[0].tokens, &idf);
+        v[1].tfidf = features::weighted_vec(&v[1].tokens, &idf);
+    }
+    built
 }
 
 /// 段对层指标：对每个段对建两块 → fill_tfidf → recall 命中判定 + score_pair + classify_cluster
@@ -1249,27 +1360,10 @@ where
     let mut total_lbl: BTreeMap<&str, usize> = BTreeMap::new();
     let mut conf: HashMap<(&str, &str), usize> = HashMap::new();
 
-    // 先建齐全部段对的两侧分块，再用【全语料 IDF】填 TF-IDF——与生产 fill_tfidf 同口径。
-    // 关键：逐对局部 IDF 会让 lexical(tfidf 余弦) 与 char_ngram(jaccard) 退化为近似同一信号，
-    // W_LEXICAL/W_CHAR_NGRAM 的权重再分配对最终分几乎无影响（门禁对权重改动失灵）；全语料 IDF
-    // 下常见模板词权重被压低，lexical 变为「区分性词」信号，与 ngram 分离，权重改动才真正传导。
-    let mut built: Vec<(Vec<CmpChunk>, Option<f32>, Option<Vec<Option<Vec<f32>>>>)> =
-        Vec::with_capacity(pairs.len());
-    for r in pairs {
-        let (sem_cos, embs) = sem_provider(&r.text_a, &r.text_b);
-        let a = regr_build_chunk(jieba, format!("{}-a", r.id), 0, 0.0, &r.text_a, Vec::new());
-        let b = regr_build_chunk(jieba, format!("{}-b", r.id), 1, 0.0, &r.text_b, Vec::new());
-        built.push((vec![a, b], sem_cos, embs));
-    }
-    let idf = {
-        let lists = built.iter().flat_map(|(v, _, _)| v.iter().map(|c| c.tokens.as_slice()));
-        features::idf_of(lists)
-    };
+    let mut built = build_pair_chunks(jieba, pairs, &mut sem_provider);
     for ((v, sem_cos, embs), r) in built.iter_mut().zip(pairs) {
         let tl = static_label(&r.label);
         *total_lbl.entry(tl).or_default() += 1;
-        v[0].tfidf = features::weighted_vec(&v[0].tokens, &idf);
-        v[1].tfidf = features::weighted_vec(&v[1].tokens, &idf);
         let got = candidate::recall(v, embs.as_deref(), &params);
         if got.contains(&(0, 1)) && POSITIVE_LABELS.contains(&tl) {
             *recalled.entry(tl).or_default() += 1;
@@ -1307,6 +1401,170 @@ where
     (recall_rate, recall_by_label, labels, macro_f1)
 }
 
+/// 文档级隐形码点摘要（无 M2 全管线，用 sanitize_with_stats 逐文档聚合后交 grade 判级）。
+fn regr_evasion(text: &str) -> Option<EvasionSummary> {
+    let (_, st) = crate::engine::normalize::sanitize_with_stats(text);
+    if st.is_clean() {
+        return None;
+    }
+    let denom = text.chars().count().max(1) as f64;
+    let json = serde_json::json!({
+        "zeroWidth": st.zero_width,
+        "bidi": st.bidi,
+        "tags": st.tags,
+        "variation": st.variation,
+        "confusableFolds": st.confusable_folds,
+        "mixedScriptWords": st.mixed_script_words,
+        "affectedChunks": 1,
+        "maxChunkConcentration": st.perturbation_total() as f64 / denom,
+    });
+    EvasionSummary::from_evasion_json(&json.to_string())
+}
+
+/// 单个文档集的围标 score（无模型层）：解析各 docx → 无模型层文本管线得 peak/clusters +
+/// 取证信号（rsid/血缘/图片同源）+ 元数据同源 + evasion → collusion::assess_with。
+fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
+    docset_eval(jieba, dir, &manifest.docset_id, &manifest.docs).0
+}
+
+/// 文档集（或其文档子集）的围标评估：返回 (score, 全量连续特征向量)。
+/// 子集展开是 M7 拟合的样本来源之一——2–5 份是产品的真实使用形态，一组围标集的任意 2 份
+/// 子集仍是围标样本、独立集的子集仍是独立样本，故子集可作为独立训练样本使用。
+fn docset_eval(
+    jieba: &Jieba,
+    dir: &Path,
+    docset_id: &str,
+    doc_names: &[String],
+) -> (f32, [f32; collusion::FEATURE_COUNT]) {
+    use std::sync::atomic::AtomicBool;
+    let cancel = AtomicBool::new(false);
+    let sdir = dir.join("docsets").join(docset_id);
+    let mut doc_infos: Vec<DocInfo> = Vec::new();
+    let mut per_doc_images: Vec<Vec<collusion::ImageFp>> = Vec::new();
+    let mut evasion: Vec<Option<EvasionSummary>> = Vec::new();
+    let mut chunks: Vec<CmpChunk> = Vec::new();
+    // 商务标数值层（M6）：docsets 的围标正样本注入了「清单单价整组乘系数」（见 price_rows），
+    // 若此处不建 BOQ，numeric 恒 None ⇒ 五类数值信号在门禁里恒不触发、注入的等比证据被白白丢弃
+    // （M7 拟合 LR 时数值特征会成为死列）。故与生产同口径抽取表格行 → extract → align → pair_stats。
+    let mut per_doc_rows: Vec<Vec<crate::engine::boq::TableRowInput>> = Vec::new();
+    for (di, name) in doc_names.iter().enumerate() {
+        let path = sdir.join(name);
+        let pb = parse::parse_file_blocks(&path, &cancel)
+            .unwrap_or_else(|e| panic!("解析 {} 失败: {e}", path.display()));
+        let blocks: Vec<&parse::Block> =
+            pb.blocks.iter().filter(|b| b.text.chars().count() >= 2).collect();
+        let total = blocks.len().max(1);
+        let mut rows: Vec<crate::engine::boq::TableRowInput> = Vec::new();
+        for (rank, b) in blocks.iter().enumerate() {
+            if b.is_table_row {
+                rows.push(crate::engine::boq::TableRowInput {
+                    chunk_id: format!("{docset_id}-{di}-{rank}"),
+                    text: b.text.clone(),
+                    page: b.page.map(|p| p as i64),
+                    order_index: rank as i64,
+                });
+            }
+            let rel = if total > 1 { rank as f32 / (total - 1) as f32 } else { 0.0 };
+            let mut c = regr_build_chunk(
+                jieba,
+                format!("{docset_id}-{di}-{rank}"),
+                di,
+                rel,
+                &b.text,
+                Vec::new(),
+            );
+            c.is_table_row = b.is_table_row;
+            if !c.tokens.is_empty() {
+                chunks.push(c);
+            }
+        }
+        per_doc_images.push(
+            pb.image_hashes
+                .iter()
+                .map(|h| collusion::ImageFp { sha256: h.sha256.clone(), dhash: h.dhash, page: h.page })
+                .collect(),
+        );
+        per_doc_rows.push(rows);
+        evasion.push(regr_evasion(&pb.legacy_text));
+        doc_infos.push(DocInfo {
+            id: format!("{docset_id}-{di}"),
+            name: name.clone(),
+            doc_type: "docx".into(),
+            pages: pb.pages,
+            char_count: pb.legacy_text.chars().count(),
+            fingerprint: pb.fingerprint,
+            parse_error: None,
+            evasion: evasion[di].clone(),
+        });
+    }
+    fill_tfidf(&mut chunks);
+    let params = candidate::RecallParams {
+        top_k: 100,
+        stop_gram_df: (chunks.len() / 10).max(256),
+        ..Default::default()
+    };
+    let cands = candidate::recall(&chunks, None, &params);
+    let mut edges = Vec::new();
+    for (i, j) in cands {
+        let parts = scoring::score_pair(&chunks[i as usize], &chunks[j as usize], None);
+        if parts.final_score >= REGRESSION_THRESHOLD {
+            edges.push(clustering::ScoredEdge { a: i, b: j, parts });
+        }
+    }
+    let raw = clustering::cluster(&chunks, &edges, REGRESSION_THRESHOLD);
+    let (_m, peak) = matrix::doc_matrix(doc_infos.len(), &chunks, &raw);
+    let r_clusters: Vec<RCluster> = raw
+        .iter()
+        .map(|rc| {
+            let docs_set: BTreeSet<usize> = rc.members.iter().map(|&i| chunks[i as usize].doc).collect();
+            RCluster {
+                avg_score: rc.avg,
+                peak: rc.peak,
+                docs: docs_set.into_iter().collect(),
+                segments: rc
+                    .members
+                    .iter()
+                    .map(|&i| ClusterSeg { doc: chunks[i as usize].doc, text: chunks[i as usize].text.clone() })
+                    .collect(),
+                exempted: false,
+                anomaly: false,
+            }
+        })
+        .collect();
+    fingerprint::cross_flags(&mut doc_infos);
+    let empty: HashSet<String> = HashSet::new();
+    let rsid = fingerprint::rsid_pairs(&mut doc_infos, &empty);
+    let lineage = fingerprint::lineage_pairs(&mut doc_infos);
+    let images = collusion::image_pairs(&per_doc_images, &empty);
+    // 数值层聚合与生产同口径：extract → align → pair_stats → numeric_evidence_of（复用
+    // compare_service 的聚合函数而非在此复制，避免门禁与生产口径漂移）。无表格行 ⇒ None，
+    // 此时回落到旧「报价梯度」信号，与生产一致。
+    let per_doc_items: Vec<Vec<crate::engine::boq::BoqItem>> = per_doc_rows
+        .iter()
+        .map(|rows| crate::engine::boq::extract_document(rows).items)
+        .collect();
+    let item_count: usize = per_doc_items.iter().map(|v| v.len()).sum();
+    let numeric = (item_count > 0).then(|| {
+        let aligned = crate::engine::boq::align(&per_doc_items);
+        let pairs = crate::engine::boq::pair_stats(&per_doc_items, &aligned, REGRESSION_ALARM_LINE);
+        crate::services::compare_service::numeric_evidence_of(&pairs, REGRESSION_ALARM_LINE)
+    });
+    let inputs = collusion::CollusionInputs {
+        peak,
+        clusters: &r_clusters,
+        docs: &doc_infos,
+        rsid_hits: &rsid,
+        lineage_hits: &lineage,
+        image_hits: &images,
+        evasion: &evasion,
+        numeric: numeric.as_ref(),
+        ..Default::default()
+    };
+    let features = collusion::feature_vector(&inputs);
+    (collusion::assess_with(inputs).score, features)
+}
+
+/// Mann-Whitney U（含并列平均秩）→ AUC；任一侧为空回落 0.5。
 /// 外部真值语料的连续分打分：复用生产打分口径（regr_build_chunk → 全语料 IDF →
 /// score_pair 取连续 final_score），返回 (final_score, 归一化真值 label) 序列，供
 /// extcalib 出 P-R/ROC/校准指标。
@@ -1349,127 +1607,6 @@ pub fn score_external_pairs(
     out
 }
 
-/// 文档级隐形码点摘要（无 M2 全管线，用 sanitize_with_stats 逐文档聚合后交 grade 判级）。
-fn regr_evasion(text: &str) -> Option<EvasionSummary> {
-    let (_, st) = crate::engine::normalize::sanitize_with_stats(text);
-    if st.is_clean() {
-        return None;
-    }
-    let denom = text.chars().count().max(1) as f64;
-    let json = serde_json::json!({
-        "zeroWidth": st.zero_width,
-        "bidi": st.bidi,
-        "tags": st.tags,
-        "variation": st.variation,
-        "confusableFolds": st.confusable_folds,
-        "mixedScriptWords": st.mixed_script_words,
-        "affectedChunks": 1,
-        "maxChunkConcentration": st.perturbation_total() as f64 / denom,
-    });
-    EvasionSummary::from_evasion_json(&json.to_string())
-}
-
-/// 单个文档集的围标 score（无模型层）：解析各 docx → 无模型层文本管线得 peak/clusters +
-/// 取证信号（rsid/血缘/图片同源）+ 元数据同源 + evasion → collusion::assess_with。
-fn docset_score(jieba: &Jieba, dir: &Path, manifest: &DocsetManifest) -> f32 {
-    use std::sync::atomic::AtomicBool;
-    let cancel = AtomicBool::new(false);
-    let sdir = dir.join("docsets").join(&manifest.docset_id);
-    let mut doc_infos: Vec<DocInfo> = Vec::new();
-    let mut per_doc_images: Vec<Vec<collusion::ImageFp>> = Vec::new();
-    let mut evasion: Vec<Option<EvasionSummary>> = Vec::new();
-    let mut chunks: Vec<CmpChunk> = Vec::new();
-    for (di, name) in manifest.docs.iter().enumerate() {
-        let path = sdir.join(name);
-        let pb = parse::parse_file_blocks(&path, &cancel)
-            .unwrap_or_else(|e| panic!("解析 {} 失败: {e}", path.display()));
-        let blocks: Vec<&parse::Block> =
-            pb.blocks.iter().filter(|b| b.text.chars().count() >= 2).collect();
-        let total = blocks.len().max(1);
-        for (rank, b) in blocks.iter().enumerate() {
-            let rel = if total > 1 { rank as f32 / (total - 1) as f32 } else { 0.0 };
-            let mut c = regr_build_chunk(
-                jieba,
-                format!("{}-{}-{}", manifest.docset_id, di, rank),
-                di,
-                rel,
-                &b.text,
-                Vec::new(),
-            );
-            c.is_table_row = b.is_table_row;
-            if !c.tokens.is_empty() {
-                chunks.push(c);
-            }
-        }
-        per_doc_images.push(
-            pb.image_hashes
-                .iter()
-                .map(|h| collusion::ImageFp { sha256: h.sha256.clone(), dhash: h.dhash, page: h.page })
-                .collect(),
-        );
-        evasion.push(regr_evasion(&pb.legacy_text));
-        doc_infos.push(DocInfo {
-            id: format!("{}-{}", manifest.docset_id, di),
-            name: name.clone(),
-            doc_type: "docx".into(),
-            pages: pb.pages,
-            char_count: pb.legacy_text.chars().count(),
-            fingerprint: pb.fingerprint,
-            parse_error: None,
-            evasion: evasion[di].clone(),
-        });
-    }
-    fill_tfidf(&mut chunks);
-    let params = candidate::RecallParams {
-        top_k: 100,
-        stop_gram_df: (chunks.len() / 10).max(256),
-        ..Default::default()
-    };
-    let cands = candidate::recall(&chunks, None, &params);
-    let mut edges = Vec::new();
-    for (i, j) in cands {
-        let parts = scoring::score_pair(&chunks[i as usize], &chunks[j as usize], None);
-        if parts.final_score >= REGRESSION_THRESHOLD {
-            edges.push(clustering::ScoredEdge { a: i, b: j, parts });
-        }
-    }
-    let raw = clustering::cluster(&chunks, &edges, REGRESSION_THRESHOLD);
-    let (_m, peak) = matrix::doc_matrix(doc_infos.len(), &chunks, &raw);
-    let r_clusters: Vec<RCluster> = raw
-        .iter()
-        .map(|rc| {
-            let docs_set: BTreeSet<usize> = rc.members.iter().map(|&i| chunks[i as usize].doc).collect();
-            RCluster {
-                avg_score: rc.avg,
-                peak: rc.peak,
-                docs: docs_set.into_iter().collect(),
-                segments: rc
-                    .members
-                    .iter()
-                    .map(|&i| ClusterSeg { doc: chunks[i as usize].doc, text: chunks[i as usize].text.clone() })
-                    .collect(),
-            }
-        })
-        .collect();
-    fingerprint::cross_flags(&mut doc_infos);
-    let empty: HashSet<String> = HashSet::new();
-    let rsid = fingerprint::rsid_pairs(&mut doc_infos, &empty);
-    let lineage = fingerprint::lineage_pairs(&mut doc_infos);
-    let images = collusion::image_pairs(&per_doc_images, &empty);
-    let col = collusion::assess_with(collusion::CollusionInputs {
-        peak,
-        clusters: &r_clusters,
-        docs: &doc_infos,
-        rsid_hits: &rsid,
-        lineage_hits: &lineage,
-        image_hits: &images,
-        evasion: &evasion,
-        ..Default::default()
-    });
-    col.score
-}
-
-/// Mann-Whitney U（含并列平均秩）→ AUC；任一侧为空回落 0.5。
 /// pub(crate)：extcalib 的 ROC-AUC 复用同一实现，避免重复。
 pub(crate) fn auc_score(pos: &[f64], neg: &[f64]) -> f64 {
     if pos.is_empty() || neg.is_empty() {
@@ -1529,15 +1666,40 @@ fn read_docset_manifests(path: &Path) -> Vec<DocsetManifest> {
         .collect()
 }
 
+/// 文本夹具的换行归一：CRLF/CR → LF。守卫按【内容】而非字节判定，才能跨平台成立——
+/// Windows 检出默认把文本转 CRLF，直接哈希原始字节会让同一提交在不同平台算出不同 hash
+/// （CI 上表现为「语料已变更但基线未同步」的误报）。.gitattributes 已关闭 fixtures 的 EOL
+/// 转换，这里是纵深防御：即便某处 checkout 设置漏网，守卫仍只对真实内容变更报警。
+/// 仅用于文本夹具；docx 等二进制字节【不得】做此替换。
+fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                out.push(b'\n');
+                // CRLF 视作一个换行
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
 fn sha256_of_file(p: &Path) -> String {
     let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("读取 {} 失败: {e}", p.display()));
-    crate::engine::normalize::sha256_hex(&bytes)
+    crate::engine::normalize::sha256_hex(&normalize_eol(&bytes))
 }
 
 /// docsets 内容 hash：清单字节 ++ 逐组逐份（id + 文件名 + docx 字节）。
 fn docsets_hash(dir: &Path) -> String {
     let manifest_path = dir.join("docsets.jsonl");
-    let mut buf = std::fs::read(&manifest_path).unwrap_or_default();
+    // 清单是文本 → 换行归一（见 normalize_eol）；下面的 docx 是二进制，按原始字节参与。
+    let mut buf = normalize_eol(&std::fs::read(&manifest_path).unwrap_or_default());
     for m in read_docset_manifests(&manifest_path) {
         for name in &m.docs {
             buf.extend_from_slice(m.docset_id.as_bytes());
@@ -1575,11 +1737,45 @@ pub fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/corpus")
 }
 
+/// 三带指标：随包校准文件作用在全量段对上（无校准文件 → 全零 + routing 空串）。
+pub fn band_metrics(jieba: &Jieba, pairs: &[PairRecord]) -> BandMetrics {
+    let Some(model) = calibrate::active_calibration() else { return BandMetrics::default() };
+    let samples = calib_samples(jieba, pairs);
+    if samples.is_empty() {
+        return BandMetrics::default();
+    }
+    let bands: Vec<&str> = samples.iter().map(|s| model.evaluate(s.score as f32).1).collect();
+    let n = samples.len() as f64;
+    let share = |b: &str| bands.iter().filter(|x| **x == b).count() as f64 / n;
+    let rate = |want_pos: bool, b: &str| -> f64 {
+        let idx: Vec<usize> =
+            (0..samples.len()).filter(|&i| (samples[i].y > 0.5) == want_pos).collect();
+        if idx.is_empty() {
+            0.0
+        } else {
+            idx.iter().filter(|&&i| bands[i] == b).count() as f64 / idx.len() as f64
+        }
+    };
+    BandMetrics {
+        routing: model.routing.as_str().to_string(),
+        // 定点化：α/β 由 f32 提升而来，直接写会带 f32 末位噪声（0.05000000074…），
+        // 让基线文件的 diff 难读。
+        alpha: round6_f64(model.alpha as f64),
+        beta: round6_f64(model.beta as f64),
+        pass_fnr: rate(true, calibrate::BAND_PASS),
+        flag_fpr: rate(false, calibrate::BAND_FLAG),
+        pass_share: share(calibrate::BAND_PASS),
+        review_share: share(calibrate::BAND_REVIEW),
+        flag_share: share(calibrate::BAND_FLAG),
+    }
+}
+
 /// 无模型层跑全语料 → 分层指标（+ 语料 hash + count）。git_rev/generated_at 由调用方填。
 pub fn compute_fast_metrics(jieba: &Jieba, dir: &Path) -> RegressionMetrics {
     let pairs = read_pairs(&dir.join("pairs.jsonl"));
     let (recall_rate, recall_by_label, labels, macro_f1) =
         pair_stats(jieba, &pairs, |_, _| (None, None));
+    let bands = band_metrics(jieba, &pairs);
     let (auc, mean_pos, mean_neg, ndoc) = docset_auc(jieba, dir);
     RegressionMetrics {
         lane: "fast".into(),
@@ -1587,6 +1783,7 @@ pub fn compute_fast_metrics(jieba: &Jieba, dir: &Path) -> RegressionMetrics {
         recall_by_label,
         labels,
         macro_f1,
+        bands,
         collusion_auc: auc,
         mean_collusion_score: mean_pos,
         mean_independent_score: mean_neg,
@@ -1605,6 +1802,9 @@ pub fn compute_fast_metrics(jieba: &Jieba, dir: &Path) -> RegressionMetrics {
 const F1_TOL: f64 = 0.02; // per-label F1 漂移带（双向）
 const RECALL_TOL: f64 = 0.01; // 召回率下降带（单向）
 const AUC_TOL: f64 = 0.03; // AUC 下降带（单向）
+/// 三带带内错误率漂移带（单向恶化）与复核带占比上限（执行方案 §8 验收②③）。
+const BAND_TOL: f64 = 0.02;
+const REVIEW_SHARE_MAX: f64 = 0.40;
 
 /// 门禁判定：
 /// - 召回率（整体 + 分标签）单向下降 >1pp、AUC 单向下降 >0.03 → 回退，失败。
@@ -1635,6 +1835,44 @@ pub fn gate_failures(base: &RegressionMetrics, cur: &RegressionMetrics) -> Vec<S
     if cur.collusion_auc < base.collusion_auc - AUC_TOL {
         f.push(format!("围标层 AUC 下降 >0.03：{:.4} → {:.4}", base.collusion_auc, cur.collusion_auc));
     }
+    // 三带层（W6-4）：①分流模式变了必须显式重新入库基线（改 α 即改承诺语义，不容静默漂移）；
+    // ②带内错误率相对基线恶化 >2pp；③【绝对线】分流生效时 pass 带漏检率 ≤α+2pp、flag 带
+    // 误报率 ≤β+2pp、复核带占比 ≤40%（执行方案 §8 验收②③）。
+    if cur.bands.routing != base.bands.routing {
+        f.push(format!("三带分流模式变更：{} → {}", base.bands.routing, cur.bands.routing));
+    }
+    if cur.bands.pass_fnr > base.bands.pass_fnr + BAND_TOL {
+        f.push(format!(
+            "低优先级抽查带漏检率上升 >2pp：{:.4} → {:.4}",
+            base.bands.pass_fnr, cur.bands.pass_fnr
+        ));
+    }
+    if cur.bands.flag_fpr > base.bands.flag_fpr + BAND_TOL {
+        f.push(format!(
+            "重点标红带误报率上升 >2pp：{:.4} → {:.4}",
+            base.bands.flag_fpr, cur.bands.flag_fpr
+        ));
+    }
+    if cur.bands.routing == "three-band" {
+        if cur.bands.pass_fnr > cur.bands.alpha + BAND_TOL {
+            f.push(format!(
+                "低优先级抽查带漏检率 {:.4} 超过 α+2pp（α={:.4}）",
+                cur.bands.pass_fnr, cur.bands.alpha
+            ));
+        }
+        if cur.bands.flag_fpr > cur.bands.beta + BAND_TOL {
+            f.push(format!(
+                "重点标红带误报率 {:.4} 超过 β+2pp（β={:.4}）",
+                cur.bands.flag_fpr, cur.bands.beta
+            ));
+        }
+        if cur.bands.review_share > REVIEW_SHARE_MAX {
+            f.push(format!(
+                "需人工复核带占比 {:.4} 超过上限 {REVIEW_SHARE_MAX}（放宽 α 或回退 review-all 并如实展示）",
+                cur.bands.review_share
+            ));
+        }
+    }
     f
 }
 
@@ -1660,6 +1898,15 @@ pub fn render_compare(base: &RegressionMetrics, cur: &RegressionMetrics) -> Stri
         );
     }
     let _ = writeln!(s, "macro-F1:          {:.4} → {:.4}", base.macro_f1, cur.macro_f1);
+    let _ = writeln!(
+        s,
+        "三带层（分流 {} → {}）：漏检率 {:.4}→{:.4} / 误报率 {:.4}→{:.4} / 复核带占比 {:.4}→{:.4}",
+        if base.bands.routing.is_empty() { "—" } else { &base.bands.routing },
+        if cur.bands.routing.is_empty() { "—" } else { &cur.bands.routing },
+        base.bands.pass_fnr, cur.bands.pass_fnr,
+        base.bands.flag_fpr, cur.bands.flag_fpr,
+        base.bands.review_share, cur.bands.review_share
+    );
     let _ = writeln!(
         s,
         "围标层 AUC:        {:.4} → {:.4}  (collusion均分 {:.3}→{:.3} / independent均分 {:.3}→{:.3})",
@@ -1697,6 +1944,891 @@ pub fn hash_mismatch_message(base: &RegressionMetrics, cur: &RegressionMetrics) 
         short8(&base.docsets_hash),
         short8(&cur.docsets_hash),
     ))
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// 围标信号融合拟合（执行方案 §8 W6-3 / M7）：docsets 语料 → log-LR 权重
+//
+// 与设计的偏差（已在 §1.2 裁决内）：原设计只拟合「旧五信号」，此处对 M1–M6 全量 16 类特征
+// 一次性拟合。三点工程约束写在这里，评审时一并看：
+//  ① 样本量：docsets 只有 12 组，16 列拟合会退化。故按【文档子集展开】补样本——一组围标集
+//     的任意 2 份子集仍是围标样本，独立集子集仍是独立样本，且 2–5 份正是产品真实形态。
+//  ② 先验：L2 向【v1 经验权重】收缩而非向 0 收缩。向 0 收缩会让语料里没有区分度的列静默死掉
+//     （例如「报价梯度」只在无 BOQ 时才出，docsets 恒有 BOQ ⇒ 该列全零），上线即等于删信号。
+//     向经验先验收缩时，无数据的列自然保留经验权重，有数据的列才被语料推动（MAP 估计）。
+//  ③ 符号：牛顿步后投影到 [0, 上限]，从构造上杜绝负权重（§1.5-4：负权重在监管场景解释不通），
+//     运行时 parse_lr_model 再审查一次。
+//
+// 合成语料的系统性乐观（§8 风险①/④）照旧成立：权重文件标 calibrationKind=
+// experimental-synthetic，真实判例回测前不摘实验性标签。
+// ————————————————————————————————————————————————————————————————————————
+
+/// 一条拟合样本：全量连续特征 + 标签（1=collusion / 0=independent）。
+pub struct FitSample {
+    pub id: String,
+    pub x: Vec<f64>,
+    pub y: f64,
+}
+
+/// L2 强度（向经验先验收缩）。取值依据：λ→0 时 16 列在 48 样本上近可分、权重发散；λ 过大则
+/// 语料完全不起作用。0.5 是在留出集 AUC 与「文本层单证据仍达 medium」的产品锚点之间的取值。
+const FIT_LAMBDA: f64 = 0.5;
+/// 牛顿迭代上限与收敛阈。
+const FIT_ITERS: usize = 200;
+const FIT_TOL: f64 = 1e-9;
+/// 留出集比例：每 5 条取 1 条（按标签分层、按固定序号取，确定性可复现）。
+const FIT_HOLDOUT_EVERY: usize = 5;
+/// 权重上限（与 collusion::parse_lr_model 的量级审查一致，投影时用）。
+const FIT_WEIGHT_MAX: f64 = 20.0;
+const FIT_INTERCEPT_MIN: f64 = -40.0;
+/// 截距上限：必须为负（零证据不得抬底分，验收④）。
+const FIT_INTERCEPT_MAX: f64 = -0.05;
+
+/// docsets → 拟合样本（全集 + 各 2 份子集）。顺序固定 ⇒ 拟合结果可复现。
+pub fn collusion_fit_samples(jieba: &Jieba, dir: &Path) -> Vec<FitSample> {
+    let manifests = read_docset_manifests(&dir.join("docsets.jsonl"));
+    let mut out = Vec::new();
+    for m in &manifests {
+        let y = if m.label == "collusion" { 1.0 } else { 0.0 };
+        let mut combos: Vec<(String, Vec<String>)> = vec![("all".to_string(), m.docs.clone())];
+        for i in 0..m.docs.len() {
+            for j in (i + 1)..m.docs.len() {
+                combos.push((format!("{i}{j}"), vec![m.docs[i].clone(), m.docs[j].clone()]));
+            }
+        }
+        for (tag, docs) in combos {
+            let (_, feats) = docset_eval(jieba, dir, &m.docset_id, &docs);
+            out.push(FitSample {
+                id: format!("{}#{tag}", m.docset_id),
+                x: feats.iter().map(|v| *v as f64).collect(),
+                y,
+            });
+        }
+    }
+    out
+}
+
+/// 高斯消元（部分主元）解 H·δ = g；H 奇异时返回 None。
+fn solve_linear(mut h: Vec<Vec<f64>>, mut g: Vec<f64>) -> Option<Vec<f64>> {
+    let n = g.len();
+    for c in 0..n {
+        let (mut piv, mut best) = (c, h[c][c].abs());
+        for (r, row) in h.iter().enumerate().skip(c + 1) {
+            if row[c].abs() > best {
+                best = row[c].abs();
+                piv = r;
+            }
+        }
+        if best < 1e-12 {
+            return None;
+        }
+        h.swap(c, piv);
+        g.swap(c, piv);
+        for r in (c + 1)..n {
+            let f = h[r][c] / h[c][c];
+            if f == 0.0 {
+                continue;
+            }
+            let (upper, lower) = h.split_at_mut(r);
+            let pivot = &upper[c];
+            for (k, v) in lower[0].iter_mut().enumerate().skip(c) {
+                *v -= f * pivot[k];
+            }
+            g[r] -= f * g[c];
+        }
+    }
+    let mut out = vec![0.0; n];
+    for c in (0..n).rev() {
+        let mut s = g[c];
+        for k in (c + 1)..n {
+            s -= h[c][k] * out[k];
+        }
+        out[c] = s / h[c][c];
+    }
+    Some(out)
+}
+
+/// 逻辑回归 MAP 估计：最大化 Σ logLik − (λ/2)‖θ−θ₀‖²，牛顿法（IRLS）+ 每步投影
+/// （权重非负且有上限、截距为负）。θ[0] 为截距，θ[1..] 与 FEATURE_KINDS 同序。
+pub fn fit_logistic(samples: &[FitSample], prior: &[f64], lambda: f64) -> Vec<f64> {
+    let d = prior.len();
+    let mut theta = prior.to_vec();
+    for _ in 0..FIT_ITERS {
+        let mut grad = vec![0.0f64; d];
+        let mut hess = vec![vec![0.0f64; d]; d];
+        for s in samples {
+            let mut z = theta[0];
+            for (k, xi) in s.x.iter().enumerate() {
+                z += theta[k + 1] * xi;
+            }
+            let p = 1.0 / (1.0 + (-z).exp());
+            let w = (p * (1.0 - p)).max(1e-9);
+            let xi: Vec<f64> = std::iter::once(1.0).chain(s.x.iter().copied()).collect();
+            for a in 0..d {
+                grad[a] += (s.y - p) * xi[a];
+                for b in 0..d {
+                    hess[a][b] += w * xi[a] * xi[b];
+                }
+            }
+        }
+        for a in 0..d {
+            grad[a] -= lambda * (theta[a] - prior[a]);
+            hess[a][a] += lambda;
+        }
+        let Some(step) = solve_linear(hess, grad) else { break };
+        let mut delta = 0.0f64;
+        for a in 0..d {
+            let next = theta[a] + step[a];
+            let clamped = if a == 0 {
+                next.clamp(FIT_INTERCEPT_MIN, FIT_INTERCEPT_MAX)
+            } else {
+                next.clamp(0.0, FIT_WEIGHT_MAX)
+            };
+            delta = delta.max((clamped - theta[a]).abs());
+            theta[a] = clamped;
+        }
+        if delta < FIT_TOL {
+            break;
+        }
+    }
+    theta
+}
+
+/// Cllr（对数似然比代价，法庭比对标准指标）：0 = 完美，1 = 与「不给信息」等价。
+/// LR 由后验概率在等先验下换算：LR = p/(1−p)。
+pub fn cllr(pos: &[f64], neg: &[f64]) -> f64 {
+    if pos.is_empty() || neg.is_empty() {
+        return f64::NAN;
+    }
+    let clamp = |p: f64| p.clamp(1e-9, 1.0 - 1e-9);
+    let a: f64 = pos.iter().map(|&p| {
+        let lr = clamp(p) / (1.0 - clamp(p));
+        (1.0 + 1.0 / lr).log2()
+    }).sum::<f64>() / pos.len() as f64;
+    let b: f64 = neg.iter().map(|&p| {
+        let lr = clamp(p) / (1.0 - clamp(p));
+        (1.0 + lr).log2()
+    }).sum::<f64>() / neg.len() as f64;
+    0.5 * (a + b)
+}
+
+/// 拟合报告（打印 + 写入权重文件的台账段）。
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FitReport {
+    pub lambda: f64,
+    pub samples: usize,
+    pub train_samples: usize,
+    pub holdout_samples: usize,
+    pub train_auc: f64,
+    pub holdout_auc: f64,
+    pub holdout_cllr: f64,
+    /// 线性基线（v1 经验权重经同一 σ 通道）的留出集 Cllr，供「Cllr < 线性基线」验收对照。
+    pub holdout_cllr_linear_baseline: f64,
+    /// 语料中无区分度（全零/零方差）的特征列：这些列的权重保持经验先验，不由语料决定。
+    pub dead_columns: Vec<String>,
+    /// 各特征列在训练集正/负类上的均值——【人工审查系数符号与量级的依据】（§1.5-4）：
+    /// 正类均值明显高于负类却拿到小权重、或反之，都是需要人工介入的信号。
+    pub feature_mean_positive: BTreeMap<String, f64>,
+    pub feature_mean_negative: BTreeMap<String, f64>,
+    /// 分级线来源：v1-lines-verified（留出集验证后沿用 v1 等级语义）| holdout-derived。
+    pub level_source: String,
+    pub docsets_hash: String,
+    pub pairs_hash: String,
+    pub git_rev: String,
+    pub fitted_at: String,
+}
+
+/// 在 docsets 语料上拟合融合权重并写出 collusion_lr.json；返回 (模型, 报告)。
+pub fn fit_collusion(jieba: &Jieba, dir: &Path) -> (collusion::LrModel, FitReport) {
+    let samples = collusion_fit_samples(jieba, dir);
+    let prior_model = collusion::empirical_prior();
+    let mut prior: Vec<f64> = Vec::with_capacity(collusion::FEATURE_COUNT + 1);
+    prior.push(prior_model.intercept as f64);
+    prior.extend(prior_model.weights.iter().map(|w| *w as f64));
+
+    // 分层 8/2 切分：同标签内按固定序号每 5 取 1 进留出集（确定性）。
+    let (mut train, mut holdout): (Vec<&FitSample>, Vec<&FitSample>) = (Vec::new(), Vec::new());
+    let (mut np, mut nn) = (0usize, 0usize);
+    for s in &samples {
+        let seq = if s.y > 0.5 {
+            np += 1;
+            np
+        } else {
+            nn += 1;
+            nn
+        };
+        if seq % FIT_HOLDOUT_EVERY == 0 {
+            holdout.push(s);
+        } else {
+            train.push(s);
+        }
+    }
+    let train_owned: Vec<FitSample> = train
+        .iter()
+        .map(|s| FitSample { id: s.id.clone(), x: s.x.clone(), y: s.y })
+        .collect();
+    let theta = fit_logistic(&train_owned, &prior, FIT_LAMBDA);
+
+    // 死列检测（列在训练集上全零 ⇒ 语料没给任何信息）：权重回落经验先验，避免上线即删信号。
+    // 系数在此就地按 6 位小数定点化：与落盘精度一致 ⇒ 分级线由【落盘后的同一组系数】算出，
+    // 不会因写文件的舍入而与运行时求值错位。
+    let round6 = |v: f64| ((v * 1e6).round() / 1e6) as f32;
+    let mut dead_columns = Vec::new();
+    let mut weights = [0f32; collusion::FEATURE_COUNT];
+    for (i, kind) in collusion::FEATURE_KINDS.iter().enumerate() {
+        let col_max = train_owned.iter().map(|s| s.x[i]).fold(0.0f64, f64::max);
+        if col_max <= 0.0 {
+            dead_columns.push((*kind).to_string());
+            weights[i] = round6(prior[i + 1]);
+        } else {
+            weights[i] = round6(theta[i + 1]);
+        }
+    }
+    let intercept = round6(theta[0]);
+
+    // 分级线：先取 v1 三线在【本模型 score 尺度】上的等效位置（v1_line_equivalent：证据量按
+    // 经验尺度换算，保证「尺子没变、只是权重被语料调整」），再在留出集上验证——正样本不得掉
+    // 到 medium 线下、负样本不得越过 medium 线；不满足才按留出集重定。
+    let probe = collusion::LrModel::from_parts(
+        collusion::CALIBRATION_EXPERIMENTAL,
+        "probe",
+        intercept,
+        weights,
+        (0.9, 0.5, 0.1),
+    );
+    let v1_lines = (
+        probe.v1_line_equivalent(collusion::LEVEL_HIGH),
+        probe.v1_line_equivalent(collusion::LEVEL_MEDIUM),
+        probe.v1_line_equivalent(collusion::LEVEL_LOW),
+    );
+    let strength_of = |m: &collusion::LrModel, s: &FitSample| -> f64 {
+        let mut x = [0f32; collusion::FEATURE_COUNT];
+        for (i, v) in s.x.iter().enumerate() {
+            x[i] = *v as f32;
+        }
+        m.evaluate(&x).1 as f64
+    };
+    let hpos: Vec<f64> = holdout.iter().filter(|s| s.y > 0.5).map(|s| strength_of(&probe, s)).collect();
+    let hneg: Vec<f64> = holdout.iter().filter(|s| s.y <= 0.5).map(|s| strength_of(&probe, s)).collect();
+    let min_pos = hpos.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_neg = hneg.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let v1_ok = !hpos.is_empty()
+        && !hneg.is_empty()
+        && min_pos >= v1_lines.1 as f64
+        && max_neg < v1_lines.1 as f64;
+    let (levels, level_source) = if v1_ok {
+        (v1_lines, "v1-equivalent-verified".to_string())
+    } else {
+        // 留出集重定：medium 取正负分界中点，high 取中点与正样本下界的中点，low 取 medium 的半档。
+        let mid = ((max_neg + min_pos) / 2.0).clamp(0.02, 0.95) as f32;
+        let hi = ((mid as f64 + min_pos) / 2.0).clamp(mid as f64 + 0.01, 0.99) as f32;
+        ((hi, mid, (mid * 0.5).max(1e-3)), "holdout-derived".to_string())
+    };
+    let version = format!("m7-lr-{}", &docsets_hash(dir)[..8]);
+    let model = collusion::LrModel::from_parts(
+        collusion::CALIBRATION_EXPERIMENTAL,
+        &version,
+        intercept,
+        weights,
+        levels,
+    );
+
+    let probs = |m: &collusion::LrModel, set: &[&FitSample], pos: bool| -> Vec<f64> {
+        set.iter()
+            .filter(|s| (s.y > 0.5) == pos)
+            .map(|s| {
+                let mut x = [0f32; collusion::FEATURE_COUNT];
+                for (i, v) in s.x.iter().enumerate() {
+                    x[i] = *v as f32;
+                }
+                m.evaluate(&x).0 as f64
+            })
+            .collect()
+    };
+    let train_refs: Vec<&FitSample> = train_owned.iter().collect();
+    let col_mean = |pos: bool, i: usize| -> f64 {
+        let v: Vec<f64> =
+            train_owned.iter().filter(|s| (s.y > 0.5) == pos).map(|s| s.x[i]).collect();
+        if v.is_empty() {
+            0.0
+        } else {
+            (v.iter().sum::<f64>() / v.len() as f64 * 1e4).round() / 1e4
+        }
+    };
+    let mut feature_mean_positive = BTreeMap::new();
+    let mut feature_mean_negative = BTreeMap::new();
+    for (i, k) in collusion::FEATURE_KINDS.iter().enumerate() {
+        feature_mean_positive.insert((*k).to_string(), col_mean(true, i));
+        feature_mean_negative.insert((*k).to_string(), col_mean(false, i));
+    }
+    let report = FitReport {
+        lambda: FIT_LAMBDA,
+        samples: samples.len(),
+        train_samples: train_owned.len(),
+        holdout_samples: holdout.len(),
+        train_auc: auc_score(&probs(&model, &train_refs, true), &probs(&model, &train_refs, false)),
+        holdout_auc: auc_score(&probs(&model, &holdout, true), &probs(&model, &holdout, false)),
+        holdout_cllr: cllr(&probs(&model, &holdout, true), &probs(&model, &holdout, false)),
+        holdout_cllr_linear_baseline: cllr(
+            &probs(&prior_model, &holdout, true),
+            &probs(&prior_model, &holdout, false),
+        ),
+        dead_columns,
+        feature_mean_positive,
+        feature_mean_negative,
+        level_source,
+        docsets_hash: docsets_hash(dir),
+        pairs_hash: sha256_of_file(&dir.join("pairs.jsonl")),
+        git_rev: git_rev(),
+        fitted_at: today_utc(),
+    };
+    (model, report)
+}
+
+/// 权重文件序列化（6 位小数定点，便于评审 diff 且逐次可复现）。
+pub fn lr_json(model: &collusion::LrModel, report: &FitReport) -> String {
+    let round = |v: f32| (v as f64 * 1e6).round() / 1e6;
+    let weights: serde_json::Map<String, serde_json::Value> = collusion::FEATURE_KINDS
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ((*k).to_string(), serde_json::json!(round(model.weights[i]))))
+        .collect();
+    let body = serde_json::json!({
+        "calibrationKind": model.calibration_kind,
+        "version": model.version,
+        "note": "实验性校准（合成语料）：权重由 fixtures/corpus/docsets 拟合，L2 向 v1 经验权重收缩；\
+                 概率为合成语料校准值、不是串通概率；真实判例回测前不作为唯一依据。\
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-collusion",
+        "intercept": round(model.intercept),
+        "weights": serde_json::Value::Object(weights),
+        "levels": {
+            "high": round(model.level_high),
+            "medium": round(model.level_medium),
+            "low": round(model.level_low),
+        },
+        "fit": report,
+    });
+    format!("{}\n", serde_json::to_string_pretty(&body).expect("serialize lr json"))
+}
+
+/// 拟合指标速览（CLI 打印）。
+pub fn render_fit(model: &collusion::LrModel, report: &FitReport) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "== 围标融合 LR 拟合（λ={} 样本 {}=训练 {}+留出 {}）==",
+        report.lambda, report.samples, report.train_samples, report.holdout_samples
+    );
+    let _ = writeln!(s, "截距 b = {:.4}（零证据基线，score 已按其重基归零）", model.intercept);
+    let prior = collusion::empirical_prior();
+    for (i, k) in collusion::FEATURE_KINDS.iter().enumerate() {
+        let dead = if report.dead_columns.iter().any(|d| d == k) { "  [死列→保留先验]" } else { "" };
+        let _ = writeln!(
+            s,
+            "  {k:<20} w = {:>7.4}  (先验 {:>6.4})  正类均值 {:.3} / 负类均值 {:.3}{dead}",
+            model.weights[i],
+            prior.weights[i],
+            report.feature_mean_positive.get(*k).copied().unwrap_or(0.0),
+            report.feature_mean_negative.get(*k).copied().unwrap_or(0.0)
+        );
+    }
+    let _ = writeln!(
+        s,
+        "留出集 AUC = {:.4}（训练集 {:.4}）；Cllr = {:.4} vs 线性基线 {:.4}",
+        report.holdout_auc, report.train_auc, report.holdout_cllr, report.holdout_cllr_linear_baseline
+    );
+    let _ = writeln!(
+        s,
+        "分级线（证据强度尺度，来源 {}）：high={:.4} medium={:.4} low={:.4}",
+        report.level_source, model.level_high, model.level_medium, model.level_low
+    );
+    s
+}
+
+/// fit-collusion 子命令入口：拟合并写 fixtures/calibration/collusion_lr.json。
+fn write_collusion_lr_to(out: &Path) {
+    let jieba = Jieba::new();
+    let dir = corpus_dir();
+    let (model, report) = fit_collusion(&jieba, &dir);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("建目录失败: {e}"));
+    }
+    std::fs::write(out, lr_json(&model, &report))
+        .unwrap_or_else(|e| panic!("写 {} 失败: {e}", out.display()));
+    eprintln!("{}", render_fit(&model, &report));
+    eprintln!("[fit-collusion] 已写入 → {}", out.display());
+}
+
+fn default_lr_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/calibration/collusion_lr.json")
+}
+
+// ————————————————————————————————————————————————————————————————————————
+// 概率校准 + 共形三带拟合（执行方案 §8 W6-4 / M7）：pairs 语料 → score_calib.json
+//
+// 三分切分（确定性，按语料内固定序号取模）：
+//   idx%5 ∈ {0,1,2} → 训练集：拟合 Platt 两参数（final_score → P(同源)）
+//   idx%5 == 3      → 共形校准集：算 t_low/t_high（split conformal 要求与训练集不相交，
+//                     否则有限样本保证不成立——这是 split conformal 的前提，不是可选优化）
+//   idx%5 == 4      → 留出集：ECE / 带内 FNR / 带内 FPR / 需人工复核带占比（验收①②③）
+//
+// 标签口径：正类 = 同源编制的四类（same/minor_change/changed/rewrite），负类 = unrelated。
+// 与召回层 POSITIVE_LABELS 同一集合，避免「校准的正类」与「门禁的正类」两套定义。
+//
+// §1.5 纪律：合成语料上的保证不等于真实标书上的保证 —— 文件里 calibrationKind 标
+// experimental-synthetic，note 与 UI/报告文案一律限定「在合成校准语料上测得」。
+// ————————————————————————————————————————————————————————————————————————
+
+/// 一条校准样本：排序分（score_pair 的 final_score）+ 标签（1=同源改写，0=无关）。
+pub struct CalibSample {
+    pub score: f64,
+    pub y: f64,
+}
+
+/// L2 强度（向 0 收缩）：Platt 只有两个参数、样本上千，只需极弱正则防完全可分时参数发散。
+const CALIB_LAMBDA: f64 = 1e-3;
+const CALIB_ITERS: usize = 200;
+const CALIB_TOL: f64 = 1e-12;
+/// 目标漏检率 α（低优先级抽查带）与目标误报率 β（重点标红带）。
+/// 【产品/合规决策，不开放运行时调整】：改 α 即改承诺语义，须走版本发布（方案 §8 配置项）。
+pub const CALIB_ALPHA: f64 = 0.05;
+pub const CALIB_BETA: f64 = 0.05;
+/// ECE 分箱数（等宽）。
+const ECE_BINS: usize = 15;
+/// 运行域下界：簇的分数恒 ≥ 相似阈值（config 默认 0.70），且 classify_cluster 的「待复核」
+/// 线在 0.55——低于 0.55 的分实际上不会成簇。三带分流【只在运行域内有意义】，故退化守卫
+/// 只看这一段。
+const OPERATING_FLOOR: f64 = 0.55;
+/// 退化守卫线：运行域内任一带吃掉 ≥95% 的样本 ⇒ 三带没有分辨力 ⇒ 不上线分流（review-all）。
+const ROUTING_DOMINANCE_MAX: f64 = 0.95;
+/// 切分取模基数与两个切分点（idx%5：0–2 训练 / 3 共形校准 / 4 留出）。
+const CALIB_SPLIT_MOD: usize = 5;
+const CALIB_SPLIT_CONFORMAL: usize = 3;
+const CALIB_SPLIT_HOLDOUT: usize = 4;
+
+/// pairs 语料 → 校准样本（无模型层，与 corpus_regression 快档同口径）。
+pub fn calib_samples(jieba: &Jieba, pairs: &[PairRecord]) -> Vec<CalibSample> {
+    let built = build_pair_chunks(jieba, pairs, |_, _| (None, None));
+    built
+        .iter()
+        .zip(pairs)
+        .map(|((v, sem_cos, _), r)| {
+            let parts = scoring::score_pair(&v[0], &v[1], *sem_cos);
+            CalibSample {
+                score: parts.final_score as f64,
+                y: if POSITIVE_LABELS.contains(&static_label(&r.label)) { 1.0 } else { 0.0 },
+            }
+        })
+        .collect()
+}
+
+/// Platt 拟合：p = σ(a·s + b)，牛顿法 + 目标平滑（Platt 1999：y⁺=(N⁺+1)/(N⁺+2)、
+/// y⁻=1/(N⁻+2)）——平滑是 Platt 方法的组成部分，防完全可分时把概率钉死在 0/1（那会让
+/// ECE 在高分区爆掉，也让共形阈值退化）。返回 (a, b)；a 经投影保证非负（单调不减）。
+pub fn fit_platt(samples: &[CalibSample], lambda: f64) -> (f64, f64) {
+    let np = samples.iter().filter(|s| s.y > 0.5).count() as f64;
+    let nn = samples.len() as f64 - np;
+    let (tp, tn) = ((np + 1.0) / (np + 2.0), 1.0 / (nn + 2.0));
+    let (mut a, mut b) = (1.0f64, 0.0f64);
+    for _ in 0..CALIB_ITERS {
+        let (mut g0, mut g1) = (0.0f64, 0.0f64); // 对 b、a 的梯度
+        let (mut h00, mut h01, mut h11) = (0.0f64, 0.0f64, 0.0f64);
+        for s in samples {
+            let t = if s.y > 0.5 { tp } else { tn };
+            let p = 1.0 / (1.0 + (-(a * s.score + b)).exp());
+            let w = (p * (1.0 - p)).max(1e-12);
+            let r = t - p;
+            g0 += r;
+            g1 += r * s.score;
+            h00 += w;
+            h01 += w * s.score;
+            h11 += w * s.score * s.score;
+        }
+        g0 -= lambda * b;
+        g1 -= lambda * a;
+        h00 += lambda;
+        h11 += lambda;
+        let det = h00 * h11 - h01 * h01;
+        if det.abs() < 1e-15 {
+            break;
+        }
+        let db = (h11 * g0 - h01 * g1) / det;
+        let da = (h00 * g1 - h01 * g0) / det;
+        let (nb, na) = (b + db, (a + da).max(0.0));
+        let delta = (nb - b).abs().max((na - a).abs());
+        b = nb;
+        a = na;
+        if delta < CALIB_TOL {
+            break;
+        }
+    }
+    (a, b)
+}
+
+/// split conformal 分位：不合格分升序，取第 ceil((n+1)(1−rate)) 名（1-based）。
+/// 名次超出样本量 ⇒ 样本不足以给出该错误率的有限样本保证 → None（调用方退化为最保守阈值）。
+pub fn conformal_quantile(sorted_asc: &[f64], rate: f64) -> Option<f64> {
+    let n = sorted_asc.len();
+    if n == 0 {
+        return None;
+    }
+    let k = (((n + 1) as f64) * (1.0 - rate)).ceil() as usize;
+    if k == 0 || k > n {
+        return None;
+    }
+    Some(sorted_asc[k - 1])
+}
+
+/// 期望校准误差（等宽分箱）：Σ (n_b/n)·|实测同源率 − 平均预测概率|。
+pub fn ece(probs: &[f64], ys: &[f64], bins: usize) -> f64 {
+    if probs.is_empty() || probs.len() != ys.len() || bins == 0 {
+        return f64::NAN;
+    }
+    let mut cnt = vec![0usize; bins];
+    let mut sum_p = vec![0.0f64; bins];
+    let mut sum_y = vec![0.0f64; bins];
+    for (p, y) in probs.iter().zip(ys) {
+        let b = ((p * bins as f64) as usize).min(bins - 1);
+        cnt[b] += 1;
+        sum_p[b] += *p;
+        sum_y[b] += *y;
+    }
+    let n = probs.len() as f64;
+    (0..bins)
+        .filter(|&b| cnt[b] > 0)
+        .map(|b| {
+            let c = cnt[b] as f64;
+            c / n * ((sum_y[b] / c) - (sum_p[b] / c)).abs()
+        })
+        .sum()
+}
+
+/// 校准拟合报告（打印 + 写入 score_calib.json 的台账段）。
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibReport {
+    pub samples: usize,
+    pub train_samples: usize,
+    pub conformal_samples: usize,
+    pub holdout_samples: usize,
+    /// 留出集 ECE：校准后 vs 未校准（把原始 final_score 当概率用）——验收①的两个数。
+    pub holdout_ece: f64,
+    pub holdout_ece_uncalibrated: f64,
+    /// 相对下降比例（验收①要求 ≥50%）。
+    pub holdout_ece_reduction: f64,
+    /// 留出集上低优先级抽查带的实测漏检率（正样本落入 pass 带的比例，验收②≤α+2pp）。
+    pub holdout_pass_fnr: f64,
+    /// 留出集上重点标红带的实测误报率（负样本落入 flag 带的比例，验收②≤β+2pp）。
+    pub holdout_flag_fpr: f64,
+    /// 留出集三带占比（验收③：需人工复核带 ≤40%）。
+    pub holdout_pass_share: f64,
+    pub holdout_review_share: f64,
+    pub holdout_flag_share: f64,
+    /// 共形分位是否有足够样本给出保证（false ⇒ 阈值退化为最保守值，须扩语料）。
+    pub conformal_low_sufficient: bool,
+    pub conformal_high_sufficient: bool,
+    /// 两条共形阈值是否倒挂（正负类在校准集上按 α/β 完全分离）。倒挂时取 min/max 互换，
+    /// 两条带各自【收缩】，α/β 保证仍成立（子集的错误率不高于母集），复核带覆盖分离间隙。
+    pub conformal_crossed: bool,
+    /// 分流决策（three-band | review-all）与依据。
+    pub routing: String,
+    pub routing_reason: String,
+    /// 运行域（final_score ≥ 0.55，即簇实际存在的分数区间）内的留出样本数与三带占比——
+    /// 退化守卫的直接证据，评审据此判断「分流是否有分辨力」。
+    pub operating_samples: usize,
+    pub operating_pass_share: f64,
+    pub operating_review_share: f64,
+    pub operating_flag_share: f64,
+    pub positive_labels: Vec<String>,
+    pub pairs_hash: String,
+    pub git_rev: String,
+    pub fitted_at: String,
+}
+
+/// 六位定点（与运行时 evaluate 的定点一致，保证「文件里的数 = 运行时用的数」）。
+fn round6_f64(v: f64) -> f64 {
+    (v * 1e6).round() / 1e6
+}
+
+/// 在 pairs 语料上拟合 Platt + split conformal 三带阈值。
+pub fn fit_calibration(jieba: &Jieba, dir: &Path) -> (calibrate::CalibrationModel, CalibReport) {
+    let pairs_path = dir.join("pairs.jsonl");
+    let pairs = read_pairs(&pairs_path);
+    let samples = calib_samples(jieba, &pairs);
+
+    let mut train: Vec<&CalibSample> = Vec::new();
+    let mut conformal: Vec<&CalibSample> = Vec::new();
+    let mut holdout: Vec<&CalibSample> = Vec::new();
+    for (i, s) in samples.iter().enumerate() {
+        match i % CALIB_SPLIT_MOD {
+            CALIB_SPLIT_CONFORMAL => conformal.push(s),
+            CALIB_SPLIT_HOLDOUT => holdout.push(s),
+            _ => train.push(s),
+        }
+    }
+    let train_owned: Vec<CalibSample> =
+        train.iter().map(|s| CalibSample { score: s.score, y: s.y }).collect();
+    let (a, b) = fit_platt(&train_owned, CALIB_LAMBDA);
+    // 系数就地定点化：分位数与验收指标都由【落盘后的同一组系数】算出，避免写文件的舍入
+    // 让运行时的带划分与报告里的 FNR/FPR 错位。
+    let (a, b) = (round6_f64(a), round6_f64(b));
+    let calibrator = calibrate::Calibrator::Platt { a: a as f32, b: b as f32 };
+    let p_of = |s: &CalibSample| -> f64 { calibrator.probability(s.score as f32) as f64 };
+
+    // split conformal：正样本以 (1−p) 为不合格分求 t_low；负样本以 p 为不合格分求 t_high。
+    let mut pos_nc: Vec<f64> = conformal.iter().filter(|s| s.y > 0.5).map(|s| 1.0 - p_of(s)).collect();
+    let mut neg_nc: Vec<f64> = conformal.iter().filter(|s| s.y <= 0.5).map(|s| p_of(s)).collect();
+    pos_nc.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    neg_nc.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let q_low = conformal_quantile(&pos_nc, CALIB_ALPHA);
+    let q_high = conformal_quantile(&neg_nc, CALIB_BETA);
+    // 样本不足以支撑该错误率时退化为最保守：t_low=0（pass 带空）/ t_high=1（flag 带空），
+    // 即「不给任何带内保证、全部转人工复核」，而不是硬凑一个没有覆盖率的阈值。
+    let raw_low = round6_f64(q_low.map(|q| (1.0 - q).clamp(0.0, 1.0)).unwrap_or(0.0));
+    // flag 带用 p ≥ t_high 判定，而共形保证的是 P(p_new > q) ≤ β：抬一个定点单位使
+    // 「p ≥ t_high」⟺「p > q」，等号侧不吃掉保证。
+    let raw_high = round6_f64(q_high.map(|q| (q + 1e-6).clamp(0.0, 1.0)).unwrap_or(1.0));
+    // 倒挂（raw_high < raw_low）= 正负两类在校准集上按 α/β 完全分离。此时取 min/max 互换：
+    // pass 带与 flag 带各自【收缩】为原带的子集 ⇒ 两个有限样本保证都仍然成立
+    // （子集上的错误率不高于母集），而复核带正好覆盖两类之间的分离间隙，不会退化成空带。
+    let conformal_crossed = raw_high < raw_low;
+    let (t_low, t_high) = (raw_low.min(raw_high), raw_low.max(raw_high));
+
+    let version = format!("m7-calib-{}", &sha256_of_file(&pairs_path)[..8]);
+    let mut model = calibrate::CalibrationModel {
+        calibration_kind: collusion::CALIBRATION_EXPERIMENTAL.to_string(),
+        version,
+        calibrator,
+        alpha: CALIB_ALPHA as f32,
+        beta: CALIB_BETA as f32,
+        t_low: t_low as f32,
+        t_high: t_high as f32,
+        // 先按三带评估：退化守卫要看「若分流会怎样」，据此再决定是否真的上线分流。
+        routing: calibrate::Routing::ThreeBand,
+        corpus_hash: sha256_of_file(&pairs_path),
+    };
+
+    // —— 退化守卫（§1.5-1 如实展示）——
+    // 三带只在【运行域】（final_score ≥ OPERATING_FLOOR，簇实际存在的分数区间）内有意义。
+    // 若运行域内任一带吃掉 ≥95% 的样本，说明校准概率在这一段没有分辨力：此时上线分流等于
+    // 把几乎所有条款推进同一条带（重点标红占满 = 告警疲劳；低优先级占满 = 变相放行）。
+    // 守卫命中 → routing=review-all：机器就位、置信度照常展示，但不做分流断言。
+    let op: Vec<&&CalibSample> =
+        holdout.iter().filter(|s| s.score >= OPERATING_FLOOR).collect();
+    let op_bands: Vec<&str> = op.iter().map(|s| model.evaluate(s.score as f32).1).collect();
+    let op_share = |b: &str| -> f64 {
+        if op_bands.is_empty() {
+            0.0
+        } else {
+            op_bands.iter().filter(|x| **x == b).count() as f64 / op_bands.len() as f64
+        }
+    };
+    let (op_pass, op_review, op_flag) = (
+        op_share(calibrate::BAND_PASS),
+        op_share(calibrate::BAND_REVIEW),
+        op_share(calibrate::BAND_FLAG),
+    );
+    let dominant: f64 = op_pass.max(op_review).max(op_flag);
+    let (routing, routing_reason) = if op_bands.is_empty() {
+        (
+            calibrate::Routing::ReviewAll,
+            "留出集在运行域（分数 ≥0.55）内无样本，无法验证三带分辨力".to_string(),
+        )
+    } else if q_low.is_none() || q_high.is_none() {
+        (
+            calibrate::Routing::ReviewAll,
+            "共形校准样本不足以给出 α/β 的有限样本保证".to_string(),
+        )
+    } else if dominant >= ROUTING_DOMINANCE_MAX {
+        (
+            calibrate::Routing::ReviewAll,
+            format!(
+                "运行域内单带占比 {:.1}% ≥ {:.0}%：相似度分在簇的分数区间内无分辨力\
+                 （本语料缺「独立编制但表面相似」的难负样本，独立文档集里同样存在 avg=1.000 的共享范本簇），\
+                 据此分流会把几乎所有条款推进同一条带 → 本版不上线分流，全部按需人工复核",
+                dominant * 100.0,
+                ROUTING_DOMINANCE_MAX * 100.0
+            ),
+        )
+    } else {
+        (calibrate::Routing::ThreeBand, "运行域内三带分布有分辨力，分流启用".to_string())
+    };
+    // 留出集验收指标：概率经 model.evaluate（与运行时逐字节同通道），三带指标按【假定分流生效】
+    // 计算（评估的是两条阈值本身的性质；分流是否上线由上面的守卫单独记录，两者不要互相污染）。
+    let hp: Vec<f64> = holdout.iter().map(|s| model.evaluate(s.score as f32).0 as f64).collect();
+    let hy: Vec<f64> = holdout.iter().map(|s| s.y).collect();
+    let raw: Vec<f64> = holdout.iter().map(|s| s.score.clamp(0.0, 1.0)).collect();
+    let bands: Vec<&str> = holdout.iter().map(|s| model.evaluate(s.score as f32).1).collect();
+    model.routing = routing;
+    let share = |b: &str| -> f64 {
+        if bands.is_empty() {
+            0.0
+        } else {
+            bands.iter().filter(|x| **x == b).count() as f64 / bands.len() as f64
+        }
+    };
+    let rate = |want_pos: bool, band: &str| -> f64 {
+        let idx: Vec<usize> =
+            (0..holdout.len()).filter(|&i| (hy[i] > 0.5) == want_pos).collect();
+        if idx.is_empty() {
+            0.0
+        } else {
+            idx.iter().filter(|&&i| bands[i] == band).count() as f64 / idx.len() as f64
+        }
+    };
+    let ece_cal = ece(&hp, &hy, ECE_BINS);
+    let ece_raw = ece(&raw, &hy, ECE_BINS);
+    let report = CalibReport {
+        samples: samples.len(),
+        train_samples: train_owned.len(),
+        conformal_samples: conformal.len(),
+        holdout_samples: holdout.len(),
+        holdout_ece: round6_f64(ece_cal),
+        holdout_ece_uncalibrated: round6_f64(ece_raw),
+        holdout_ece_reduction: round6_f64(if ece_raw > 0.0 { 1.0 - ece_cal / ece_raw } else { 0.0 }),
+        holdout_pass_fnr: round6_f64(rate(true, calibrate::BAND_PASS)),
+        holdout_flag_fpr: round6_f64(rate(false, calibrate::BAND_FLAG)),
+        holdout_pass_share: round6_f64(share(calibrate::BAND_PASS)),
+        holdout_review_share: round6_f64(share(calibrate::BAND_REVIEW)),
+        holdout_flag_share: round6_f64(share(calibrate::BAND_FLAG)),
+        conformal_low_sufficient: q_low.is_some(),
+        conformal_high_sufficient: q_high.is_some(),
+        conformal_crossed,
+        routing: routing.as_str().to_string(),
+        routing_reason,
+        operating_samples: op_bands.len(),
+        operating_pass_share: round6_f64(op_pass),
+        operating_review_share: round6_f64(op_review),
+        operating_flag_share: round6_f64(op_flag),
+        positive_labels: POSITIVE_LABELS.iter().map(|s| (*s).to_string()).collect(),
+        pairs_hash: sha256_of_file(&pairs_path),
+        git_rev: git_rev(),
+        fitted_at: today_utc(),
+    };
+    (model, report)
+}
+
+/// 校准文件序列化（6 位定点，便于评审 diff 且逐次可复现）。
+pub fn calib_json(model: &calibrate::CalibrationModel, report: &CalibReport) -> String {
+    let params = match &model.calibrator {
+        calibrate::Calibrator::Platt { a, b } => serde_json::json!({
+            "platt": { "a": round6_f64(*a as f64), "b": round6_f64(*b as f64) },
+        }),
+        calibrate::Calibrator::Isotonic { breakpoints } => serde_json::json!({
+            "isotonic": {
+                "breakpoints": breakpoints
+                    .iter()
+                    .map(|(x, y)| serde_json::json!([round6_f64(*x as f64), round6_f64(*y as f64)]))
+                    .collect::<Vec<_>>(),
+            },
+        }),
+    };
+    let mut body = serde_json::json!({
+        "calibrationKind": model.calibration_kind,
+        "version": model.version,
+        "type": model.calibrator.kind_str(),
+        "alpha": round6_f64(model.alpha as f64),
+        "beta": round6_f64(model.beta as f64),
+        "thresholds": {
+            "tLow": round6_f64(model.t_low as f64),
+            "tHigh": round6_f64(model.t_high as f64),
+        },
+        "routing": model.routing.as_str(),
+        "note": "实验性校准（合成语料）：Platt 参数与三带阈值由 fixtures/corpus/pairs.jsonl 拟合。\
+                 α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；\
+                 低优先级抽查带只做排序与折叠，不隐藏任何条款。\
+                 routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。\
+                 重新生成：cargo run --example corpusgen --features dev-tools -- fit-calib",
+        "fit": report,
+    });
+    if let (Some(obj), Some(p)) = (body.as_object_mut(), params.as_object()) {
+        for (k, v) in p {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    format!("{}\n", serde_json::to_string_pretty(&body).expect("serialize calib json"))
+}
+
+/// 校准指标速览（CLI 打印）。
+pub fn render_calib(model: &calibrate::CalibrationModel, report: &CalibReport) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "== 概率校准（{}）+ 共形三带（样本 {}=训练 {}+共形 {}+留出 {}）==",
+        model.calibrator.kind_str(),
+        report.samples,
+        report.train_samples,
+        report.conformal_samples,
+        report.holdout_samples
+    );
+    if let calibrate::Calibrator::Platt { a, b } = &model.calibrator {
+        let _ = writeln!(s, "Platt: p = σ({a:.6}·s + {b:.6})");
+    }
+    let _ = writeln!(
+        s,
+        "三带阈值：tLow={:.6} tHigh={:.6}（α={:.2} β={:.2}，在合成校准语料上测得；共形样本充足 低{}/高{}）",
+        model.t_low,
+        model.t_high,
+        model.alpha,
+        model.beta,
+        report.conformal_low_sufficient,
+        report.conformal_high_sufficient
+    );
+    let _ = writeln!(
+        s,
+        "留出集 ECE：校准后 {:.4} vs 未校准 {:.4}（下降 {:.1}%）",
+        report.holdout_ece,
+        report.holdout_ece_uncalibrated,
+        report.holdout_ece_reduction * 100.0
+    );
+    let _ = writeln!(
+        s,
+        "留出集带内错误率：低优先级抽查带 FNR={:.4}（目标 ≤{:.4}）／重点标红带 FPR={:.4}（目标 ≤{:.4}）",
+        report.holdout_pass_fnr,
+        CALIB_ALPHA + 0.02,
+        report.holdout_flag_fpr,
+        CALIB_BETA + 0.02
+    );
+    let _ = writeln!(
+        s,
+        "留出集三带占比：低优先级抽查 {:.1}% / 需人工复核 {:.1}% / 重点标红 {:.1}%（复核带上限 40%）",
+        report.holdout_pass_share * 100.0,
+        report.holdout_review_share * 100.0,
+        report.holdout_flag_share * 100.0
+    );
+    let _ = writeln!(
+        s,
+        "运行域（分数 ≥{:.2}，n={}）三带占比：{:.1}% / {:.1}% / {:.1}%{}",
+        OPERATING_FLOOR,
+        report.operating_samples,
+        report.operating_pass_share * 100.0,
+        report.operating_review_share * 100.0,
+        report.operating_flag_share * 100.0,
+        if report.conformal_crossed { "（共形阈值倒挂，已按保守方向互换）" } else { "" }
+    );
+    let _ = writeln!(s, "分流决策：{} —— {}", report.routing, report.routing_reason);
+    s
+}
+
+/// fit-calib 子命令入口：拟合并写 fixtures/calibration/score_calib.json。
+fn write_calib_to(out: &Path) {
+    let jieba = Jieba::new();
+    let dir = corpus_dir();
+    let (model, report) = fit_calibration(&jieba, &dir);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("建目录失败: {e}"));
+    }
+    std::fs::write(out, calib_json(&model, &report))
+        .unwrap_or_else(|e| panic!("写 {} 失败: {e}", out.display()));
+    eprintln!("{}", render_calib(&model, &report));
+    eprintln!("[fit-calib] 已写入 → {}", out.display());
+}
+
+fn default_calib_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/calibration/score_calib.json")
 }
 
 #[cfg(test)]
@@ -1953,6 +3085,61 @@ mod tests {
         eprintln!("[corpus_regression] 通过\n{table}");
     }
 
+    // —— M7 融合拟合（W6-3）：纯函数层单测，不碰语料 IO，秒级 ——
+
+    #[test]
+    fn fit_logistic_recovers_separation_and_never_emits_negative_weights() {
+        // 两列特征：第 1 列完全区分正负、第 2 列纯噪声。拟合应抬高第 1 列、并保持全部权重非负
+        // （投影约束，§1.5-4）；截距保持为负（零证据不得抬底分）。
+        let mk = |a: f64, b: f64, y: f64, i: usize| FitSample { id: format!("s{i}"), x: vec![a, b], y };
+        let mut samples = Vec::new();
+        for i in 0..12 {
+            samples.push(mk(1.0, (i % 2) as f64, 1.0, i));
+            samples.push(mk(0.0, ((i + 1) % 2) as f64, 0.0, 100 + i));
+        }
+        let prior = vec![-3.6, 1.0, 1.0];
+        let theta = fit_logistic(&samples, &prior, FIT_LAMBDA);
+        assert!(theta[0] < 0.0, "截距须为负，实际 {}", theta[0]);
+        assert!(theta.iter().skip(1).all(|w| *w >= 0.0), "权重不得为负：{theta:?}");
+        assert!(theta[1] > prior[1], "有区分度的列权重应被语料抬高：{}", theta[1]);
+        assert!(theta[1] > theta[2], "区分列应显著强于噪声列：{} vs {}", theta[1], theta[2]);
+        // 确定性：同输入两次拟合逐位一致
+        let again = fit_logistic(&samples, &prior, FIT_LAMBDA);
+        assert_eq!(theta, again, "拟合必须确定性可复现");
+    }
+
+    #[test]
+    fn fitted_weights_file_round_trips_through_runtime_parser() {
+        // 拟合侧写出的文件必须能被运行时加载器接受（含符号/量级/分级线审查）——否则上线即静默回退。
+        let prior = collusion::empirical_prior();
+        let model = collusion::LrModel::from_parts(
+            collusion::CALIBRATION_EXPERIMENTAL,
+            "roundtrip-test",
+            prior.intercept,
+            prior.weights,
+            (
+                prior.v1_line_equivalent(collusion::LEVEL_HIGH),
+                prior.v1_line_equivalent(collusion::LEVEL_MEDIUM),
+                prior.v1_line_equivalent(collusion::LEVEL_LOW),
+            ),
+        );
+        let raw = lr_json(&model, &FitReport::default());
+        let parsed = collusion::parse_lr_model(&raw).expect("拟合产物必须能被运行时加载");
+        assert_eq!(parsed.calibration_kind, collusion::CALIBRATION_EXPERIMENTAL);
+        for i in 0..collusion::FEATURE_COUNT {
+            assert!((parsed.weights[i] - model.weights[i]).abs() < 1e-5, "权重列 {i} 往返丢失");
+        }
+        assert!(raw.ends_with('\n'), "文件应以换行收尾（diff 友好）");
+    }
+
+    #[test]
+    fn cllr_rewards_confident_correct_and_punishes_confident_wrong() {
+        // Cllr 口径自检：完美判别 ≈0；无信息（恒 0.5）=1；自信而错 >1。
+        assert!(cllr(&[0.999, 0.999], &[0.001, 0.001]) < 0.02);
+        assert!((cllr(&[0.5, 0.5], &[0.5, 0.5]) - 1.0).abs() < 1e-9);
+        assert!(cllr(&[0.01, 0.02], &[0.98, 0.99]) > 1.0);
+    }
+
     /// 语料 hash 不匹配时报错含修复命令（验收⑤），无需篡改磁盘文件。
     #[test]
     fn corpus_regression_hash_guard_reports_fix_command() {
@@ -1995,6 +3182,243 @@ mod tests {
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "召回率不降不触发");
         assert!(!gate_failures(&base, &mk(0.90, 1.00, 0.95)).is_empty(), "AUC 降 0.05 触发");
         assert!(gate_failures(&base, &mk(0.90, 1.00, 1.00)).is_empty(), "AUC 不降不触发");
+    }
+
+    /// 三带门禁（W6-4 验收②③）：分流模式变更、带内错误率恶化、复核带过宽三类都要红灯；
+    /// 未启用分流（review-all）时复核带占比 100% 不算失败（那是明示的回退路径，不是回退）。
+    #[test]
+    fn corpus_regression_band_gate() {
+        let mk = |routing: &str, pass_fnr: f64, flag_fpr: f64, review: f64| RegressionMetrics {
+            bands: BandMetrics {
+                routing: routing.into(),
+                alpha: 0.05,
+                beta: 0.05,
+                pass_fnr,
+                flag_fpr,
+                review_share: review,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let base = mk("three-band", 0.03, 0.02, 0.20);
+        assert!(gate_failures(&base, &base).is_empty(), "完全一致不触发");
+        assert!(!gate_failures(&base, &mk("review-all", 0.0, 0.0, 1.0)).is_empty(), "分流模式变更必须显式入库");
+        assert!(!gate_failures(&base, &mk("three-band", 0.06, 0.02, 0.20)).is_empty(), "漏检率涨 3pp 触发");
+        assert!(gate_failures(&base, &mk("three-band", 0.04, 0.02, 0.20)).is_empty(), "漏检率涨 1pp 不触发");
+        assert!(!gate_failures(&base, &mk("three-band", 0.03, 0.05, 0.20)).is_empty(), "误报率涨 3pp 触发");
+        assert!(!gate_failures(&base, &mk("three-band", 0.03, 0.02, 0.45)).is_empty(), "复核带 45% 超上限触发");
+        // 绝对线：α=5% + 2pp = 7%，8% 的漏检率即便基线更高也要红。
+        let loose = mk("three-band", 0.09, 0.02, 0.20);
+        assert!(!gate_failures(&loose, &mk("three-band", 0.08, 0.02, 0.20)).is_empty(), "漏检率超 α+2pp 绝对线");
+        // review-all：复核带 100% 是明示回退路径，不判失败。
+        let ra = mk("review-all", 0.0, 0.0, 1.0);
+        assert!(gate_failures(&ra, &ra).is_empty(), "review-all 下复核带 100% 不算门禁失败");
+    }
+
+    /// Platt 拟合 + split conformal 分位 + ECE 三件套的数学正确性（离线、秒级、不读语料）。
+    #[test]
+    fn platt_conformal_and_ece_are_correct() {
+        // 构造 logit 线性的合成数据：真参数 a=8、b=-4 ⇒ 拟合应把分界点还原到 s≈0.5 附近。
+        let mut samples = Vec::new();
+        for i in 0..=200 {
+            let s = i as f64 / 200.0;
+            let p = 1.0 / (1.0 + (-(8.0 * s - 4.0)).exp());
+            // 每个分数点按真概率放置正负样本各若干，避免随机数带来的不可复现。
+            let pos = (p * 10.0).round() as usize;
+            for k in 0..10 {
+                samples.push(CalibSample { score: s, y: if k < pos { 1.0 } else { 0.0 } });
+            }
+        }
+        let (a, b) = fit_platt(&samples, 1e-6);
+        assert!(a > 0.0, "斜率必须为正（单调不减）");
+        let boundary = -b / a;
+        assert!((boundary - 0.5).abs() < 0.05, "分界点应还原到 0.5 附近，实际 {boundary}");
+
+        // 共形分位：n=19、rate=0.05 ⇒ k=ceil(20*0.95)=19 ⇒ 取最大值；n=18 时保证不成立 → None。
+        let v: Vec<f64> = (1..=19).map(|i| i as f64 / 19.0).collect();
+        assert_eq!(conformal_quantile(&v, 0.05), Some(v[18]));
+        assert_eq!(conformal_quantile(&v[..18], 0.05), None, "样本不足以给出 5% 保证时必须返回 None");
+        assert_eq!(conformal_quantile(&[], 0.05), None);
+        // 覆盖率语义：不合格分 ≤ 分位的样本占比 ≥ 1−α。
+        let n = 100usize;
+        let v: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let q = conformal_quantile(&v, 0.10).unwrap();
+        let covered = v.iter().filter(|x| **x <= q).count() as f64 / n as f64;
+        assert!(covered >= 0.90, "共形覆盖率不足：{covered}");
+
+        // ECE：完美校准 → 0；恒定 0.9 但实际一半正样本 → 0.4。
+        let probs = vec![0.1, 0.1, 0.9, 0.9];
+        let ys = vec![0.0, 0.0, 1.0, 1.0];
+        assert!(ece(&probs, &ys, 10) < 0.11);
+        let over = vec![0.9, 0.9, 0.9, 0.9];
+        let half = vec![1.0, 0.0, 1.0, 0.0];
+        assert!((ece(&over, &half, 10) - 0.4).abs() < 1e-9, "过自信的 ECE 应为 |0.5−0.9|");
+        assert!(ece(&[], &[], 10).is_nan());
+    }
+
+    /// 拟合确定性（验收⑥的拟合侧）：同语料两次 fit_calibration 产出逐字节一致的文件，
+    /// 且随包 score_calib.json 与「当前语料 + 当前代码」重新拟合的结果一致
+    /// （不一致 = 有人改了语料/打分却没重跑 fit-calib，校准与运行时口径已脱节）。
+    #[test]
+    fn fit_calibration_is_deterministic_and_matches_shipped_file() {
+        let jieba = Jieba::new();
+        let dir = corpus_dir();
+        let (m1, r1) = fit_calibration(&jieba, &dir);
+        let (m2, r2) = fit_calibration(&jieba, &dir);
+        assert_eq!(calib_json(&m1, &r1), calib_json(&m2, &r2), "两次拟合必须逐字节一致");
+        let shipped = std::fs::read_to_string(default_calib_path()).expect("随包校准文件应存在");
+        let shipped: serde_json::Value = serde_json::from_str(&shipped).unwrap();
+        let fresh: serde_json::Value = serde_json::from_str(&calib_json(&m1, &r1)).unwrap();
+        for key in ["type", "platt", "isotonic", "thresholds", "alpha", "beta", "routing"] {
+            assert_eq!(
+                shipped.get(key),
+                fresh.get(key),
+                "随包 score_calib.json 的 {key} 与当前语料/代码重拟合结果不一致：\
+                 请重跑 cargo run --example corpusgen --features dev-tools -- fit-calib"
+            );
+        }
+    }
+
+    /// 语料 hash 守卫必须【跨平台】成立：Windows 检出会把文本夹具转成 CRLF，若按原始字节
+    /// 哈希，同一提交在 Windows 上算出的 pairs_hash/docsets_hash 与 macOS 落库的基线不同，
+    /// CI 会误报「语料已变更但基线未同步」（实测于 windows-latest）。故守卫按换行归一后的
+    /// 内容判定；本测试钉死 CRLF/CR/LF 三种换行的哈希一致，且不误伤二进制字节。
+    #[test]
+    fn corpus_hash_is_line_ending_agnostic() {
+        let lf = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
+        let crlf = b"{\"a\":1}\r\n{\"b\":2}\r\n".to_vec();
+        let cr = b"{\"a\":1}\r{\"b\":2}\r".to_vec();
+        let h = |b: &[u8]| crate::engine::normalize::sha256_hex(&normalize_eol(b));
+        assert_eq!(h(&lf), h(&crlf), "CRLF 与 LF 内容相同，哈希须一致");
+        assert_eq!(h(&lf), h(&cr), "CR 与 LF 内容相同，哈希须一致");
+        // 真实内容变更仍须被检出（守卫不能因归一而失灵）。
+        assert_ne!(h(&lf), h(b"{\"a\":2}\n{\"b\":2}\n"), "内容变更须改变哈希");
+        // 二进制（docx 的 zip 头）不参与归一：这里仅验证 normalize_eol 不改无 CR 的字节。
+        let zip_head = [0x50u8, 0x4B, 0x03, 0x04, 0x00, 0x0A];
+        assert_eq!(normalize_eol(&zip_head), zip_head.to_vec());
+    }
+
+    /// 语料的报价清单必须能被 M6 数值层解析——否则 docsets 注入的「等比乘系数」证据不可读，
+    /// numeric 恒 None、五类数值信号在门禁中恒不触发（M7 拟合 LR 时数值特征会成为死列）。
+    /// 曾因表头用「序号|设备名称及服务内容|单价（元）|工期」（仅 2 列可识别、3 行 < n≥10 门槛）
+    /// 而静默失效，故以本测试钉死：清单可解析 + 围标组呈严格等比 + 独立组无线性关系。
+    #[test]
+    fn docset_price_tables_are_boq_parsable_and_carry_planted_ratio() {
+        use crate::engine::boq;
+        let base_units = [1200i64, 3400, 760];
+        let extract = |rows: &[Vec<String>]| -> Vec<boq::BoqItem> {
+            let inputs: Vec<boq::TableRowInput> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| boq::TableRowInput {
+                    chunk_id: format!("c{i}"),
+                    text: r.join(" | "),
+                    page: None,
+                    order_index: i as i64,
+                })
+                .collect();
+            boq::extract_document(&inputs).items
+        };
+        // 围标组：同基准、份间不同 ratio ⇒ 可解析且严格等比。
+        let a = extract(&price_rows(&base_units, 100, None));
+        let b = extract(&price_rows(&base_units, 108, None));
+        assert!(a.len() >= 10, "清单行数须 ≥10 以越过规律性/相关性 n≥10 门槛，实得 {}", a.len());
+        assert_eq!(a.len(), b.len(), "同基准两份清单条目数应一致");
+        assert!(a.iter().all(|it| it.unit_price.is_some() && it.total_price.is_some()));
+        assert!(a.iter().all(|it| it.code.is_some()), "编码列须被识别（按编码对齐）");
+        for (x, y) in a.iter().zip(b.iter()) {
+            let (px, py) = (x.unit_price.unwrap(), y.unit_price.unwrap());
+            // 整数截断带来 ≤1 元噪声，比值仍应贴近 1.08。
+            assert!((py / px - 1.08).abs() < 0.01, "围标组份间应呈等比：{px} → {py}");
+        }
+        // 独立组：逐行扰动 ⇒ 比值离散（非恒定），不构成等比。
+        let i1 = extract(&price_rows(&base_units, 100, Some(11)));
+        let i2 = extract(&price_rows(&base_units, 100, Some(22)));
+        let ratios: Vec<f64> = i1
+            .iter()
+            .zip(i2.iter())
+            .map(|(x, y)| y.unit_price.unwrap() / x.unit_price.unwrap())
+            .collect();
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        let spread = ratios.iter().map(|r| (r - mean).abs()).fold(0.0f64, f64::max);
+        assert!(spread > 0.02, "独立组比值应离散（无线性关系），实得最大偏离 {spread:.4}");
+    }
+
+    /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。
+    /// 打印含语义的分层全表；有 baseline_metrics_full.json 时对照门禁，否则仅速览。
+    /// 围标层 AUC 仍走无模型层（取证信号为主，语义对其影响可忽略）。
+    #[test]
+    #[ignore] // 需本地缓存语义模型：BIDGUARD_EMBED_DIR=<dir> cargo test --features dev-tools corpus_regression_full -- --ignored --nocapture
+    fn corpus_regression_full() {
+        use crate::engine::embed;
+        let dir = corpus_dir();
+        let jieba = Jieba::new();
+        let spec = embed::resolve("bge-zh");
+        let mut slot: embed::LoadedEmbedder = None;
+        let model = embed::ensure(&mut slot, spec, false).unwrap_or_else(|| {
+            panic!(
+                "语义模型不可用；请设置 BIDGUARD_EMBED_DIR 指向本地缓存的 {} 模型目录后重试",
+                spec.id
+            )
+        });
+
+        let pairs = read_pairs(&dir.join("pairs.jsonl"));
+        let (recall_rate, recall_by_label, labels, macro_f1) =
+            pair_stats(&jieba, &pairs, |a, b| {
+                match embed::embed_batch(model, &[a.to_string(), b.to_string()], spec.id) {
+                    Some(v) if v.len() == 2 => {
+                        let cos = embed::cosine(&v[0], &v[1]);
+                        (Some(cos), Some(vec![Some(v[0].clone()), Some(v[1].clone())]))
+                    }
+                    _ => (None, None),
+                }
+            });
+        let (auc, mean_pos, mean_neg, ndoc) = docset_auc(&jieba, &dir);
+        let cur = RegressionMetrics {
+            lane: "full".into(),
+            recall_rate,
+            recall_by_label,
+            labels,
+            macro_f1,
+            // 三带层用无模型层口径（校准输入是 final_score；慢档的语义分不参与分带阈值）。
+            bands: band_metrics(&jieba, &pairs),
+            collusion_auc: auc,
+            mean_collusion_score: mean_pos,
+            mean_independent_score: mean_neg,
+            pairs_count: pairs.len(),
+            docsets_count: ndoc,
+            pairs_hash: sha256_of_file(&dir.join("pairs.jsonl")),
+            docsets_hash: docsets_hash(&dir),
+            git_rev: git_rev(),
+            generated_at: today_utc(),
+            note: format!("语义层：bge-zh({})；AUC 仍走无模型层", spec.id),
+        };
+        let baseline_path = dir.join("baseline_metrics_full.json");
+        if baseline_write_mode() {
+            let body = serde_json::to_string_pretty(&cur).expect("serialize");
+            std::fs::write(&baseline_path, format!("{body}\n")).expect("写全档基线");
+            eprintln!("[corpus_regression_full] 已写入全档基线 → {}", baseline_path.display());
+            eprintln!("{}", render_single(&cur));
+            return;
+        }
+        match std::fs::read_to_string(&baseline_path) {
+            Ok(raw) => {
+                let base: RegressionMetrics = serde_json::from_str(&raw).expect("解析全档基线");
+                let table = render_compare(&base, &cur);
+                let failures = gate_failures(&base, &cur);
+                if !failures.is_empty() {
+                    panic!("全档回归门禁失败（{} 项）：\n{}\n{}", failures.len(), failures.join("\n"), table);
+                }
+                eprintln!("[corpus_regression_full] 通过\n{table}");
+            }
+            Err(_) => {
+                eprintln!(
+                    "[corpus_regression_full] 无全档基线（{}），仅速览；如需入库：BIDGUARD_WRITE_BASELINE=1 ...",
+                    baseline_path.display()
+                );
+                eprintln!("{}", render_single(&cur));
+            }
+        }
     }
 
     // —— 外部真值相似度校准（打破合成同源循环）——
@@ -2119,7 +3543,6 @@ mod tests {
         assert!(!files.is_empty(), "外部语料目录 {} 下无 *.jsonl", dir.display());
 
         let mut metrics: Vec<extcalib::ExtCalibMetrics> = Vec::new();
-        let mut calib: Vec<extcalib::CalibrationReport> = Vec::new();
         for f in &files {
             let pairs = extcalib::read_external_pairs(f)
                 .unwrap_or_else(|e| panic!("读取 {} 失败: {e}", f.display()));
@@ -2134,10 +3557,6 @@ mod tests {
             // 词面档（无模型，恒可跑）
             let lex = score_external_pairs(&jieba, &pairs, None);
             metrics.push(extcalib::evaluate(&source, "lexical", &lex, 0.5, REGRESSION_THRESHOLD, 10));
-            let bin = |v: &[(f32, f32)]| -> Vec<(f32, bool)> {
-                v.iter().map(|(s, l)| (*s, extcalib::is_positive(*l, 0.5))).collect()
-            };
-            calib.push(extcalib::calibrate_report(&source, "lexical", &bin(&lex), 10));
             // 语义两档（模型就绪才跑）：fused = 生产融合分（用户实际经历的）；
             // cosine = 裸嵌入余弦（单独回答「嵌入本身判别力如何」）。
             if let Some(cos) = semantic_cosines(&pairs) {
@@ -2151,12 +3570,6 @@ mod tests {
                     REGRESSION_THRESHOLD,
                     10,
                 ));
-                calib.push(extcalib::calibrate_report(
-                    &source,
-                    &format!("fused:{mid}"),
-                    &bin(&fused),
-                    10,
-                ));
                 let raw: Vec<(f32, f32)> =
                     cos.iter().zip(&pairs).map(|(c, p)| (*c, p.label)).collect();
                 metrics.push(extcalib::evaluate(
@@ -2167,35 +3580,11 @@ mod tests {
                     REGRESSION_THRESHOLD,
                     10,
                 ));
-                calib.push(extcalib::calibrate_report(
-                    &source,
-                    &format!("cosine:{mid}"),
-                    &bin(&raw),
-                    10,
-                ));
             } else {
                 eprintln!("[external_calib] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
             }
         }
         metrics.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
-        if !calib.is_empty() {
-            calib.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
-            let mut t = String::from(
-                "\n概率校准（训练/测试 = 按分数排序后隔一取一；ECE 为留出集上的值）\n",
-            );
-            t.push_str(&format!(
-                "{:<12} {:<26} {:>6} {:>6} {:>8} {:>8} {:>9} {:>8}\n",
-                "source", "scorer", "train", "test", "ECE原始", "ECE_Platt", "ECE_保序", "ROC"
-            ));
-            for c in &calib {
-                t.push_str(&format!(
-                    "{:<12} {:<26} {:>6} {:>6} {:>8.3} {:>8.3} {:>9.3} {:>8.3}\n",
-                    c.source, c.scorer, c.train_count, c.test_count, c.ece_raw, c.ece_platt,
-                    c.ece_isotonic, c.roc_auc
-                ));
-            }
-            eprintln!("{t}");
-        }
         eprintln!("{}", render_extcalib(&metrics));
 
         let baseline_path = corpus_dir().join("baseline_metrics_external.json");
@@ -2646,78 +4035,5 @@ mod tests {
         }
     }
 
-    /// 慢档（本地手动，#[ignore]）：追加语义层（沿用 BIDGUARD_EMBED_DIR 本地缓存模型）。
-    /// 打印含语义的分层全表；有 baseline_metrics_full.json 时对照门禁，否则仅速览。
-    /// 围标层 AUC 仍走无模型层（取证信号为主，语义对其影响可忽略）。
-    #[test]
-    #[ignore] // 需本地缓存语义模型：BIDGUARD_EMBED_DIR=<dir> cargo test --features dev-tools corpus_regression_full -- --ignored --nocapture
-    fn corpus_regression_full() {
-        use crate::engine::embed;
-        let dir = corpus_dir();
-        let jieba = Jieba::new();
-        let spec = embed::resolve("bge-zh");
-        let mut slot: embed::LoadedEmbedder = None;
-        let model = embed::ensure(&mut slot, spec, false).unwrap_or_else(|| {
-            panic!(
-                "语义模型不可用；请设置 BIDGUARD_EMBED_DIR 指向本地缓存的 {} 模型目录后重试",
-                spec.id
-            )
-        });
-
-        let pairs = read_pairs(&dir.join("pairs.jsonl"));
-        let (recall_rate, recall_by_label, labels, macro_f1) =
-            pair_stats(&jieba, &pairs, |a, b| {
-                match embed::embed_batch(model, &[a.to_string(), b.to_string()], spec.id) {
-                    Some(v) if v.len() == 2 => {
-                        let cos = embed::cosine(&v[0], &v[1]);
-                        (Some(cos), Some(vec![Some(v[0].clone()), Some(v[1].clone())]))
-                    }
-                    _ => (None, None),
-                }
-            });
-        let (auc, mean_pos, mean_neg, ndoc) = docset_auc(&jieba, &dir);
-        let cur = RegressionMetrics {
-            lane: "full".into(),
-            recall_rate,
-            recall_by_label,
-            labels,
-            macro_f1,
-            collusion_auc: auc,
-            mean_collusion_score: mean_pos,
-            mean_independent_score: mean_neg,
-            pairs_count: pairs.len(),
-            docsets_count: ndoc,
-            pairs_hash: sha256_of_file(&dir.join("pairs.jsonl")),
-            docsets_hash: docsets_hash(&dir),
-            git_rev: git_rev(),
-            generated_at: today_utc(),
-            note: format!("语义层：bge-zh({})；AUC 仍走无模型层", spec.id),
-        };
-        let baseline_path = dir.join("baseline_metrics_full.json");
-        if baseline_write_mode() {
-            let body = serde_json::to_string_pretty(&cur).expect("serialize");
-            std::fs::write(&baseline_path, format!("{body}\n")).expect("写全档基线");
-            eprintln!("[corpus_regression_full] 已写入全档基线 → {}", baseline_path.display());
-            eprintln!("{}", render_single(&cur));
-            return;
-        }
-        match std::fs::read_to_string(&baseline_path) {
-            Ok(raw) => {
-                let base: RegressionMetrics = serde_json::from_str(&raw).expect("解析全档基线");
-                let table = render_compare(&base, &cur);
-                let failures = gate_failures(&base, &cur);
-                if !failures.is_empty() {
-                    panic!("全档回归门禁失败（{} 项）：\n{}\n{}", failures.len(), failures.join("\n"), table);
-                }
-                eprintln!("[corpus_regression_full] 通过\n{table}");
-            }
-            Err(_) => {
-                eprintln!(
-                    "[corpus_regression_full] 无全档基线（{}），仅速览；如需入库：BIDGUARD_WRITE_BASELINE=1 ...",
-                    baseline_path.display()
-                );
-                eprintln!("{}", render_single(&cur));
-            }
-        }
-    }
 }
+

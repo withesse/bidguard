@@ -66,6 +66,20 @@ export function useClearModel() {
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
   });
 }
+export function useDownloadRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.downloadRerankerModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useClearRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearRerankerModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
 export function useDownloadOcrModel() {
   const qc = useQueryClient();
   return useMutation({
@@ -393,6 +407,38 @@ export function useCompareSummary(jobId: string | undefined) {
     queryKey: ["compareSummary", jobId],
     queryFn: () => api.getCompareSummary(jobId!),
     enabled: !!jobId,
+    staleTime: 60_000,
+  });
+}
+
+// —— 对齐区段（W4-5，M5b）：只读证据层 ——
+
+/** 某任务的对齐区段列表（可选按文档对过滤，方向无关）。旧任务返回空数组。 */
+export function useAlignedSegments(jobId: string | undefined, docA?: string, docB?: string) {
+  return useQuery({
+    queryKey: ["alignedSegments", jobId, docA ?? null, docB ?? null],
+    queryFn: () => api.listAlignedSegments(jobId!, docA, docB),
+    enabled: !!jobId,
+    staleTime: 60_000,
+  });
+}
+
+/** 区段详情（选中区段时懒加载）。 */
+export function useSegmentDetail(segmentId: string | undefined) {
+  return useQuery({
+    queryKey: ["segmentDetail", segmentId],
+    queryFn: () => api.getSegmentDetail(segmentId!),
+    enabled: !!segmentId,
+    staleTime: 60_000,
+  });
+}
+
+/** 某聚类反查关联区段（ClusterDetail「所在区段」Pill）。旧任务返回空数组。 */
+export function useClusterSegments(clusterId: string | undefined) {
+  return useQuery({
+    queryKey: ["clusterSegments", clusterId],
+    queryFn: () => api.getClusterSegments(clusterId!),
+    enabled: !!clusterId,
     staleTime: 60_000,
   });
 }

@@ -1,6 +1,6 @@
 [package]
 name = "bidguard"
-version = "0.5.0"
+version = "0.6.0"
 description = "原本 · 标书查重 — 离线标书交叉比对与围标识别"
 authors = ["原本 Verum"]
 edition = "2021"
@@ -17,10 +17,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Enables the synthetic-corpus generator (engine::corpusgen) and its `corpusgen` bin.
 dev-tools = []
 
-# 合成对抗语料生成器 CLI（M3 校准语料）：cargo run --bin corpusgen --features dev-tools
-[[bin]]
+# 合成对抗语料生成器 CLI（M3 校准语料）：cargo run --example corpusgen --features dev-tools
+# 【务必保持 example 而非 bin】：tauri 打包时不看 required-features，包内出现第二个 bin 就会
+# 挑错二进制当主程序（v0.6.0 首次发布即因此失败：Built application at .../release/corpusgen
+# → failed to bundle）。example 不属于应用二进制，tauri 不会看到它。
+[[example]]
 name = "corpusgen"
-path = "src/bin/corpusgen.rs"
+path = "examples/corpusgen.rs"
 required-features = ["dev-tools"]
 
 [build-dependencies]
@@ -38,11 +41,17 @@ serde_json = "1"
 
 # 引擎依赖（纯 Rust，无系统库依赖）
 zip = { version = "2", default-features = false, features = ["deflate"] } # 解 docx(zip)
-quick-xml = "0.36"   # 解析 docx 正文与元数据 XML
+# 解析 docx 正文与元数据 XML（不可信输入）。≥0.41 修复 RUSTSEC-2026-0194（重复属性名检查的
+# 二次方复杂度）与 -0195（NsReader 命名空间声明无界分配导致内存耗尽）。
+quick-xml = "0.41"
 jieba-rs = "0.7"     # 中文分词
-pdf-extract = "0.7"  # PDF 文本抽取回落（纯 Rust，文本型 PDF）
+pdf-extract = "0.12" # PDF 文本抽取回落（纯 Rust，文本型 PDF）；随其自带的 lopdf 一并升到已修复版
 pdfium-render = "0.8" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
-lopdf = "0.34"       # 读 PDF 元数据指纹（Info 字典）
+# 读 PDF 元数据指纹（Info 字典）与内容流审计。≥0.42 修复 RUSTSEC-2026-0187（深嵌套 PDF 对象
+# 栈溢出）——本应用直接解析投标人提供的不可信 PDF，属必修。停在 0.42 而非 0.44：0.44 与树内
+# time crate 不兼容（BorrowedFormatItem::StringLiteral 已移除），且 0.42 与 pdf-extract 自带的
+# 版本一致，可让树内只保留一份 lopdf。
+lopdf = "0.42"
 similar = "2"        # 字符级 diff（逐对对比高亮）
 rust_xlsxwriter = "0.79" # 导出 Excel 报告
 fastembed = "5"      # 语义查重（中文 embedding；ort rc.12，与 oar-ocr 对齐）
@@ -64,7 +73,9 @@ twox-hash = "2.1.2"
 unicode-normalization = "0.1.25"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
-calamine = { version = "0.35.0", features = ["dates"] }
+# 0.36 起改用 quick-xml 0.41：0.35 会把带漏洞的 quick-xml 0.39 拖进依赖树
+# （RUSTSEC-2026-0194/-0195），而 xlsx 同样是投标人提供的不可信输入。
+calamine = { version = "0.36", features = ["dates"] }
 
 # 授权/激活（license 模块）：纯 Rust，无系统库依赖
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] } # 许可验签（仅公钥）

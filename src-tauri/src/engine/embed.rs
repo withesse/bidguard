@@ -22,6 +22,9 @@ pub struct EmbedModelSpec {
     /// 自托管按需下载源（5 文件打成的 .tar：model.onnx + 4 个 tokenizer 文件）。
     /// None = 不提供自托管下载（仍可走 HF 或内置）。离线内网可把归档放此 URL 或直接内置。
     pub download_url: Option<&'static str>,
+    /// 归档期望 sha256（十六进制）。Some 时下载后逐字节校验，不符即整目录丢弃——模型是判读
+    /// 结论的上游，被截断/被替换的权重会让查重结论不可举证（W6-2 顺带补齐的取证短板）。
+    pub sha256: Option<&'static str>,
 }
 
 /// 可选模型注册表。默认项（e5-small）的 id 沿用历史值，保证旧缓存继续命中。
@@ -34,6 +37,7 @@ pub const MODELS: &[EmbedModelSpec] = &[
         pooling: Pooling::Cls,
         // 默认档，建议随安装包内置（见 src-tauri/models/embeddings/README.md）；无内置文件时回落 HF
         download_url: None,
+        sha256: None,
     },
     EmbedModelSpec {
         key: "bge-large-zh",
@@ -42,6 +46,7 @@ pub const MODELS: &[EmbedModelSpec] = &[
         model: EmbeddingModel::BGELargeZHV15,
         pooling: Pooling::Cls,
         download_url: None, // 太大不内置；可填自托管 .tar 供内网/离线下载，或回落 HF
+        sha256: None,
     },
     EmbedModelSpec {
         key: "e5-large",
@@ -50,6 +55,7 @@ pub const MODELS: &[EmbedModelSpec] = &[
         model: EmbeddingModel::MultilingualE5Large,
         pooling: Pooling::Mean,
         download_url: None,
+        sha256: None,
     },
     EmbedModelSpec {
         key: "e5-small",
@@ -58,6 +64,7 @@ pub const MODELS: &[EmbedModelSpec] = &[
         model: EmbeddingModel::MultilingualE5Small,
         pooling: Pooling::Mean,
         download_url: None,
+        sha256: None,
     },
     EmbedModelSpec {
         key: "e5-base",
@@ -66,6 +73,7 @@ pub const MODELS: &[EmbedModelSpec] = &[
         model: EmbeddingModel::MultilingualE5Base,
         pooling: Pooling::Mean,
         download_url: None,
+        sha256: None,
     },
 ];
 
@@ -150,7 +158,12 @@ fn init_local(dir: &Path, spec: &EmbedModelSpec) -> Option<TextEmbedding> {
 /// 递归收集缓存目录下所有文件 (路径, 字节)，最深 5 层。
 /// 用 fs::metadata（跟随符号链接）判定类型/大小：HF-hub 缓存把 snapshots/<hash>/.../model.onnx
 /// 存为指向 blobs/<sha> 的符号链接，entry.file_type() 不跟随会漏掉这些 onnx（导致误判"未下载"）。
-fn walk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(std::path::PathBuf, u64)>) {
+/// 复核模型（engine::rerank）走同一套缓存目录扫描口径，故 pub(crate) 复用而非再写一遍。
+pub(crate) fn walk_files(
+    dir: &std::path::Path,
+    depth: u8,
+    out: &mut Vec<(std::path::PathBuf, u64)>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
@@ -169,7 +182,9 @@ fn walk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(std::path::PathBu
 /// HF-hub 缓存里同一 blob 既以真文件 blobs/<sha> 出现、又被 snapshots/.. 符号链接指向，
 /// walk_files 跟随符号链接会把同一份字节计两遍；canonicalize 后符号链接与目标 blob
 /// 收敛到同一绝对路径，只计一次（detection 用 .any() 不受影响，故仅在求和处去重）。
-fn dedup_bytes<'a>(files: impl IntoIterator<Item = &'a (std::path::PathBuf, u64)>) -> u64 {
+pub(crate) fn dedup_bytes<'a>(
+    files: impl IntoIterator<Item = &'a (std::path::PathBuf, u64)>,
+) -> u64 {
     let mut seen = std::collections::HashSet::new();
     files
         .into_iter()
@@ -277,29 +292,9 @@ pub fn download_model(spec: &EmbedModelSpec) -> Result<u64, String> {
         .ok_or_else(|| "该模型未提供自托管下载源；请启用联网由 HF 拉取，或将其文件内置到安装包".to_string())?;
     let base = download_dir().ok_or_else(|| "无法定位下载目录".to_string())?;
     let dest = base.join(spec.id);
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-    let resp = ureq::get(url).call().map_err(|e| format!("下载失败：{e}"))?;
-    let reader = resp.into_body().into_reader();
-    let mut archive = tar::Archive::new(reader);
-    let wanted: std::collections::HashSet<&str> =
-        [ONNX_FILE].into_iter().chain(TOKENIZER_FILES).collect();
-    let mut written = 0u64;
-    for entry in archive.entries().map_err(|e| e.to_string())? {
-        let mut e = entry.map_err(|e| e.to_string())?;
-        let name = e
-            .path()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
-        let Some(name) = name else { continue };
-        if !wanted.contains(name.as_str()) {
-            continue;
-        }
-        // 先写 .part 再 rename，避免半截文件被后续 local_model_dir 当成就位
-        let part = dest.join(format!("{name}.part"));
-        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-        written += std::io::copy(&mut e, &mut out).map_err(|e| e.to_string())?;
-        std::fs::rename(&part, dest.join(&name)).map_err(|e| e.to_string())?;
-    }
+    // .part+rename 原子落盘与 sha256 校验统一走 engine::modelfetch（与复核模型同一条落盘路径）
+    let wanted: Vec<&str> = [ONNX_FILE].into_iter().chain(TOKENIZER_FILES).collect();
+    let written = crate::engine::modelfetch::fetch_tar_into(url, spec.sha256, &dest, &wanted)?;
     if local_model_dir(spec).is_none() {
         let _ = std::fs::remove_dir_all(&dest); // 半套文件不留，避免被当就位
         return Err("下载归档缺少必需文件（需 model.onnx + 4 个 tokenizer 文件）".to_string());

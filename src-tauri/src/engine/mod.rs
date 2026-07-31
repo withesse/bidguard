@@ -2,6 +2,11 @@
 // 解析(parse) → 标准化(normalize) → 分块(chunker) → 特征(features/corpus) →
 // 召回(candidate) → 评分(scoring) → 聚类(clustering) → 分类与 diff(diff) →
 // 矩阵(matrix) + 事实冲突(fact) + 围标判定(collusion) + 指纹(fingerprint)。
+pub mod align;
+pub mod background;
+pub mod boq;
+/// 概率校准与共形三带（M7 W6-4）：簇分 → 校准概率 → 低优先级抽查/需人工复核/重点标红。
+pub mod calibrate;
 pub mod candidate;
 pub mod chunker;
 pub mod clustering;
@@ -20,12 +25,20 @@ pub mod fact;
 pub mod features;
 pub mod fingerprint;
 pub mod matrix;
+/// 机制感知筛查（W5-5）：评标办法配置 + 反事实基准价重算。【仅描述性输出，不进围标分级】。
+pub mod mechanism;
+/// 模型按需下载的共用落盘器（embed / rerank）：.tar 原子落盘 + sha256 完整性校验。
+pub mod modelfetch;
 pub mod normalize;
 pub mod ocr;
 pub mod parse;
 pub mod pdf_audit;
 pub mod pdf_xcheck;
 pub mod report;
+/// cross-encoder 复核带（M7 W6-2）：uncertain 簇的【复核建议】分，不自动改判。
+pub mod rerank;
 pub mod scoring;
 pub mod segment;
 pub mod similarity;
+pub mod verbatim;
+pub mod winnow;

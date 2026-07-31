@@ -24,6 +24,20 @@ pub fn char_ngrams(s: &str) -> HashSet<u64> {
     out
 }
 
+/// 单一 n 的字符 n-gram 哈希集合（去重）。背景范本库（W3-4）用 n=4 的字符 4-gram
+/// 计算文档频率 DF 与逐块 boiler_fraction；哈希复用同一 hash64。文本不足 n 字返回空集。
+pub fn char_ngrams_n(s: &str, n: usize) -> HashSet<u64> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = HashSet::new();
+    if n == 0 || chars.len() < n {
+        return out;
+    }
+    for w in chars.windows(n) {
+        out.insert(hash64(&w.iter().collect::<String>()));
+    }
+    out
+}
+
 pub fn jaccard(a: &HashSet<u64>, b: &HashSet<u64>) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -230,7 +244,7 @@ pub fn weighted_vec(tokens: &[String], idf: &HashMap<String, f32>) -> HashMap<St
             (t.clone(), w)
         })
         .collect();
-    let norm: f32 = v.values().map(|w| w * w).sum::<f32>().sqrt();
+    let norm = order_free_sum(v.values().map(|w| (*w as f64) * (*w as f64))).sqrt() as f32;
     if norm > 0.0 {
         for w in v.values_mut() {
             *w /= norm;
@@ -239,18 +253,64 @@ pub fn weighted_vec(tokens: &[String], idf: &HashMap<String, f32>) -> HashMap<St
     v
 }
 
-/// 两个 L2 归一化稀疏向量的余弦（点积）。
+/// 定点累加的刻度（1e-12 一档）。浮点加法【不满足结合律】，而 HashMap 的迭代序随实例而变
+/// （每个 map 的 hash 种子不同）——同一份输入两次求值就会在第 7 位有效数字上抖动。
+/// 这直接违反「同输入同配置两次比对结果逐字节一致」的可复现承诺（举证场景里，同一份材料
+/// 复跑得出不同分数是硬伤）；概率校准的 Platt 拟合还会把这点抖动放大到落盘系数上。
+/// 整数加法满足结合律，故把每项定点化到 1e-12 后用 i128 累加，结果与迭代序无关。
+/// 刻度取 1e-12：远细于 f32 的有效精度（~1e-7），定点化本身不引入可见误差；
+/// i128 容量（~1.7e38）对本处量级（每项 ≤1e20、项数 ≤1e6）有极大余量，不会溢出。
+const FIXED_SCALE: f64 = 1e12;
+
+/// 与求和顺序无关的浮点求和：逐项定点化后整数累加，再还原。
+fn order_free_sum(terms: impl Iterator<Item = f64>) -> f64 {
+    let acc: i128 = terms.map(|t| (t * FIXED_SCALE).round() as i128).sum();
+    acc as f64 / FIXED_SCALE
+}
+
+/// 两个 L2 归一化稀疏向量的余弦（点积）。求和走 order_free_sum：见上方结合律说明。
 pub fn sparse_dot(a: &HashMap<String, f32>, b: &HashMap<String, f32>) -> f32 {
     let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-    small
-        .iter()
-        .filter_map(|(t, w)| big.get(t).map(|v| w * v))
-        .sum()
+    order_free_sum(
+        small.iter().filter_map(|(t, w)| big.get(t).map(|v| (*w as f64) * (*v as f64))),
+    ) as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 可复现回归（W6-4/W6-2 依赖）：稀疏点积必须与求和顺序无关。
+    // HashMap 迭代序随实例而变 + f32/f64 加法不满足结合律 ⇒ 朴素 sum 会让同一对文本两次
+    // 求值在末位抖动，进而让「同输入两次比对结果逐字节一致」的承诺失效（Platt 拟合会把
+    // 这点抖动放大到落盘系数上，曾表现为校准拟合测试随机失败）。
+    #[test]
+    fn sparse_dot_is_independent_of_iteration_order() {
+        // 刻意选一组按不同顺序相加会产生不同 f32 舍入的项
+        let terms: Vec<(String, f32)> = (0..64)
+            .map(|i| (format!("t{i}"), 1.0 / (i as f32 + 1.0).sqrt() / 8.0))
+            .collect();
+        let build = |order: Box<dyn Iterator<Item = usize>>| -> HashMap<String, f32> {
+            order.map(|i| (terms[i].0.clone(), terms[i].1)).collect()
+        };
+        let fwd = build(Box::new(0..terms.len()));
+        let rev = build(Box::new((0..terms.len()).rev()));
+        let shuffled = build(Box::new((0..terms.len()).map(|i| (i * 37) % 64)));
+        let base = sparse_dot(&fwd, &fwd);
+        assert_eq!(base, sparse_dot(&rev, &rev), "逆序插入不得改变点积");
+        assert_eq!(base, sparse_dot(&shuffled, &fwd), "打乱插入序不得改变点积");
+        assert!(base > 0.0, "前置条件：本组向量点积非零（实测 {base}）");
+    }
+
+    #[test]
+    fn order_free_sum_matches_math_and_ignores_order() {
+        let v = [0.1f64, 0.2, 0.3, 0.4];
+        let fwd = order_free_sum(v.iter().copied());
+        let rev = order_free_sum(v.iter().rev().copied());
+        assert_eq!(fwd, rev);
+        assert!((fwd - 1.0).abs() < 1e-9, "实测 {fwd}");
+        assert_eq!(order_free_sum(std::iter::empty()), 0.0);
+    }
 
     #[test]
     fn ngrams_and_jaccard() {

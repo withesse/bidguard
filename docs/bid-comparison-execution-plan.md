@@ -12,7 +12,7 @@
 
 这五项是审查发现的主要返工源，任何条目动工前先落实：
 
-1. **迁移台账一次性预分配**。六个工作流的原始设计全部抢占 V12 槽位。按里程碑顺序固定分配并写死进各条目（**2026-07-06 修订**：V12 已被注册激活 MVP 的 license_usage 表占用——commit 6e18dfc 先行合入，重编已发布迁移会损坏现有用户库，故整体顺延一位）：V13=documents.evasion_json（✅ M0 已落地）、V14=documents.doc_role（✅ M0 已落地）、V15=document_images 表（✅ M1 已落地）、V16=chunk_exemptions 表、V17=clusters 豁免列（exempt_reason/multi_doc_anomaly）、V18=verbatim_matches 表、V19=aligned_segments（含 anchors）、V20=segment_diffs 表、V21=boq_items 表、V22=jobs.numeric_json、V23=clusters.rerank_score/confidence/band 合批。删除一切"编号以合入时下一空位为准"的浮动表述。
+1. **迁移台账一次性预分配**。六个工作流的原始设计全部抢占 V12 槽位。按里程碑顺序固定分配并写死进各条目（**2026-07-06 修订**：V12 已被注册激活 MVP 的 license_usage 表占用——commit 6e18dfc 先行合入，重编已发布迁移会损坏现有用户库，故整体顺延一位）：V13=documents.evasion_json（✅ M0 已落地）、V14=documents.doc_role（✅ M0 已落地）、V15=document_images 表（✅ M1 已落地）、V16=chunk_exemptions 表（✅ M4 已落地）、V17=clusters 豁免列（exempt_reason/multi_doc_anomaly）（✅ M4 已落地）、V18=verbatim_matches 表（✅ M5 已落地）、V19=aligned_segments（含 anchors）（✅ M5 已落地）、V20=segment_diffs 表（✅ M5 已落地）、V21=boq_items 表（✅ M6 已落地）、V22=jobs.numeric_json（✅ M6 已落地）、V23=clusters.rerank_score/confidence/band 合批（✅ M7 已落地）。删除一切"编号以合入时下一空位为准"的浮动表述。
 2. **collusion 融合架构定终态**。M0 先做 `CollusionInputs` 单结构体重构（assess_with 签名只改这一次）；所有新信号从第一天起按**连续特征 x∈[0,1]** 定义（不是定值触发），M7 的逻辑回归对**全量特征**一次性拟合；FORENSIC_CAP/数值封顶/条件化 floor 作为 LR 之外的少数显式规则保留并文档化。避免原始设计中"四个工作流轮番改签名、LR 只拟合旧五信号"的互斥。
 3. **options_hash 只 bump 一次（v5→v6）**。W2 归一化改动、W1 取证指纹版本、pdf_cross_check 配置键合并进同一次 bump。关键依据（工程审查 HIGH）：不 bump 时跨工作区缓存复用路径（import_service.rs persist_cached）会原样复制旧 fingerprint_json，重新导入也拿不到新取证字段；document_images 在缓存路径需同步重算/复制。
 4. **matrix_json 与 ExportData 的 schema 在 M0 冻结**。剔除前/剔除后/区段三套口径一次定形：`{documentIds, matrix(剔除后·聚类口径，风险分级用它), matrixOriginal, segmentMatrix, peak/peakOriginal/segmentPeak, mode}`；六格式导出的 forensic/evasion/numeric/segments 节先定形状，后续里程碑按节填充，避免 docx 排版三次返工。Matrix.tsx 的双口径 UI（角标 + Pill 切换 + tooltip 对照）合并为一次改造，放在 M5 统一实现。
@@ -74,7 +74,7 @@
 - **内置静态范本背景库**（1.5d，W3-4 降级版）：砍掉跨工作区增量 DF 记账（审查裁决：破坏可复现可举证），保留随包版本化静态库 + 双阈值。
 - **豁免接线**（1d，新增条目——审查发现的缺失桥接）：招标文件 rsid 集/图片哈希集/token 集喂回 M1 三处豁免参数；激活条件化 floor。
 - **k-共现查证**（2.5d，W3-3，V16）：≥3 家共有先查证，查不到标"待复核·多家共有段落"（不自动 high）。
-- **分区分层阈值**（2.5d，W3-5）：五区分类（legal/price/tech/business/other），legal 区阈值 +0.12，price 区不做文本相似度。
+- **分区分层阈值**（2.5d，W3-5）：五区分类（legal/price/tech/business/other），legal 区阈值 +0.12。price 区**不上浮、不因套话文本计分**，但表格行**维持现阈值**以保留金额事实冲突通道（fact.rs 依赖 price 表格行聚类出金额冲突）——逐项数值雷同率/相关性留 M6 数值层，不在 M4 切断 price 文本聚类（否则会静默废掉已有的金额冲突检测并破两条基线测试）。
 
 ### M5 铁证层 + 对齐成型（~18d，可拆 M5a 铁证+链化 / M5b 视图+导出）
 
@@ -701,7 +701,7 @@
 - **配置**：无运行时配置；生成参数（种子、各变换强度）写死在 bin 内并随 fixtures 版本化
 - **新依赖**：无。RNG 用仓库既有 splitmix64；同义表/混淆表自建（规避《同义词词林》等外部词表的许可问题）；JSONL 读写用已有 serde_json
 - **风险**：①循环论证：变换器与检测器共享同一套直觉（同义替换 vs 词面维），在自造语料上的指标会系统性偏乐观，只能证伪不能证真——须在文档注明"合成语料指标是下界回归基线，不是真实检出率"；②同义表覆盖不足会让 rewrite 样本改写强度不够、与 minor_change 标签边界模糊；③seeds 若含真实企业信息有泄露风险，入库前必须脱敏；④label 分级线本身依赖现行八类定义，后续 item 4 改带语义时标注格式需保持前向兼容（label 保留原值，band 另算）
-- **验收标准**：①cargo run --bin corpusgen --features dev-tools 两次运行输出的 pairs.jsonl/docsets 逐字节一致；②pairs.jsonl ≥2000 对、四类标签各 ≥300、每类变换链 ≥200 对；docsets ≥10 组（围标正/独立负各半）；③cargo test --features dev-tools corpus_metrics -- --ignored --nocapture 输出各层指标 JSON（召回层召回率、评分层 per-label P/R/F1、围标层混淆矩阵）且无 panic；④现有 cargo test --lib 全绿（生成器不影响发布路径）；⑤fixtures 总体积 <5MB
+- **验收标准**：①cargo run --example corpusgen --features dev-tools 两次运行输出的 pairs.jsonl/docsets 逐字节一致；②pairs.jsonl ≥2000 对、四类标签各 ≥300、每类变换链 ≥200 对；docsets ≥10 组（围标正/独立负各半）；③cargo test --features dev-tools corpus_metrics -- --ignored --nocapture 输出各层指标 JSON（召回层召回率、评分层 per-label P/R/F1、围标层混淆矩阵）且无 panic；④现有 cargo test --lib 全绿（生成器不影响发布路径）；⑤fixtures 总体积 <5MB
 
 ### cross-encoder 复核带：reranker ONNX 接入模型管理器，只重打分 uncertain 带（4d）
 

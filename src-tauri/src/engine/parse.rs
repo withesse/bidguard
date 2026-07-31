@@ -5,6 +5,14 @@ use crate::engine::report::Fingerprint;
 use pdfium_render::prelude::*;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+
+/// 文本事件取值：quick-xml 0.41 起 `BytesText::unescape` 被拆成「按 XML 版本解码（含 EOL 归一）」
+/// 与「实体反转义」两步。docx 正文与 core/app.xml 均为 XML 1.0，故走 xml10_content + unescape，
+/// 与旧版 `unescape()` 语义等价；任一步失败返回 None（沿用旧代码「取不到就跳过」的容错）。
+fn xml_text(t: &quick_xml::events::BytesText<'_>) -> Option<String> {
+    let decoded = t.xml10_content().ok()?;
+    Some(quick_xml::escape::unescape(&decoded).ok()?.into_owned())
+}
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -885,7 +893,10 @@ fn parse_xmp(xml: &[u8], fp: &mut Fingerprint) {
                 // 与 <xmpMM:DerivedFrom stRef:documentID="…"/>
                 for a in e.attributes().flatten() {
                     let key = a.key.local_name().into_inner().to_ascii_lowercase();
-                    let Ok(val) = a.unescape_value() else { continue };
+                    // XMP 为 XML 1.0；normalized_value 取代旧 unescape_value（0.41 起需显式版本）。
+                    let Ok(val) = a.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
+                        continue;
+                    };
                     match key.as_slice() {
                         b"documentid" if elem_is_derived => set(&mut fp.xmp_derived_from, &val),
                         b"documentid" => set(&mut fp.xmp_document_id, &val),
@@ -906,7 +917,7 @@ fn parse_xmp(xml: &[u8], fp: &mut Fingerprint) {
                 cur.clear();
             }
             Ok(Event::Text(t)) => {
-                let Ok(val) = t.unescape() else { continue };
+                let Some(val) = xml_text(&t) else { continue };
                 match cur.as_slice() {
                     b"documentid" if in_derived => set(&mut fp.xmp_derived_from, &val),
                     b"documentid" => set(&mut fp.xmp_document_id, &val),
@@ -1377,7 +1388,7 @@ fn docx_blocks(xml: &[u8]) -> (Vec<Block>, String, bool) {
             }
             Ok(Event::Text(t)) => {
                 if in_t {
-                    if let Ok(s) = t.unescape() {
+                    if let Some(s) = xml_text(&t) {
                         para.push_str(&s);
                     }
                 }
@@ -1404,7 +1415,7 @@ fn fill_core(xml: &[u8], fp: &mut Fingerprint) {
             Ok(Event::Start(e)) => cur = e.local_name().into_inner().to_vec(),
             Ok(Event::End(_)) => cur.clear(),
             Ok(Event::Text(t)) => {
-                let val = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                let val = xml_text(&t).unwrap_or_default();
                 if !val.trim().is_empty() {
                     match cur.as_slice() {
                         b"creator" => fp.author = Some(val),
@@ -1435,7 +1446,7 @@ fn fill_app(xml: &[u8], fp: &mut Fingerprint) -> u32 {
             Ok(Event::Start(e)) => cur = e.local_name().into_inner().to_vec(),
             Ok(Event::End(_)) => cur.clear(),
             Ok(Event::Text(t)) => {
-                let val = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                let val = xml_text(&t).unwrap_or_default();
                 match cur.as_slice() {
                     b"Application" => fp.app = Some(val),
                     b"TotalTime" => fp.total_edit_minutes = val.trim().parse::<i64>().ok(),
@@ -2002,7 +2013,8 @@ mod tests {
         let hits = lineage_pairs(&mut hard_docs);
         let c = assess_with(CollusionInputs { lineage_hits: &hits, ..Default::default() });
         let s = c.signals.iter().find(|s| s.kind == "pdfLineage").expect("应有 pdfLineage 信号");
-        assert!((s.weight - 0.35).abs() < 1e-6, "硬命中满权重 0.35，实际 {}", s.weight);
+        let expect_hard = crate::engine::collusion::expected_contribution("pdfLineage", 1.0);
+        assert!((s.weight - expect_hard).abs() < 1e-6, "硬命中 x=1 满档，实际 {}", s.weight);
         assert!(s.detail.contains("未命中不代表清白"));
         assert!(hard_docs[0].fingerprint.risk_flags.iter().any(|f| f.contains("同一母文件")));
 
@@ -2013,7 +2025,8 @@ mod tests {
         let mid_hits = lineage_pairs(&mut mid_docs);
         let cm = assess_with(CollusionInputs { lineage_hits: &mid_hits, ..Default::default() });
         let sm = cm.signals.iter().find(|s| s.kind == "pdfLineage").expect("中命中也应有信号");
-        assert!((sm.weight - 0.35 * 0.55).abs() < 1e-6, "仅中命中 x=0.55，实际 {}", sm.weight);
+        let expect_mid = crate::engine::collusion::expected_contribution("pdfLineage", 0.55);
+        assert!((sm.weight - expect_mid).abs() < 1e-6, "仅中命中 x=0.55，实际 {}", sm.weight);
 
         // 均无命中：无该信号
         let n1 = write_lineage_pdf(&dir, "n1.pdf", b"\x03", None, &["DDDDDD+FangSong"]);

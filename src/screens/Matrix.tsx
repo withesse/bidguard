@@ -1,10 +1,11 @@
 // 屏 4 · 检测报告 · 交叉矩阵 —— 移植自 app-design/project/src/c/bid-b.jsx (BidScrMatrix)
 // 数据驱动：直接消费 CompareSummaryDto（原生），无真实结果则真空态。
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import { C, severityColor } from "../design/tokens";
 import { Icon } from "../design/Icon";
 import { Topbar } from "../components/Topbar";
-import { Button, Pill } from "../components/primitives";
+import { Button, Pill, SegControl } from "../components/primitives";
 import { useTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import { useCompareSummary } from "../queries/data";
@@ -12,7 +13,7 @@ import type { Screen } from "../routes";
 import type { Collusion, Fingerprint } from "../engine";
 import type { CompareSummaryDto } from "../api/types";
 import { docColor, docTag } from "../utils/docTag";
-import { simBand } from "../utils/clusterUi";
+import { bandUi, routingNote, simBand } from "../utils/clusterUi";
 
 const EMPTY_FP: Fingerprint = {
   author: null,
@@ -49,14 +50,37 @@ interface Insight {
 }
 interface MatrixView {
   docs: ViewDoc[];
+  docIds: string[];
+  /** 主口径：残差·剔除后·聚类覆盖率（风险分级与围标信号①的唯一输入）。 */
   matrix: number[][];
+  /** 未对减口径（原始相似度）；无对减时等于 matrix。 */
+  matrixOriginal: number[][];
+  /** 区段口径（对齐区段按 chunk 去重后覆盖率）；无区段时为 null → 不提供口径切换。 */
+  segMatrix: number[][] | null;
   peakPct: number;
+  segPeakPct: number;
   peakColor: string;
   peakPair: string;
+  /** W3-2 招标对减：剔除的引用块数（0=无对减）与原始峰值（对照用）。 */
+  tenderRefCount: number;
+  peakOriginalPct: number;
   conclusion: { pill: string; statement: string; desc: string };
   pairRows: PairRow[];
   insights: Insight[];
   forensicSignals: { tag: string; fg: string; bg: string; detail: string; weight: number }[];
+  /** 围标结论的证据强度口头等级（ENFSI 式，§1.5-2）：不展示概率数值。 */
+  strength: string;
+  /** 复核路由三带统计（W6-4）+ 分流说明；旧任务全部计入「未校准」。 */
+  bands: { pass: number; review: number; flag: number; uncalibrated: number; note: string };
+  /** M6 商务标数值层：有清单数据才提供「商务标数值」入口（独立屏，决策 5）。 */
+  hasNumeric: boolean;
+  numericAlarmPairs: number;
+  numericArithErrors: number;
+}
+
+/** 区段口径峰值有效（非空矩阵且有非零项）→ 才提供口径切换（旧任务/无区段不切）。 */
+function hasSegmentCaliber(seg: number[][] | null): boolean {
+  return !!seg && seg.length > 0 && seg.some((row) => row.some((v) => v > 0));
 }
 
 // 围标信号 kind → 洞察标签配色。取证四类走「取证/图片/错误」红/橙档，规避走最高红档；
@@ -71,8 +95,21 @@ const KIND_META: Record<string, { tag: string; fg: string; bg: string }> = {
   imageReuse: { tag: "图片", fg: C.hi2, bg: C.hi2Soft },
   sharedErrors: { tag: "错误", fg: C.hi4, bg: C.hi4Soft },
   evasion: { tag: "规避特征", fg: C.danger, bg: C.dangerSoft },
+  // W3-3 多家异常一致：独立「待复核」档（不自动 high）；detail 自带涉嫌措辞 + 条例第四十条 + 评标委员会脚注。
+  multiDocAnomaly: { tag: "待复核 · 涉嫌一致", fg: C.danger, bg: C.dangerSoft },
+  // M6 商务标数值层（W5-6）：四类数值信号 + 后置的机制反事实。detail 自带 §1.5 口径/线索/核对措辞。
+  numericIdentical: { tag: "清单雷同率", fg: C.danger, bg: C.dangerSoft },
+  numericArithError: { tag: "共享算术错误", fg: C.hi4, bg: C.hi4Soft },
+  numericPattern: { tag: "线索 · 规律性差异", fg: C.hi2, bg: C.hi2Soft },
+  numericCorrelation: { tag: "单价相关性", fg: C.hi3, bg: C.hi3Soft },
+  numericMechanism: { tag: "评标机制反事实", fg: C.hi3, bg: C.hi3Soft },
 };
 const KIND_META_DEFAULT = { tag: "相似", fg: C.hi3, bg: C.brandSoft };
+// M7 起 CollusionSignal.weight 是该信号的【对数似然比贡献】（log-odds），不再是 0–1 的权重占比，
+// 故不能再按百分比呈现。数值越大代表该证据把结论往「同源编制」方向推得越多；分解按贡献降序。
+function contribLabel(weight: number): string {
+  return `对数似然比贡献 +${weight.toFixed(2)}`;
+}
 // 取证指纹折叠区消费的信号 kind（rsid/PDF 血缘/图片同源/共同错误）。
 const FORENSIC_KINDS = ["rsid", "pdfLineage", "imageReuse", "sharedErrors"];
 const FORENSIC_DISCLAIMER =
@@ -83,6 +120,21 @@ function sev(pct: number): { c: string; label: string } {
   return { c: b.color, label: b.label };
 }
 
+// 围标结论的【证据强度口头等级】（ENFSI 式，§1.5-2）：M7 起围标 score 是校准后的证据强度，
+// 一律不作「串通概率 X%」呈现——屏幕只给口头等级，概率数值仅留在 collusion_json 技术字段。
+function strengthPhrase(level: string): string {
+  switch (level) {
+    case "high":
+      return "强支持「同源编制」假设";
+    case "medium":
+      return "中等支持「同源编制」假设";
+    case "low":
+      return "弱支持「同源编制」假设";
+    default:
+      return "未见支持「同源编制」假设的证据";
+  }
+}
+
 const LEVEL_META: Record<string, { pill: string; color: string; statement: string }> = {
   high: { pill: "围标嫌疑 · 高", color: C.danger, statement: "命中多项同源信号，高度疑似围标，建议立即人工复核。" },
   medium: { pill: "重点复核 · 中", color: C.hi3, statement: "存在明显雷同与同源迹象，建议重点复核核心章节。" },
@@ -90,9 +142,31 @@ const LEVEL_META: Record<string, { pill: string; color: string; statement: strin
   none: { pill: "未见明显围标", color: C.ink, statement: "各份标书差异充分，未见高度雷同或同源迹象。" },
 };
 
+/** 由某口径矩阵派生「对比结果一览」行（按百分比降序）。矩阵切口径时随之刷新。 */
+function buildPairRows(matrix: number[][], docs: ViewDoc[]): PairRow[] {
+  const n = docs.length;
+  const rows: PairRow[] = [];
+  for (let i = 0; i < n; i++)
+    for (let j = i + 1; j < n; j++) {
+      const pct = Math.round((matrix[i]?.[j] ?? 0) * 100);
+      const sv = sev(pct);
+      rows.push({
+        pair: `${docs[i].tag} × ${docs[j].tag}`,
+        pct,
+        label: sv.label,
+        c: sv.c,
+        secs: `${docs[i].short} ↔ ${docs[j].short}`,
+      });
+    }
+  rows.sort((a, b) => b.pct - a.pct);
+  return rows;
+}
+
 function fromSummary(sm: CompareSummaryDto): MatrixView {
   const docIds = sm.matrix?.documentIds ?? [];
   const matrix = sm.matrix?.matrix ?? [];
+  const matrixOriginal = sm.matrix?.matrixOriginal ?? matrix;
+  const segMatrix = sm.matrix?.segmentMatrix ?? null;
   const byId = new Map(sm.documents.map((d) => [d.id, d]));
   const fpOf = (id: string): Fingerprint => {
     try {
@@ -127,14 +201,7 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
       }
   const peakPct = Math.round((sm.matrix?.peak || 0) * 100);
 
-  const pairRows: PairRow[] = [];
-  for (let i = 0; i < n; i++)
-    for (let j = i + 1; j < n; j++) {
-      const pct = Math.round(matrix[i][j] * 100);
-      const sv = sev(pct);
-      pairRows.push({ pair: `${docs[i].tag} × ${docs[j].tag}`, pct, label: sv.label, c: sv.c, secs: `${docs[i].short} ↔ ${docs[j].short}` });
-    }
-  pairRows.sort((a, b) => b.pct - a.pct);
+  const pairRows = buildPairRows(matrix, docs);
 
   // 围标综合判定驱动结论与洞察
   const collusion = sm.collusion as unknown as Collusion | undefined;
@@ -152,12 +219,12 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
         tag: "异常字符",
         fg: C.warn,
         bg: C.warnSoft,
-        title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`,
+        title: contribLabel(sig.weight),
         body: "检测到异常字符（可能来自复制粘贴），建议人工留意；未达规避特征确认级，未必构成规避。",
       };
     }
     const meta = KIND_META[sig.kind] ?? KIND_META_DEFAULT;
-    return { ...meta, title: `信号权重 ${(sig.weight * 100).toFixed(0)}%`, body: sig.detail };
+    return { ...meta, title: contribLabel(sig.weight), body: sig.detail };
   });
   // 取证指纹折叠区：逐条列出 rsid/PDF 血缘/图片同源/共同错误信号（明细含天干对与免责纪律）。
   const forensicSignals = signals
@@ -189,21 +256,56 @@ function fromSummary(sm: CompareSummaryDto): MatrixView {
   const desc =
     (signals.length ? signals.map((sig) => sig.detail).join("；") + "。" : "") +
     `本次共比对 ${n} 份标书、${(n * (n - 1)) / 2} 对组合，峰值相似度 ${peakPct}%，全部在本地完成。`;
+  const hasSeg = hasSegmentCaliber(segMatrix);
   return {
     docs,
+    docIds,
     matrix,
+    matrixOriginal,
+    segMatrix: hasSeg ? segMatrix : null,
     peakPct,
+    segPeakPct: Math.round((sm.matrix?.segmentPeak ?? 0) * 100),
     peakColor,
     peakPair: `${docs[pi].tag} ←→ ${docs[pj].tag}`,
+    tenderRefCount: sm.summary?.tenderRefChunkCount ?? 0,
+    peakOriginalPct: Math.round((sm.matrix?.peakOriginal ?? sm.matrix?.peak ?? 0) * 100),
+    strength: strengthPhrase(level),
+    bands: {
+      pass: sm.summary?.bandPassCount ?? 0,
+      review: sm.summary?.bandReviewCount ?? 0,
+      flag: sm.summary?.bandFlagCount ?? 0,
+      uncalibrated:
+        sm.summary?.bandUncalibratedCount ??
+        Math.max(
+          0,
+          (sm.summary?.clusterCount ?? 0) -
+            (sm.summary?.bandPassCount ?? 0) -
+            (sm.summary?.bandReviewCount ?? 0) -
+            (sm.summary?.bandFlagCount ?? 0),
+        ),
+      note: routingNote(
+        sm.summary?.calibrationRouting,
+        sm.summary?.calibrationAlpha,
+        sm.summary?.calibrationBeta,
+      ),
+    },
     conclusion: { pill: lv.pill, statement, desc },
     pairRows,
     insights,
     forensicSignals,
+    hasNumeric: (sm.numeric?.pairs?.length ?? 0) > 0,
+    numericAlarmPairs: sm.numeric?.pairs?.filter((p) => p.alarm).length ?? 0,
+    numericArithErrors:
+      sm.numeric?.pairs?.reduce((s, p) => s + (p.sharedArithErrors?.length ?? 0), 0) ?? 0,
   };
 }
 
 export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId?: string }) {
   const { dark } = useTheme();
+  const nav = useNavigate();
+  const { wsId } = useParams<{ wsId: string }>();
+  // 口径切换（§1.4）：null=跟随后端默认口径；用户手动切换后固定。
+  const [mode, setMode] = useState<"cluster" | "segment" | null>(null);
   const ink = dark ? "#fff" : C.ink;
   const mute = dark ? "rgba(255,255,255,0.55)" : C.ink3;
   const bg = dark ? "#15151B" : C.paper;
@@ -231,6 +333,39 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
   }
   const v = fromSummary(sm);
   const n = v.docs.length;
+  // 主口径永远是聚类·剔除后（风险分级/围标判定的唯一输入，与峰值卡一致）；矩阵展示口径可切到
+  // 区段。默认聚类：区段覆盖天然更稀疏（无对齐区段的文档对区段值=0），作默认易被误读为「不相似」。
+  const activeMode: "cluster" | "segment" =
+    (mode ?? "cluster") === "segment" && v.segMatrix ? "segment" : "cluster";
+  const activeMatrix = activeMode === "segment" && v.segMatrix ? v.segMatrix : v.matrix;
+  const activePairRows = buildPairRows(activeMatrix, v.docs);
+  const caliberLabel = activeMode === "segment" ? "区段口径" : "聚类口径（剔除后）";
+  const goSegments = (r: number, c: number) =>
+    nav(`/workspace/${wsId}/job/${jobId}/segments?a=${v.docIds[r]}&b=${v.docIds[c]}`);
+  // 单元格对照口径（角标）：聚类模式对照未对减原始值；区段模式对照聚类剔除后值。差异 >10pp 标注。
+  const cornerOf = (r: number, c: number): { pct: number; hot: boolean } | null => {
+    if (r === c) return null;
+    const primary = Math.round((activeMatrix[r]?.[c] ?? 0) * 100);
+    const other =
+      activeMode === "segment"
+        ? Math.round((v.matrix[r]?.[c] ?? 0) * 100)
+        : Math.round((v.matrixOriginal[r]?.[c] ?? 0) * 100);
+    if (other === primary) return null;
+    return { pct: other, hot: Math.abs(other - primary) > 10 };
+  };
+  const titleOf = (r: number, c: number): string => {
+    if (r === c) return "";
+    const cluster = Math.round((v.matrix[r]?.[c] ?? 0) * 100);
+    const original = Math.round((v.matrixOriginal[r]?.[c] ?? 0) * 100);
+    const seg = v.segMatrix ? Math.round((v.segMatrix[r]?.[c] ?? 0) * 100) : null;
+    const parts = [`聚类·剔除后 ${cluster}%`, `未对减 ${original}%`];
+    if (seg != null) parts.push(`区段 ${seg}%`);
+    const spread = Math.max(cluster, original, seg ?? cluster) - Math.min(cluster, original, seg ?? cluster);
+    // 全角空格写成转义：ESLint no-irregular-whitespace 默认放行普通字符串、但不放行模板串
+    // (skipTemplates=false)，且 skipComments 默认亦为 false，故此注释也不能写字面全角空格。
+    const tail = spread > 10 ? `\u3000口径差异 ${spread}pp（>10pp，注意口径选择）` : "";
+    return `${v.docs[r].tag}×${v.docs[c].tag} · ${parts.join(" · ")}${tail} · 点击查看对齐区段`;
+  };
   const share = async () => {
     const text = [
       "标书查重报告",
@@ -298,14 +433,78 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
               >
                 {v.conclusion.statement}
               </div>
+              {/* 证据强度口头等级（§1.5-2 ENFSI 式）：不展示「串通概率 X%」，
+                  概率数值仅保留在导出 JSON 的技术字段并注明「合成语料校准、非串通概率」。 */}
+              <div style={{ fontSize: 12.5, color: mute, marginTop: 8 }}>
+                证据强度：<b style={{ color: ink }}>{v.strength}</b>
+                （在合成校准语料上测得的强度等级，不是串通概率；是否构成串通投标须由评标委员会依法认定）
+              </div>
               <div style={{ fontSize: 13, color: mute, marginTop: 8, lineHeight: 1.65 }}>{v.conclusion.desc}</div>
-              <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+              {/* 复核路由三带统计（W6-4）：条款按什么口径排队，报告与列表口径一致 */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, color: mute }}>复核路由</span>
+                {([
+                  ["flag", v.bands.flag],
+                  ["review", v.bands.review],
+                  ["pass", v.bands.pass],
+                  ["uncalibrated", v.bands.uncalibrated],
+                ] as const).map(([key, n]) => {
+                  const ui = bandUi(key);
+                  return (
+                    <span
+                      key={key}
+                      role="button"
+                      tabIndex={0}
+                      title={ui.hint}
+                      onClick={() => onGo("clusters")}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onGo("clusters");
+                        }
+                      }}
+                      style={{
+                        fontSize: 11,
+                        padding: "3px 9px",
+                        borderRadius: 999,
+                        cursor: "pointer",
+                        color: ui.fg,
+                        background: ui.bg,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {ui.label} {n}
+                    </span>
+                  );
+                })}
+                <span style={{ fontSize: 10.5, color: mute, flexBasis: "100%", lineHeight: 1.6 }}>
+                  {v.bands.note}
+                </span>
+              </div>
+              {v.segMatrix && (
+                <div style={{ fontSize: 11, color: mute, marginTop: 8, lineHeight: 1.6 }}>
+                  围标判定基于<b style={{ color: ink }}>聚类口径（剔除后 · 峰值 {v.peakPct}%）</b>；
+                  区段口径峰值 {v.segPeakPct}% 仅供矩阵展示，不改变分级。
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
                 <Button kind="primary" size="md" icon="diff" onClick={() => onGo("compare")}>
                   查看逐对对比
                 </Button>
                 <Button kind="secondary" size="md" icon="folder" onClick={() => onGo("clusters")}>
                   查看重复条款
                 </Button>
+                {/* M6：数值证据为独立屏（决策 5），仅在识别出报价清单时出现 */}
+                {v.hasNumeric && (
+                  <Button kind="secondary" size="md" onClick={() => onGo("numeric")}>
+                    商务标数值
+                    {v.numericAlarmPairs > 0
+                      ? ` · 告警 ${v.numericAlarmPairs} 对`
+                      : v.numericArithErrors > 0
+                        ? ` · 算术错误 ${v.numericArithErrors} 条`
+                        : ""}
+                  </Button>
+                )}
               </div>
             </div>
             <div
@@ -345,23 +544,48 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
               <div style={{ fontSize: 12, color: mute, marginTop: 8 }}>
                 出现在 <span style={{ color: ink, fontWeight: 700 }}>{v.peakPair}</span> 之间
               </div>
+              {/* W3-2 招标对减：剔除后为主口径，原始峰值作对照（Pill 切换完整版在 M5）。 */}
+              {v.tenderRefCount > 0 && (
+                <div style={{ fontSize: 11, color: mute, marginTop: 10, lineHeight: 1.6 }}>
+                  已剔除招标文件引用 <span style={{ color: ink, fontWeight: 700 }}>{v.tenderRefCount}</span> 块
+                  {v.peakOriginalPct !== v.peakPct && (
+                    <>
+                      {" · "}原始峰值 <span style={{ color: ink, fontWeight: 700 }}>{v.peakOriginalPct}%</span> → 剔除后{" "}
+                      <span style={{ color: ink, fontWeight: 700 }}>{v.peakPct}%</span>
+                    </>
+                  )}
+                  <br />
+                  风险分级采用剔除后口径（对招标条款的合法逐字应答已剥离）
+                </div>
+              )}
             </div>
           </div>
 
           {/* 矩阵 + 洞察 */}
           <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16 }}>
             <div style={{ background: cardBg, border: `1px solid ${border}`, borderRadius: 14, padding: 24 }}>
-              <div style={{ display: "flex", alignItems: "baseline", marginBottom: 18 }}>
+              <div style={{ display: "flex", alignItems: "center", marginBottom: 12, gap: 10, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 14, fontWeight: 700, color: ink }}>
                   {n} × {n} 标书相似度矩阵
                 </span>
-                <span style={{ fontSize: 11, color: mute, marginLeft: 8 }}>语义级 · 段落粒度</span>
+                <span style={{ fontSize: 11, color: mute }}>
+                  {activeMode === "segment" ? "对齐区段 · 覆盖率" : "语义级 · 段落粒度"}
+                </span>
                 <div style={{ flex: 1 }} />
+                {v.segMatrix && (
+                  <div style={{ width: 190 }}>
+                    <SegControl
+                      options={["聚类口径", "区段口径"]}
+                      value={activeMode === "segment" ? 1 : 0}
+                      onChange={(i) => setMode(i === 1 ? "segment" : "cluster")}
+                    />
+                  </div>
+                )}
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontSize: 10.5, color: mute }}>低</span>
                   <div
                     style={{
-                      width: 92,
+                      width: 72,
                       height: 8,
                       borderRadius: 4,
                       background: `linear-gradient(to right, ${C.okSoft}, ${C.hi1}, ${C.hi2}, ${C.hi3}, ${C.hi4})`,
@@ -370,7 +594,13 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                   <span style={{ fontSize: 10.5, color: mute }}>高</span>
                 </div>
               </div>
-              <BigMatrix docs={v.docs} matrix={v.matrix} onCell={() => onGo("compare")} />
+              {/* §1.4 双口径：单元格大数=当前口径，左上角标=对照口径（差异>10pp 标红）；tooltip 三口径对照。 */}
+              <div style={{ fontSize: 10.5, color: mute, marginBottom: 12, lineHeight: 1.6 }}>
+                当前口径 <b style={{ color: ink }}>{caliberLabel}</b> · 角标为对照口径
+                {activeMode === "segment" ? "（聚类·剔除后）" : "（未对减原始）"}
+                ；围标判定固定采用<b style={{ color: ink }}>聚类口径（剔除后）</b>，与展示口径无关。点单元格看对齐区段。
+              </div>
+              <BigMatrix docs={v.docs} matrix={activeMatrix} cornerOf={cornerOf} titleOf={titleOf} onCell={goSegments} />
 
               <div
                 style={{
@@ -392,9 +622,9 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                     marginBottom: 4,
                   }}
                 >
-                  对比结果一览
+                  对比结果一览 · {caliberLabel}
                 </div>
-                {v.pairRows.map((row, i) => (
+                {activePairRows.map((row, i) => (
                   <div
                     key={i}
                     style={{
@@ -534,7 +764,7 @@ export function MatrixScreen({ onGo, jobId }: { onGo: (s: Screen) => void; jobId
                             {s.tag}
                           </Pill>
                           <span style={{ fontSize: 11, color: mute, fontFamily: C.mono }}>
-                            权重 {(s.weight * 100).toFixed(0)}%
+                            {contribLabel(s.weight)}
                           </span>
                         </div>
                         <div style={{ fontSize: 11, color: mute, marginTop: 6, lineHeight: 1.6 }}>{s.detail}</div>
@@ -579,10 +809,16 @@ function BigMatrix({
   docs,
   matrix,
   onCell,
+  cornerOf,
+  titleOf,
 }: {
   docs: ViewDoc[];
   matrix: number[][];
-  onCell?: () => void;
+  onCell?: (r: number, c: number) => void;
+  /** 对照口径角标（左上）：差异 >10pp 时 hot 标红。null=无对照或对角线。 */
+  cornerOf?: (r: number, c: number) => { pct: number; hot: boolean } | null;
+  /** 单元格 tooltip（三口径对照）。 */
+  titleOf?: (r: number, c: number) => string;
 }) {
   const { dark } = useTheme();
   const ink = dark ? "#fff" : C.ink;
@@ -644,11 +880,12 @@ function BigMatrix({
           {matrix[r].map((val, c) => {
             const diag = r === c;
             const isHot = val >= 0.9 && !diag;
+            const corner = diag ? null : (cornerOf?.(r, c) ?? null);
             return (
               <div
                 key={c}
-                onClick={diag ? undefined : onCell}
-                title={diag ? undefined : "查看逐对对比"}
+                onClick={diag ? undefined : () => onCell?.(r, c)}
+                title={diag ? undefined : (titleOf?.(r, c) ?? "查看对齐区段")}
                 role={diag ? undefined : "button"}
                 tabIndex={diag ? undefined : 0}
                 onKeyDown={
@@ -657,7 +894,7 @@ function BigMatrix({
                     : (e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          onCell?.();
+                          onCell?.(r, c);
                         }
                       }
                 }
@@ -709,6 +946,26 @@ function BigMatrix({
                     }}
                   >
                     雷同
+                  </span>
+                )}
+                {corner && (
+                  <span
+                    title="对照口径数值"
+                    style={{
+                      position: "absolute",
+                      top: 4,
+                      left: 6,
+                      fontSize: 9,
+                      fontWeight: 700,
+                      fontFamily: C.mono,
+                      color: corner.hot ? "#fff" : cellFg(val),
+                      background: corner.hot ? C.danger : "rgba(0,0,0,0.12)",
+                      padding: "0px 4px",
+                      borderRadius: 4,
+                      opacity: corner.hot ? 1 : 0.75,
+                    }}
+                  >
+                    {corner.pct}
                   </span>
                 )}
               </div>
