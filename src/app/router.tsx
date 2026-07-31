@@ -1,7 +1,9 @@
 // 路由表：Hash 路由（Tauri 生产环境用自定义协议加载，BrowserRouter 刷新会丢路径）。
 // 结果屏 Matrix/Compare/Export 原生消费 DTO（useCompareSummary / 按需 getPairDetail），适配层已移除。
+import type { ReactNode } from "react";
 import {
   createHashRouter,
+  Navigate,
   Outlet,
   useLocation,
   useNavigate,
@@ -13,7 +15,8 @@ import { Button, Pill } from "../components/primitives";
 import { C } from "../design/tokens";
 import { useTheme } from "../theme";
 import type { Screen } from "../routes";
-import { useCompareSummary } from "../queries/data";
+import { useCompareSummary, useLicenseStatus } from "../queries/data";
+import { Activate } from "../screens/Activate";
 import { typeUi } from "../utils/clusterUi";
 import { WorkspaceList } from "../screens/WorkspaceList";
 import { CompareSetup } from "../screens/CompareSetup";
@@ -21,6 +24,8 @@ import { Running } from "../screens/Running";
 import { JobsList } from "../screens/JobsList";
 import { ClustersScreen } from "../screens/ClustersScreen";
 import { ClusterDetail } from "../screens/ClusterDetail";
+import { PairSegments } from "../screens/PairSegments";
+import { BusinessNumeric } from "../screens/BusinessNumeric";
 import { DocPreview } from "../screens/DocPreview";
 import { Library } from "../screens/Library";
 import { Tools } from "../screens/Tools";
@@ -64,9 +69,22 @@ function Layout() {
       }}
     >
       <Sidebar active={activeKey(pathname)} onNav={(k) => nav(NAV_PATH[k as NavKey] ?? "/")} />
-      <Outlet />
+      <LicenseGate>
+        <Outlet />
+      </LicenseGate>
     </div>
   );
+}
+
+/** 授权守卫：未激活/到期/用尽（active=false）时，除激活页外一律拦到 /activate。
+ *  授权判定在 Rust 层强制，这里仅为 UX 引导（前端不可信）。状态未加载时不拦截，避免闪烁。 */
+function LicenseGate({ children }: { children: ReactNode }) {
+  const { pathname } = useLocation();
+  const { data, isLoading } = useLicenseStatus();
+  if (!isLoading && data && !data.active && pathname !== "/activate") {
+    return <Navigate to="/activate" replace />;
+  }
+  return <>{children}</>;
 }
 
 /** 结果屏壳：各屏原生消费 DTO（useCompareSummary / 按需 getPairDetail），onGo 映射为路由跳转。 */
@@ -80,6 +98,8 @@ function JobView({ view }: { view: "matrix" | "compare" | "export" }) {
       matrix: base,
       compare: `${base}/compare`,
       clusters: `${base}/clusters`,
+      segments: `${base}/segments`,
+      numeric: `${base}/numeric`,
       export: `${base}/export`,
       scan: `${base}/running`,
       tasks: "/starred",
@@ -214,6 +234,7 @@ export const router = createHashRouter([
     errorElement: <RouteError />,
     children: [
       { path: "/", element: <WorkspaceList /> },
+      { path: "/activate", element: <Activate /> },
       { path: "/starred", element: <JobsList title="我的任务" mode="starred" /> },
       { path: "/history", element: <JobsList title="历史记录" mode="all" /> },
       { path: "/library", element: <Library /> },
@@ -225,6 +246,8 @@ export const router = createHashRouter([
       { path: "/workspace/:wsId/job/:jobId", element: <JobView view="matrix" /> },
       { path: "/workspace/:wsId/job/:jobId/compare", element: <JobView view="compare" /> },
       { path: "/workspace/:wsId/job/:jobId/clusters", element: <ClustersScreen /> },
+      { path: "/workspace/:wsId/job/:jobId/segments", element: <PairSegments /> },
+      { path: "/workspace/:wsId/job/:jobId/numeric", element: <BusinessNumeric /> },
       { path: "/workspace/:wsId/job/:jobId/cluster/:cid", element: <ClusterDetail /> },
       { path: "/workspace/:wsId/job/:jobId/export", element: <JobView view="export" /> },
       { path: "*", element: <WorkspaceList /> },

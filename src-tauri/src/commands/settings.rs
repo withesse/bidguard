@@ -54,6 +54,56 @@ pub struct AppInfo {
     /// 可选 OCR 档位清单。
     pub ocr_models: Vec<OcrModelInfo>,
     pub default_ocr_model: String,
+    /// 随包概率校准的只读台账（W6-4，M7）：设置页展示「哪一版校准、拿什么语料测的」。
+    /// α/β 与阈值【不开放运行时调整】——改 α 即改承诺语义，须走版本发布（方案 §8 配置项）。
+    pub calibration: CalibrationInfo,
+}
+
+/// 校准只读台账（设置页展示用）。available=false ⇒ 随包文件缺失/未过审查，本机比对不出三带。
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationInfo {
+    pub available: bool,
+    pub version: String,
+    /// 校准来源标签：experimental-synthetic = 合成语料拟合（实验性，真实判例回测前不摘标签）。
+    pub kind: String,
+    /// 校准器类型：platt | isotonic。
+    pub calibrator: String,
+    /// 分流模式：three-band | review-all。
+    pub routing: String,
+    pub alpha: f32,
+    pub beta: f32,
+    pub t_low: f32,
+    pub t_high: f32,
+    /// 训练语料 hash（前 8 位即可核对语料版本）。
+    pub corpus_hash: String,
+    /// 分流说明（§1.5-1 文案唯一来源，前端不得自造）。
+    pub note: String,
+}
+
+impl CalibrationInfo {
+    fn current() -> Self {
+        match crate::engine::calibrate::active_calibration() {
+            Some(m) => CalibrationInfo {
+                available: true,
+                version: m.version.clone(),
+                kind: m.calibration_kind.clone(),
+                calibrator: m.calibrator.kind_str().to_string(),
+                routing: m.routing.as_str().to_string(),
+                alpha: m.alpha,
+                beta: m.beta,
+                t_low: m.t_low,
+                t_high: m.t_high,
+                corpus_hash: m.corpus_hash.clone(),
+                note: m.routing_note(),
+            },
+            None => CalibrationInfo {
+                note: "随包校准文件不可用：本次安装不产出置信度与复核路由三带，条款按既有风险等级复核。"
+                    .to_string(),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 #[tauri::command]
@@ -77,6 +127,7 @@ pub async fn get_app_info() -> AppResult<AppInfo> {
             })
             .collect(),
         default_ocr_model: crate::engine::ocr::DEFAULT_OCR_MODEL.to_string(),
+        calibration: CalibrationInfo::current(),
     })
 }
 

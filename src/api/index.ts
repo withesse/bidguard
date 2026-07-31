@@ -4,13 +4,18 @@ import type {
   AnnotationDto,
   AppInfoDto,
   DiagnosticItem,
+  LicenseStatusDto,
   ModelStatusDto,
   StorageInfoDto,
+  AlignedSegmentDto,
   ClusterDetailDto,
   ClusterFilter,
+  ClusterSegmentRefDto,
   ClusterSummaryDto,
   CompareRequest,
   CompareSummaryDto,
+  SegmentDetailDto,
+  DocRole,
   DocumentDto,
   DocumentPreviewDto,
   JobDto,
@@ -35,8 +40,9 @@ export const deleteWorkspace = (workspaceId: string) =>
   call<void>("delete_workspace", { workspaceId });
 
 // —— 文档 ——
-export const importDocuments = (workspaceId: string, paths: string[]) =>
-  call<JobDto>("import_documents", { workspaceId, paths });
+/** docRole 缺省按投标文件（bid）导入；招标文件/补遗答疑传 tender / tender_supplement。 */
+export const importDocuments = (workspaceId: string, paths: string[], docRole?: DocRole) =>
+  call<JobDto>("import_documents", { workspaceId, paths, docRole: docRole ?? null });
 export const listDocuments = (workspaceId: string) =>
   call<DocumentDto[]>("list_documents", { workspaceId });
 export const getDocumentPreview = (documentId: string) =>
@@ -107,6 +113,11 @@ export const downloadEmbeddingModel = (modelKey: string) =>
   call<void>("download_embedding_model", { modelKey });
 export const clearEmbeddingModel = (modelKey: string) =>
   call<number>("clear_embedding_model", { modelKey });
+/** 按需下载某复核模型（cross-encoder，W6-2）。返回本地占用字节数。 */
+export const downloadRerankerModel = (modelKey: string) =>
+  call<number>("download_reranker_model", { modelKey });
+export const clearRerankerModel = (modelKey: string) =>
+  call<number>("clear_reranker_model", { modelKey });
 /** 按需下载某 OCR 高精档（medium）。返回写入字节数。 */
 export const downloadOcrModel = (modelKey: string) =>
   call<number>("download_ocr_model", { modelKey });
@@ -116,6 +127,13 @@ export const getStorageInfo = () => call<StorageInfoDto>("get_storage_info");
 export const clearEmbeddingCache = () => call<number>("clear_embedding_cache");
 export const vacuumDb = () => call<void>("vacuum_db");
 export const runDiagnostics = () => call<DiagnosticItem[]>("run_diagnostics");
+
+// —— 授权 / 激活 ——
+export const getLicenseStatus = () => call<LicenseStatusDto>("get_license_status");
+export const getMachineCode = () => call<string>("get_machine_code");
+/** input：armored 许可文本（粘贴）或本机 .lic 文件路径。 */
+export const importLicense = (input: string) =>
+  call<LicenseStatusDto>("import_license", { input });
 
 // —— 设置 / 模板 / 应用信息 ——
 export const getAppSettings = () => call<Record<string, unknown> | null>("get_app_settings");
@@ -166,3 +184,18 @@ export const setClusterReviewStatus = (clusterId: string, status: string) =>
   call<void>("set_cluster_review_status", { clusterId, status });
 export const getPairDetail = (jobId: string, documentA: string, documentB: string) =>
   call<PairMatchDto[]>("get_pair_detail", { jobId, documentA, documentB });
+
+// —— 对齐区段（W4-5，M5b）——
+/** 某任务的对齐区段列表；documentA/B 可选（方向无关过滤）。旧任务返回空数组。 */
+export const listAlignedSegments = (jobId: string, documentA?: string, documentB?: string) =>
+  call<AlignedSegmentDto[]>("list_aligned_segments", {
+    jobId,
+    documentA: documentA ?? null,
+    documentB: documentB ?? null,
+  });
+/** 区段详情（双栏高亮 + 反向互链所需数据）。 */
+export const getSegmentDetail = (segmentId: string) =>
+  call<SegmentDetailDto>("get_segment_detail", { segmentId });
+/** 某聚类反查关联的对齐区段（ClusterDetail「所在区段」Pill）。旧任务返回空数组。 */
+export const getClusterSegments = (clusterId: string) =>
+  call<ClusterSegmentRefDto[]>("get_cluster_segments", { clusterId });

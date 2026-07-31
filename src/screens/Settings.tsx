@@ -7,9 +7,16 @@ import { Button, Toggle, SegControl } from "../components/primitives";
 import { useTheme, type FontScale, type Highlight } from "../theme";
 import { useToast } from "../components/Toast";
 import { errMsg } from "../api/client";
-import { useAppInfo, useAppSettings, useSaveAppSettings } from "../queries/data";
+import {
+  useAppInfo,
+  useAppSettings,
+  useLicenseStatus,
+  useSaveAppSettings,
+} from "../queries/data";
 import { relaunchApp, runUpdate, type UpdateState } from "../utils/updater";
 import { type Scope } from "../prefs";
+import { useNavigate } from "react-router-dom";
+import type { LicenseStatusDto } from "../api/types";
 
 const FONT_SCALES: FontScale[] = ["compact", "regular", "comfy", "spacious"];
 const SCOPES: Scope[] = ["full", "tech", "business"];
@@ -40,6 +47,7 @@ const BUILTIN_PARSER = {
   detectTable: true,
   ocrDocxImages: true,
   ocrModel: "v6-small",
+  pdfCrossCheck: true,
 };
 
 /** 与后端 config::SecurityDefaults 内置值一致的前端镜像。 */
@@ -61,6 +69,8 @@ export function Settings() {
   const { data: cfgRaw } = useAppSettings();
   const saveCfg = useSaveAppSettings();
   const { data: appInfo } = useAppInfo();
+  const { data: license } = useLicenseStatus();
+  const nav = useNavigate();
   const embeddingModels = appInfo?.embeddingModels ?? [];
   const cmp = useMemo(() => {
     const patch =
@@ -156,6 +166,38 @@ export function Settings() {
       <Topbar title="设置" sub="检测偏好与外观" />
       <div style={{ flex: 1, overflow: "auto", padding: "28px 48px 40px" }}>
         <div style={{ maxWidth: 720, margin: "0 auto", display: "flex", flexDirection: "column", gap: 20 }}>
+          {/* 授权状态 */}
+          <Card title="授权" cardBg={cardBg} border={border} mute={mute}>
+            <Row
+              label="授权状态"
+              sub={licenseSub(license)}
+              ink={ink}
+              mute={mute}
+              last
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {license && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: licenseUi(license.state).fg,
+                      background: licenseUi(license.state).bg,
+                      padding: "3px 9px",
+                      borderRadius: 999,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {licenseUi(license.state).label}
+                  </span>
+                )}
+                <Button kind="secondary" size="sm" onClick={() => nav("/activate")}>
+                  管理授权
+                </Button>
+              </div>
+            </Row>
+          </Card>
+
           {/* 检测偏好 */}
           <Card title="检测偏好（新任务默认值）" cardBg={cardBg} border={border} mute={mute}>
             <Row label="默认比对范围" sub="新任务默认比对的标段" ink={ink} mute={mute}>
@@ -286,6 +328,17 @@ export function Settings() {
                 onChange={() => changeParser({ ocrDocxImages: !parser.ocrDocxImages })}
               />
             </Row>
+            <Row
+              label="PDF 渲染交叉验证"
+              sub="抽样页渲染成图再 OCR，比对文字层是否被字体重映射/图片化正文篡改；命中改用 OCR 文本。每份文字版 PDF 约 +5–10 秒"
+              ink={ink}
+              mute={mute}
+            >
+              <Toggle
+                on={parser.pdfCrossCheck as boolean}
+                onChange={() => changeParser({ pdfCrossCheck: !parser.pdfCrossCheck })}
+              />
+            </Row>
             {(appInfo?.ocrModels ?? []).length > 0 && (
               <Row
                 label="扫描件 OCR 档位"
@@ -381,6 +434,40 @@ export function Settings() {
             </Row>
           </Card>
 
+          {/* 概率校准与复核路由（W6-4）：只读台账。α/β 与阈值随包固化，不开放运行时调整
+              ——改 α 即改「带内错误率」的承诺语义，须走版本发布。 */}
+          <Card title="概率校准与复核路由" cardBg={cardBg} border={border} mute={mute}>
+            <Row
+              label="校准版本"
+              sub={
+                appInfo?.calibration?.available
+                  ? `${appInfo.calibration.kind === "experimental-synthetic" ? "实验性校准（合成语料）" : appInfo.calibration.kind} · ${appInfo.calibration.calibrator} · 语料 ${appInfo.calibration.corpusHash.slice(0, 8)}`
+                  : "随包校准文件不可用"
+              }
+              ink={ink}
+              mute={mute}
+            >
+              <span style={{ fontSize: 11.5, color: mute }}>
+                {appInfo?.calibration?.available ? appInfo.calibration.version : "—"}
+              </span>
+            </Row>
+            <Row
+              label="分流模式"
+              sub={appInfo?.calibration?.note ?? "读取中…"}
+              ink={ink}
+              mute={mute}
+              last
+            >
+              <span style={{ fontSize: 11.5, color: mute }}>
+                {appInfo?.calibration?.routing === "three-band"
+                  ? `三带 · α=${Math.round((appInfo.calibration.alpha ?? 0) * 100)}% β=${Math.round((appInfo.calibration.beta ?? 0) * 100)}%`
+                  : appInfo?.calibration?.routing === "review-all"
+                    ? "全部需人工复核"
+                    : "—"}
+              </span>
+            </Row>
+          </Card>
+
           {/* 关于与更新 */}
           <Card title="关于" cardBg={cardBg} border={border} mute={mute}>
             <Row label="检查更新" sub="从 GitHub Releases 获取签名更新包" ink={ink} mute={mute} last>
@@ -408,6 +495,46 @@ export function Settings() {
       </div>
     </div>
   );
+}
+
+function licenseUi(state: string): { label: string; fg: string; bg: string } {
+  switch (state) {
+    case "licensed":
+      return { label: "已授权", fg: C.ok, bg: C.okSoft };
+    case "trial":
+      return { label: "试用中", fg: C.warn, bg: C.warnSoft };
+    case "grace":
+      return { label: "宽限期", fg: C.warn, bg: C.warnSoft };
+    case "exhausted":
+      return { label: "次数用尽", fg: C.danger, bg: C.dangerSoft };
+    case "expired":
+      return { label: "已到期", fg: C.danger, bg: C.dangerSoft };
+    case "machineMismatch":
+      return { label: "未绑定本机", fg: C.danger, bg: C.dangerSoft };
+    default:
+      return { label: "未激活", fg: C.danger, bg: C.dangerSoft };
+  }
+}
+
+function licenseSub(st: LicenseStatusDto | undefined): string {
+  if (!st) return "读取中…";
+  const days = (iso: string | null) =>
+    iso ? Math.max(0, Math.ceil((new Date(iso).getTime() - Date.now()) / 86_400_000)) : null;
+  if (st.state === "trial") {
+    const d = days(st.trialExpiresAt);
+    const parts: string[] = [];
+    if (st.remainingUses != null) parts.push(`剩余 ${st.remainingUses} 次`);
+    if (d != null) parts.push(`${d} 天后到期`);
+    return "免费试用 · " + parts.join(" · ");
+  }
+  if (st.state === "licensed" || st.state === "grace") {
+    const parts: string[] = [];
+    if (st.licenseeName) parts.push(st.licenseeName);
+    parts.push(st.remainingUses != null ? `剩余 ${st.remainingUses} 次` : "不限次数");
+    if (st.expiresAt) parts.push(`${days(st.expiresAt)} 天后到期`);
+    return parts.join(" · ");
+  }
+  return st.message ?? "请激活后使用";
 }
 
 function Card({
