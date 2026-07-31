@@ -28,6 +28,7 @@ import {
 } from "../queries/data";
 import type { AnnotationDto, OcrLine } from "../api/types";
 import { chunkTypeUi, CHUNK_TYPE_ORDER, SENTENCE_TINTS, splitSentences } from "../utils/chunkType";
+import { evasionEvidenceKinds, isEvasionConfirmed } from "../utils/evasion";
 
 const METHOD_CN: Record<string, string> = {
   docx: "Word 文档",
@@ -247,6 +248,22 @@ export function DocPreview() {
           }}
         >
           ⚠️ 内容不完整：{doc.truncationNotice}
+        </div>
+      )}
+      {/* 规避特征告警条（§1.5：仅 confirmed 挂条；suspect 不挂——避免弱信号误导）。 */}
+      {doc?.evasionSummary && isEvasionConfirmed(doc.evasionSummary) && (
+        <div
+          role="alert"
+          style={{
+            padding: "8px 32px",
+            fontSize: 12.5,
+            color: "#9A3838",
+            background: "rgba(181,69,69,0.12)",
+            borderBottom: `1px solid ${border}`,
+          }}
+        >
+          ⚠️ 检测到疑似规避特征，请人工复核：{evasionEvidenceKinds(doc.evasionSummary).join("、") || "见比对报告"}
+          。规避痕迹可被清除，未命中不构成清白证明；请对照原文（智能分块可定位到具体段落 / PDF 页码）人工判断。
         </div>
       )}
       {error != null && (

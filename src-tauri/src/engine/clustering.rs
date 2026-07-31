@@ -10,6 +10,7 @@ pub struct ScoredEdge {
     pub parts: ScoreParts,
 }
 
+#[derive(Clone)]
 pub struct RawCluster {
     pub members: Vec<u32>,
     /// chunk 下标 → 角色：primary | duplicate_candidate
@@ -243,6 +244,8 @@ mod tests {
             minhash: vec![],
             entities: vec![],
             tfidf: Default::default(),
+            tender_coverage: 0.0,
+            boiler_fraction: 0.0,
         }
     }
 

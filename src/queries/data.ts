@@ -15,6 +15,7 @@ import { toast } from "../components/Toast";
 import type {
   ClusterFilter,
   CompareRequest,
+  DocRole,
   JobDto,
   NewTemplateDto,
   TemplateDto,
@@ -26,6 +27,19 @@ export function useWorkspaces() {
 
 export function useAppInfo() {
   return useQuery({ queryKey: ["appInfo"], queryFn: api.getAppInfo, staleTime: Infinity });
+}
+
+// —— 授权 / 激活 ——
+export function useLicenseStatus() {
+  return useQuery({ queryKey: ["license"], queryFn: api.getLicenseStatus, staleTime: 5_000 });
+}
+
+export function useImportLicense() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: string) => api.importLicense(input),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["license"] }),
+  });
 }
 
 // —— 工具：模型 / 存储 / 自检 ——
@@ -49,6 +63,20 @@ export function useClearModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: api.clearEmbeddingModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useDownloadRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.downloadRerankerModel,
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
+  });
+}
+export function useClearRerankModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.clearRerankerModel,
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["modelStatus"] }),
   });
 }
@@ -229,7 +257,9 @@ export function useDeleteWorkspace() {
 export function useImportDocuments(workspaceId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (paths: string[]) => api.importDocuments(workspaceId, paths),
+    // docRole 缺省 bid（投标）；招标文件/补遗答疑由招标组导入按钮传入
+    mutationFn: ({ paths, docRole }: { paths: string[]; docRole?: DocRole }) =>
+      api.importDocuments(workspaceId, paths, docRole),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["documents", workspaceId] });
       void qc.invalidateQueries({ queryKey: ["jobs"] });
@@ -249,7 +279,11 @@ export function useStartCompare(workspaceId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (request: CompareRequest) => api.startCompare(workspaceId, request),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: ["jobs"] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["jobs"] });
+      // 起了一次比对即消费一次次数，刷新授权状态卡的剩余次数
+      void qc.invalidateQueries({ queryKey: ["license"] });
+    },
   });
 }
 
@@ -373,6 +407,38 @@ export function useCompareSummary(jobId: string | undefined) {
     queryKey: ["compareSummary", jobId],
     queryFn: () => api.getCompareSummary(jobId!),
     enabled: !!jobId,
+    staleTime: 60_000,
+  });
+}
+
+// —— 对齐区段（W4-5，M5b）：只读证据层 ——
+
+/** 某任务的对齐区段列表（可选按文档对过滤，方向无关）。旧任务返回空数组。 */
+export function useAlignedSegments(jobId: string | undefined, docA?: string, docB?: string) {
+  return useQuery({
+    queryKey: ["alignedSegments", jobId, docA ?? null, docB ?? null],
+    queryFn: () => api.listAlignedSegments(jobId!, docA, docB),
+    enabled: !!jobId,
+    staleTime: 60_000,
+  });
+}
+
+/** 区段详情（选中区段时懒加载）。 */
+export function useSegmentDetail(segmentId: string | undefined) {
+  return useQuery({
+    queryKey: ["segmentDetail", segmentId],
+    queryFn: () => api.getSegmentDetail(segmentId!),
+    enabled: !!segmentId,
+    staleTime: 60_000,
+  });
+}
+
+/** 某聚类反查关联区段（ClusterDetail「所在区段」Pill）。旧任务返回空数组。 */
+export function useClusterSegments(clusterId: string | undefined) {
+  return useQuery({
+    queryKey: ["clusterSegments", clusterId],
+    queryFn: () => api.getClusterSegments(clusterId!),
+    enabled: !!clusterId,
     staleTime: 60_000,
   });
 }

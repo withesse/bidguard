@@ -1,0 +1,49 @@
+{
+  "alpha": 0.05,
+  "beta": 0.05,
+  "calibrationKind": "experimental-synthetic",
+  "fit": {
+    "conformalCrossed": true,
+    "conformalHighSufficient": true,
+    "conformalLowSufficient": true,
+    "conformalSamples": 350,
+    "fittedAt": "2026-07-27",
+    "gitRev": "1b878d5",
+    "holdoutEce": 0.004619,
+    "holdoutEceReduction": 0.978973,
+    "holdoutEceUncalibrated": 0.21969,
+    "holdoutFlagFpr": 0.0,
+    "holdoutFlagShare": 0.768571,
+    "holdoutPassFnr": 0.0,
+    "holdoutPassShare": 0.197143,
+    "holdoutReviewShare": 0.034286,
+    "holdoutSamples": 350,
+    "operatingFlagShare": 1.0,
+    "operatingPassShare": 0.0,
+    "operatingReviewShare": 0.0,
+    "operatingSamples": 238,
+    "pairsHash": "ae38744f8c8aa29677c6fa77118f998ae956f69123a1795d9e6042654051214a",
+    "positiveLabels": [
+      "same",
+      "minor_change",
+      "changed",
+      "rewrite"
+    ],
+    "routing": "review-all",
+    "routingReason": "运行域内单带占比 100.0% ≥ 95%：相似度分在簇的分数区间内无分辨力（本语料缺「独立编制但表面相似」的难负样本，独立文档集里同样存在 avg=1.000 的共享范本簇），据此分流会把几乎所有条款推进同一条带 → 本版不上线分流，全部按需人工复核",
+    "samples": 1750,
+    "trainSamples": 1050
+  },
+  "note": "实验性校准（合成语料）：Platt 参数与三带阈值由 fixtures/corpus/pairs.jsonl 拟合。α/β 是【在合成校准语料上测得】的带内错误率目标，不是对真实标书的承诺；低优先级抽查带只做排序与折叠，不隐藏任何条款。routing=review-all 时三带分流不生效（见 fit.routingReason）：全部条款按需人工复核。重新生成：cargo run --example corpusgen --features dev-tools -- fit-calib",
+  "platt": {
+    "a": 25.234619,
+    "b": -6.498768
+  },
+  "routing": "review-all",
+  "thresholds": {
+    "tHigh": 0.987017,
+    "tLow": 0.055687
+  },
+  "type": "platt",
+  "version": "m7-calib-ae38744f"
+}

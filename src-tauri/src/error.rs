@@ -15,6 +15,13 @@ pub enum AppErrorCode {
     CompareFailed,
     ExportFailed,
     NotFound,
+    // 授权 / 激活（license 模块，全部在 Rust 层强制，前端仅做 UX）
+    LicenseRequired,       // 未激活 / 试用未开始或已结束
+    LicenseExpired,        // 授权到期（超宽限）
+    LicenseExhausted,      // 使用次数用尽
+    LicenseMachineMismatch,// 许可未绑定到本机
+    LicenseInvalid,        // 验签失败 / 许可格式错误
+    LicenseClockTamper,    // 检测到系统时钟回拨
     Unknown,
 }
 

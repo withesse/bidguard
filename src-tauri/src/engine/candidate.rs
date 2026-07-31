@@ -192,7 +192,7 @@ const LSH_BITS: usize = 16; // 每表签名位数
 const LSH_TABLES: usize = 6; // 表数（多表提升召回，减少桶边界漏配）
 
 #[inline]
-fn splitmix64(mut z: u64) -> u64 {
+pub(crate) fn splitmix64(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);

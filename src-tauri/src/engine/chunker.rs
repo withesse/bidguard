@@ -5,7 +5,7 @@ use crate::db::repo::chunk_repo::NewChunk;
 use crate::engine::features;
 use crate::engine::normalize::{self, NormalizeOptions};
 use crate::engine::parse::Block;
-use crate::engine::segment::{self, Section};
+use crate::engine::segment;
 use crate::engine::similarity::{cosine, tokenize_lang};
 use jieba_rs::Jieba;
 
@@ -360,8 +360,16 @@ fn make(
     order_index: i64,
 ) -> NewChunk {
     let page = if ctx.opts.preserve_page_number { page } else { None };
-    let normalized = normalize::normalize(text, &ctx.opts.normalize);
-    let tokens = tokenize_lang(ctx.jieba, text, &ctx.opts.language);
+    // 带统计归一化（W2 入口对抗层）：normalized_text/normalized_hash 与全部特征
+    // （tokens/entities/ngrams/minhash）基于清洗后文本，恢复被隐形码点/同形字破坏的
+    // 一致性；块级统计随 NewChunk 落 chunk_features.extra_json（定位「扰动集中在
+    // 哪些块」），text 保留原始字节供取证下钻。分两步取中间产物：分词吃 sanitize
+    // 产物而非原文（词内零宽/同形注入会拆碎 token，击穿 lexical 通道），也非归一
+    // 终态（cn_numbers/去标点改变词面，偏离既有分词口径）；模板侧分词同口径，见
+    // import_service::run_import。
+    let (sanitized, evasion) = normalize::sanitize_with_stats(text);
+    let normalized = normalize::normalize_sanitized(&sanitized, &ctx.opts.normalize);
+    let tokens = tokenize_lang(ctx.jieba, &sanitized, &ctx.opts.language);
     // 命中余弦最高的样板（≥ 阈值）：标记 is_template 并记录其 id 供命中统计。
     let mut template_id: Option<String> = None;
     let mut best = -1.0f32;
@@ -373,13 +381,15 @@ fn make(
         }
     }
     let is_template = template_id.is_some();
-    let section_kind = match segment::classify(text) {
-        Section::Tech => "tech",
-        Section::Business => "business",
-        Section::Other => "other",
-    };
     let entities = features::extract_entities(&normalized);
     let ngrams = features::char_ngrams(&normalized);
+    // 五区分类（§5 W3-5）：标题路径优先于正文关键词；表格行且含金额实体 → price（数值层证据）。
+    // section_kind 落 chunks 表（TEXT 列直接容纳 legal/price 新值，无迁移）；旧库由 corpus 比对期重算兼容。
+    let titles: Vec<String> = ctx.stack.iter().map(|(_, t)| t.clone()).collect();
+    let has_amount = entities.iter().any(|e| e.kind == "amount");
+    let is_table_row = chunk_type == "table_row";
+    let section_kind =
+        segment::section_kind_str(segment::classify_zone(&titles, text, is_table_row, has_amount));
     NewChunk {
         chunk_type: chunk_type.to_string(),
         chunk_level: chunk_level.to_string(),
@@ -398,6 +408,7 @@ fn make(
         token_json: serde_json::to_string(&tokens).ok(),
         entity_json: serde_json::to_string(&entities).ok(),
         minhash_blob: Some(features::minhash_to_blob(&features::minhash(&ngrams))),
+        evasion: if evasion.is_clean() { None } else { Some(evasion) },
     }
 }
 
@@ -641,6 +652,111 @@ mod tests {
             .unwrap();
         assert!(!normal.is_template);
         assert!(normal.template_id.is_none());
+    }
+
+    /// V16 官方表单样板必须扛得住「投标人填空」：真实标书里的投标函不是空白范本，
+    /// 而是填入了单位名/金额/工期/质量等级的成品。若只有逐字空白范本才命中，这条修复
+    /// 在真实数据上就是空转——多份标书照抄的同一份投标函仍会被当成雷同证据。
+    #[test]
+    fn official_bid_letter_template_still_matches_after_bidder_fills_blanks() {
+        let jieba = Jieba::new();
+        let seeds = crate::db::migrations::official_seed_texts();
+        let (_, bidletter) =
+            seeds.iter().find(|(id, _)| id == "t-ndrc-bidletter").expect("V16 应含投标函样板");
+        let opts = ChunkerOptions {
+            templates: vec![("t-ndrc-bidletter".to_string(), tokenize(&jieba, bidletter))],
+            ..Default::default()
+        };
+        // 同一份官方投标函，由投标人填入具体信息后的成品（占位符替换为真实值）
+        let filled = "1．我方已仔细研究了 滨海新区市政道路改造工程 标段施工招标文件的全部内容，\
+愿意以人民币（大写）叁仟贰佰壹拾万元整 元（¥32100000.00）的投标总报价，工期 240 日历天，\
+按合同约定实施和完成承包工程，修补工程中的任何缺陷，工程质量达到 合格 。\
+2．我方承诺在投标有效期内不修改、撤销投标文件。\
+3．随同本投标函提交投标保证金一份，金额为人民币（大写）陆拾万元整 元（¥600000.00）。\
+4．如我方中标： （1）我方承诺在收到中标通知书后，在中标通知书规定的期限内与你方签订合同。\
+（2）随同本投标函递交的投标函附录属于合同文件的组成部分。\
+（3）我方承诺按照招标文件规定向你方递交履约担保。\
+（4）我方承诺在合同约定的期限内完成并移交全部合同工程。\
+5．我方在此声明，所递交的投标文件及有关资料内容完整、真实和准确，\
+且不存在第二章“投标人须知”第1.4.3项规定的任何一种情形。";
+        let text = format!("{filled}\n\n本工程拟采用装配式施工与BIM协同管理，自主研发的进度纠偏算法可将工期压缩12%。");
+        let chunks = chunk(&jieba, &blocks_md(&text), &opts);
+        let letter = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("投标总报价"))
+            .expect("应有投标函分块");
+        assert!(
+            letter.is_template,
+            "填空后的官方投标函仍应命中样板（否则真实标书里的照抄表单不会被抑制）"
+        );
+        assert_eq!(letter.template_id.as_deref(), Some("t-ndrc-bidletter"));
+        // 反向：投标人自撰的技术内容不得被样板压掉（压掉=漏报）
+        let own = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("BIM"))
+            .expect("应有自撰内容分块");
+        assert!(!own.is_template, "投标人自撰技术内容不得被标为样板");
+    }
+
+    #[test]
+    fn tokens_come_from_sanitized_text() {
+        // W2-1「全部特征基于清洗后文本」：token_json 也是特征列。词内零宽拆词
+        // （微服\u{200B}务）与同形字替换（Pагe）不得拆碎/变形 token——否则
+        // normalized_hash/MinHash 恢复了命中，权重最高的 lexical 通道（tfidf 余弦、
+        // 共有词交集、模板余弦）仍被击穿
+        let jieba = Jieba::new();
+        let clean = "本项目采用分层解耦的微服务总体架构设计方案（Page 编号）。";
+        let dirty = "本项目采用分层解耦的微服\u{200B}务总体架构设计方案\
+                     （P\u{0430}\u{0433}\u{0435} 编号）。";
+        let a = chunk(&jieba, &blocks_md(clean), &ChunkerOptions::default());
+        let b = chunk(&jieba, &blocks_md(dirty), &ChunkerOptions::default());
+        let pa = a.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        let pb = b.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        assert_eq!(pa.token_json, pb.token_json, "扰动块 tokens 应与干净文本一致");
+        assert!(pb.token_json.as_ref().unwrap().contains("Page"), "同形字应折回拉丁词面");
+        // 回归护栏：直接对原文分词（修复前行为）产出的词面与清洗后不同——
+        // 同形词以西里尔原貌入 token，lexical 通道两侧词面失配
+        let raw = serde_json::to_string(&tokenize(&jieba, dirty)).unwrap();
+        assert!(!raw.contains("Page"), "原文分词不该有拉丁词面（否则本测试失去意义）");
+    }
+
+    #[test]
+    fn template_match_survives_invisible_injection() {
+        // 样板剔除的对抗面：雷同段落词内插零宽后，分词吃清洗产物，模板余弦不应失配
+        let jieba = Jieba::new();
+        let tpl = "我方承诺提供7×24小时技术支持服务，质保期内免费维护，确保系统稳定运行";
+        let opts = ChunkerOptions {
+            templates: vec![("tpl-1".to_string(), tokenize(&jieba, tpl))],
+            ..Default::default()
+        };
+        let dirty = "我方承诺提供7×24小时技术支\u{200B}持服务，质\u{200B}保期内免费维\u{200B}护，确保系统稳定运行。";
+        let chunks = chunk(&jieba, &blocks_md(dirty), &opts);
+        let para = chunks
+            .iter()
+            .find(|c| c.chunk_level == "paragraph" && c.text.contains("7×24"))
+            .unwrap();
+        assert!(para.is_template, "零宽注入不应击穿模板匹配");
+        assert_eq!(para.template_id.as_deref(), Some("tpl-1"));
+    }
+
+    #[test]
+    fn evasion_stats_flow_into_chunks() {
+        let jieba = Jieba::new();
+        let clean = "本项目采用分层解耦的微服务总体架构设计方案。";
+        let dirty = "本项目采用分层\u{200B}解耦的微服务总体架构\u{200B}设计方案。";
+        let a = chunk(&jieba, &blocks_md(clean), &ChunkerOptions::default());
+        let b = chunk(&jieba, &blocks_md(dirty), &ChunkerOptions::default());
+        let pa = a.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        let pb = b.iter().find(|c| c.chunk_level == "paragraph").unwrap();
+        // 隐形字符不破坏 normalized_hash（词面通道恢复命中），原文保留供取证
+        assert_eq!(pa.normalized_hash, pb.normalized_hash);
+        assert_ne!(pa.exact_hash, pb.exact_hash, "exact_hash 基于原始字节，应不同");
+        assert!(pb.text.contains('\u{200B}'), "chunks.text 保留原始字节");
+        // 统计只在有发现的块上携带
+        assert!(pa.evasion.is_none());
+        let ev = pb.evasion.as_ref().unwrap();
+        assert_eq!(ev.zero_width, 2);
+        assert_eq!(ev.stripped_total(), 2);
     }
 
     #[test]
