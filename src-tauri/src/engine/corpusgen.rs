@@ -1309,24 +1309,28 @@ where
 
 /// 外部真值语料的连续分打分：复用生产打分口径（regr_build_chunk → 全语料 IDF →
 /// score_pair 取连续 final_score），返回 (final_score, 归一化真值 label) 序列，供
-/// extcalib 出 P-R/ROC/校准指标。词面档传 `|_, _| None`；语义档传返回余弦的闭包。
+/// extcalib 出 P-R/ROC/校准指标。
+///
+/// `semantic`：按 pairs 下标对齐的语义余弦。传 None 走词面档（W_LEXICAL）；传 Some 走
+/// 融合档（W_SEMANTIC，语义维占 0.35）。余弦由调用方批量预算（见测试侧 semantic_cosines），
+/// 而非逐对闭包——嵌入批处理远快于逐对推理，也避免模型可变借用穿过建块循环。
 ///
 /// 注意：外部为裸句对，无 section_path / rel_pos 上下文 → structure 维恒 None、order 维恒
 /// 1.0。对 ROC/PR/Spearman 等排序指标无碍（常量项不改排序），但会系统性抬高绝对分，故
 /// 阈值处 P/R/F1 与 ECE 带此偏移，解读时须知（这也正是「裸句对 vs 章节块」的口径差异）。
-pub fn score_external_pairs<F>(
+pub fn score_external_pairs(
     jieba: &Jieba,
     pairs: &[crate::engine::extcalib::ExternalPair],
-    mut sem_provider: F,
-) -> Vec<(f32, f32)>
-where
-    F: FnMut(&str, &str) -> Option<f32>,
-{
+    semantic: Option<&[f32]>,
+) -> Vec<(f32, f32)> {
+    if let Some(s) = semantic {
+        assert_eq!(s.len(), pairs.len(), "语义余弦数量须与句对数一致");
+    }
     // 先建齐全部句对两侧分块，再用【全语料 IDF】填 TF-IDF——与 pair_stats 同口径，
     // 避免逐对局部 IDF 让 lexical 与 char_ngram 退化为近似同一信号。
     let mut built: Vec<(CmpChunk, CmpChunk, Option<f32>, f32)> = Vec::with_capacity(pairs.len());
     for (i, r) in pairs.iter().enumerate() {
-        let sem = sem_provider(&r.text_a, &r.text_b);
+        let sem = semantic.map(|s| s[i]);
         let a = regr_build_chunk(jieba, format!("ext{i}-a"), 0, 0.0, &r.text_a, Vec::new());
         let b = regr_build_chunk(jieba, format!("ext{i}-b"), 1, 0.0, &r.text_b, Vec::new());
         built.push((a, b, sem, r.label));
@@ -2006,17 +2010,37 @@ mod tests {
         corpus_dir().join("external")
     }
 
+    /// 批量算语义余弦（按 pairs 下标对齐）。模型不可用时返回 None → 调用方只跑词面档。
+    /// 离线：allow_download=false，需 BIDGUARD_EMBED_DIR 或 ~/.cache/bidguard/embeddings/<id>/。
+    fn semantic_cosines(pairs: &[crate::engine::extcalib::ExternalPair]) -> Option<Vec<f32>> {
+        use crate::engine::embed;
+        let spec = embed::resolve("bge-zh");
+        let mut slot: embed::LoadedEmbedder = None;
+        let model = embed::ensure(&mut slot, spec, false)?;
+        // 两侧文本摊平后按 EMBED_BATCH 分批，一次推理多条（远快于逐对）。
+        let flat: Vec<String> =
+            pairs.iter().flat_map(|p| [p.text_a.clone(), p.text_b.clone()]).collect();
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(flat.len());
+        for chunk in flat.chunks(128) {
+            vecs.extend(embed::embed_batch(model, chunk, spec.id)?);
+        }
+        if vecs.len() != flat.len() {
+            return None;
+        }
+        Some(vecs.chunks(2).map(|c| embed::cosine(&c[0], &c[1])).collect())
+    }
+
     fn render_extcalib(ms: &[crate::engine::extcalib::ExtCalibMetrics]) -> String {
-        let mut s = String::from("外部真值相似度校准（词面 score_pair 档；@0.7=运行阈值）\n");
+        let mut s = String::from("外部真值相似度校准（@0.7=运行阈值）\n");
         s.push_str(&format!(
-            "{:<12} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
-            "source", "n", "pos", "neg", "ROC", "PR", "P@.7", "R@.7", "F1@.7", "bestF1", "bestThr",
-            "ECE", "Spearman"
+            "{:<12} {:<8} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8}\n",
+            "source", "scorer", "n", "pos", "neg", "ROC", "PR", "P@.7", "R@.7", "F1@.7", "bestF1",
+            "bestThr", "ECE", "Spearman"
         ));
         for m in ms {
             s.push_str(&format!(
-                "{:<12} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
-                m.source, m.pairs_count, m.positives, m.negatives, m.roc_auc, m.pr_auc,
+                "{:<12} {:<8} {:>4} {:>4} {:>4} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3} {:>7.3} {:>6.3} {:>8.3}\n",
+                m.source, m.scorer, m.pairs_count, m.positives, m.negatives, m.roc_auc, m.pr_auc,
                 m.precision_at, m.recall_at, m.f1_at, m.best_f1, m.best_threshold, m.ece, m.spearman
             ));
         }
@@ -2031,25 +2055,31 @@ mod tests {
         const AUC_TOL: f64 = 0.03;
         const F1_TOL: f64 = 0.02;
         const ECE_TOL: f64 = 0.03;
-        let by_src: BTreeMap<&str, &crate::engine::extcalib::ExtCalibMetrics> =
-            base.iter().map(|m| (m.source.as_str(), m)).collect();
+        // 按 (source, scorer) 配对：同一语料的词面/融合/纯余弦三档各有自己的基线。
+        let by_key: BTreeMap<(&str, &str), &crate::engine::extcalib::ExtCalibMetrics> =
+            base.iter().map(|m| ((m.source.as_str(), m.scorer.as_str()), m)).collect();
         let mut fails = Vec::new();
         for c in cur {
-            let Some(b) = by_src.get(c.source.as_str()) else {
-                fails.push(format!("[{}] 基线缺此来源（新增语料需 BIDGUARD_WRITE_BASELINE=1 重写基线）", c.source));
+            let k = (c.source.as_str(), c.scorer.as_str());
+            let Some(b) = by_key.get(&k) else {
+                fails.push(format!(
+                    "[{}/{}] 基线缺此档（新增语料/档位需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
+                    c.source, c.scorer
+                ));
                 continue;
             };
+            let tag = format!("{}/{}", c.source, c.scorer);
             if c.roc_auc < b.roc_auc - AUC_TOL {
-                fails.push(format!("[{}] ROC-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", c.source, b.roc_auc, c.roc_auc));
+                fails.push(format!("[{tag}] ROC-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", b.roc_auc, c.roc_auc));
             }
             if c.pr_auc < b.pr_auc - AUC_TOL {
-                fails.push(format!("[{}] PR-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", c.source, b.pr_auc, c.pr_auc));
+                fails.push(format!("[{tag}] PR-AUC 降 {:.3}→{:.3}（容差 {AUC_TOL}）", b.pr_auc, c.pr_auc));
             }
             if c.best_f1 < b.best_f1 - F1_TOL {
-                fails.push(format!("[{}] bestF1 降 {:.3}→{:.3}（容差 {F1_TOL}）", c.source, b.best_f1, c.best_f1));
+                fails.push(format!("[{tag}] bestF1 降 {:.3}→{:.3}（容差 {F1_TOL}）", b.best_f1, c.best_f1));
             }
             if c.ece > b.ece + ECE_TOL {
-                fails.push(format!("[{}] ECE 升 {:.3}→{:.3}（容差 {ECE_TOL}）", c.source, b.ece, c.ece));
+                fails.push(format!("[{tag}] ECE 升 {:.3}→{:.3}（容差 {ECE_TOL}）", b.ece, c.ece));
             }
         }
         fails
@@ -2086,10 +2116,22 @@ mod tests {
                 .map(|p| p.source.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| f.file_stem().unwrap_or_default().to_string_lossy().into_owned());
-            let scored = score_external_pairs(&jieba, &pairs, |_, _| None);
-            metrics.push(extcalib::evaluate(&source, "lexical", &scored, 0.5, REGRESSION_THRESHOLD, 10));
+            // 词面档（无模型，恒可跑）
+            let lex = score_external_pairs(&jieba, &pairs, None);
+            metrics.push(extcalib::evaluate(&source, "lexical", &lex, 0.5, REGRESSION_THRESHOLD, 10));
+            // 语义两档（模型就绪才跑）：fused = 生产融合分（用户实际经历的）；
+            // cosine = 裸嵌入余弦（单独回答「嵌入本身判别力如何」）。
+            if let Some(cos) = semantic_cosines(&pairs) {
+                let fused = score_external_pairs(&jieba, &pairs, Some(&cos));
+                metrics.push(extcalib::evaluate(&source, "fused", &fused, 0.5, REGRESSION_THRESHOLD, 10));
+                let raw: Vec<(f32, f32)> =
+                    cos.iter().zip(&pairs).map(|(c, p)| (*c, p.label)).collect();
+                metrics.push(extcalib::evaluate(&source, "cosine", &raw, 0.5, REGRESSION_THRESHOLD, 10));
+            } else {
+                eprintln!("[external_calib] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
+            }
         }
-        metrics.sort_by(|a, b| a.source.cmp(&b.source));
+        metrics.sort_by(|a, b| (a.source.as_str(), a.scorer.as_str()).cmp(&(&b.source, &b.scorer)));
         eprintln!("{}", render_extcalib(&metrics));
 
         let baseline_path = corpus_dir().join("baseline_metrics_external.json");
@@ -2150,48 +2192,65 @@ mod tests {
                 f.display()
             );
             let source = pairs[0].source.clone();
-            let scored = score_external_pairs(&jieba, &pairs, |_, _| None);
-            // 汇总 + 按子类分档
-            let all: Vec<f32> = scored.iter().map(|(s, _)| *s).collect();
-            probes.push(extcalib::false_positive_probe(
-                &source,
-                "lexical",
-                "all",
-                &all,
-                REGRESSION_THRESHOLD,
-            ));
-            let mut subs: BTreeSet<String> =
+            let subs: BTreeSet<String> =
                 pairs.iter().map(|p| p.subclass.clone()).filter(|s| !s.is_empty()).collect();
-            for sub in subs.iter() {
-                let v: Vec<f32> = scored
-                    .iter()
-                    .zip(&pairs)
-                    .filter(|(_, p)| &p.subclass == sub)
-                    .map(|((s, _), _)| *s)
-                    .collect();
+            // 各档分数：词面恒有；语义两档（融合 / 裸余弦）模型就绪才有。
+            let cos = semantic_cosines(&pairs);
+            if cos.is_none() {
+                eprintln!("[template_fp_probe] 语义模型不可用，跳过 fused/cosine 档（设 BIDGUARD_EMBED_DIR 或预置 ~/.cache/bidguard/embeddings/）");
+            }
+            let mut lanes: Vec<(&str, Vec<f32>)> = vec![(
+                "lexical",
+                score_external_pairs(&jieba, &pairs, None).iter().map(|(s, _)| *s).collect(),
+            )];
+            if let Some(c) = &cos {
+                lanes.push((
+                    "fused",
+                    score_external_pairs(&jieba, &pairs, Some(c)).iter().map(|(s, _)| *s).collect(),
+                ));
+                lanes.push(("cosine", c.clone()));
+            }
+            for (scorer, scores) in &lanes {
                 probes.push(extcalib::false_positive_probe(
                     &source,
-                    "lexical",
-                    sub,
-                    &v,
+                    scorer,
+                    "all",
+                    scores,
                     REGRESSION_THRESHOLD,
                 ));
+                for sub in subs.iter() {
+                    let v: Vec<f32> = scores
+                        .iter()
+                        .zip(&pairs)
+                        .filter(|(_, p)| &p.subclass == sub)
+                        .map(|(s, _)| *s)
+                        .collect();
+                    probes.push(extcalib::false_positive_probe(
+                        &source,
+                        scorer,
+                        sub,
+                        &v,
+                        REGRESSION_THRESHOLD,
+                    ));
+                }
             }
-            subs.clear();
         }
-        probes.sort_by(|a, b| (a.source.as_str(), a.subclass.as_str()).cmp(&(&b.source, &b.subclass)));
+        probes.sort_by(|a, b| {
+            (a.source.as_str(), a.scorer.as_str(), a.subclass.as_str())
+                .cmp(&(&b.source, &b.scorer, &b.subclass))
+        });
 
         let mut table = String::from(
-            "官方范本「合法雷同」误报探针（词面 score_pair 档；阈值 0.7；全部为负样本）\n",
+            "官方范本「合法雷同」误报探针（阈值 0.7；全部为负样本，FPR 越低越好）\n",
         );
         table.push_str(&format!(
-            "{:<22} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
-            "source", "subclass", "n", "flagged", "FPR", "mean", "median", "p90", "max"
+            "{:<22} {:<8} {:<14} {:>4} {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "source", "scorer", "subclass", "n", "flagged", "FPR", "mean", "median", "p90", "max"
         ));
         for p in &probes {
             table.push_str(&format!(
-                "{:<22} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
-                p.source, p.subclass, p.pairs_count, p.flagged, p.fpr, p.mean_score,
+                "{:<22} {:<8} {:<14} {:>4} {:>8} {:>7.3} {:>7.3} {:>7.3} {:>7.3} {:>7.3}\n",
+                p.source, p.scorer, p.subclass, p.pairs_count, p.flagged, p.fpr, p.mean_score,
                 p.median_score, p.p90_score, p.max_score
             ));
         }
@@ -2219,21 +2278,24 @@ mod tests {
             serde_json::from_str(&raw).expect("解析 baseline_metrics_template_fp.json");
         // 门禁：误报率单向上升即失败（合法样板被误标的比例不得恶化）。
         const FPR_TOL: f64 = 0.03;
-        let by_key: BTreeMap<(&str, &str), &extcalib::FalsePositiveProbe> =
-            base.iter().map(|p| ((p.source.as_str(), p.subclass.as_str()), p)).collect();
+        let by_key: BTreeMap<(&str, &str, &str), &extcalib::FalsePositiveProbe> = base
+            .iter()
+            .map(|p| ((p.source.as_str(), p.scorer.as_str(), p.subclass.as_str()), p))
+            .collect();
         let mut failures = Vec::new();
         for c in &probes {
-            let Some(b) = by_key.get(&(c.source.as_str(), c.subclass.as_str())) else {
+            let k = (c.source.as_str(), c.scorer.as_str(), c.subclass.as_str());
+            let Some(b) = by_key.get(&k) else {
                 failures.push(format!(
-                    "[{}/{}] 基线缺此分档（新增语料需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
-                    c.source, c.subclass
+                    "[{}/{}/{}] 基线缺此分档（新增语料/档位需 BIDGUARD_WRITE_BASELINE=1 重写基线）",
+                    c.source, c.scorer, c.subclass
                 ));
                 continue;
             };
             if c.fpr > b.fpr + FPR_TOL {
                 failures.push(format!(
-                    "[{}/{}] 误报率升 {:.3}→{:.3}（容差 {FPR_TOL}）",
-                    c.source, c.subclass, b.fpr, c.fpr
+                    "[{}/{}/{}] 误报率升 {:.3}→{:.3}（容差 {FPR_TOL}）",
+                    c.source, c.scorer, c.subclass, b.fpr, c.fpr
                 ));
             }
         }

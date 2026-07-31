@@ -1,19 +1,53 @@
 [
   {
     "source": "pawsx-zh",
+    "scorer": "cosine",
+    "pairsCount": 300,
+    "positives": 123,
+    "negatives": 177,
+    "rocAuc": 0.5654770107023104,
+    "prAuc": 0.4951059072774086,
+    "threshold": 0.7,
+    "precisionAt": 0.41379310344827586,
+    "recallAt": 0.975609756097561,
+    "f1At": 0.5811138014527846,
+    "bestThreshold": 0.769473,
+    "bestF1": 0.5920398009950248,
+    "ece": 0.49500432391961413,
+    "spearman": 0.111558027613362
+  },
+  {
+    "source": "pawsx-zh",
+    "scorer": "fused",
+    "pairsCount": 300,
+    "positives": 123,
+    "negatives": 177,
+    "rocAuc": 0.5748013412337514,
+    "prAuc": 0.5122197294106854,
+    "threshold": 0.7,
+    "precisionAt": 0.44285714285714284,
+    "recallAt": 0.7560975609756098,
+    "f1At": 0.5585585585585585,
+    "bestThreshold": 0.38957146,
+    "bestF1": 0.5899280575539569,
+    "ece": 0.3433424234390259,
+    "spearman": 0.12744448029860267
+  },
+  {
+    "source": "pawsx-zh",
     "scorer": "lexical",
     "pairsCount": 300,
     "positives": 123,
     "negatives": 177,
-    "rocAuc": 0.5755362638372147,
-    "prAuc": 0.4966609614783187,
+    "rocAuc": 0.5756740618253641,
+    "prAuc": 0.5002743309453467,
     "threshold": 0.7,
     "precisionAt": 0.4766355140186916,
     "recallAt": 0.4146341463414634,
     "f1At": 0.4434782608695652,
     "bestThreshold": 0.12046018,
     "bestF1": 0.5913461538461537,
-    "ece": 0.2314232841382424,
-    "spearman": 0.1286967214382138
+    "ece": 0.23142328582704066,
+    "spearman": 0.1289318848682892
   }
 ]
