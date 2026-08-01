@@ -40,7 +40,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # 引擎依赖（纯 Rust，无系统库依赖）
-zip = { version = "2", default-features = false, features = ["deflate"] } # 解 docx(zip)
+zip = { version = "8", default-features = false, features = ["deflate"] } # 解 docx(zip)
 # 解析 docx 正文与元数据 XML（不可信输入）。≥0.41 修复 RUSTSEC-2026-0194（重复属性名检查的
 # 二次方复杂度）与 -0195（NsReader 命名空间声明无界分配导致内存耗尽）。
 quick-xml = "0.41"
