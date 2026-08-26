@@ -116,6 +116,10 @@ export interface OcrModelInfo {
 
 export interface AppInfoDto {
   version: string;
+  /** 构建时 git 短 SHA（源码包构建取不到时为 "unknown"）——About 面板展示，工单定位用。 */
+  buildSha: string;
+  /** 日志目录绝对路径（「打开日志目录」按钮用；解析失败为 null）。 */
+  logDir: string | null;
   maxDocs: number;
   minDocs: number;
   embeddingModels: EmbedModelInfo[];

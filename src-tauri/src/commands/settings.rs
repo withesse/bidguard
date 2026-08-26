@@ -47,6 +47,11 @@ pub struct OcrModelInfo {
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
     pub version: String,
+    /// 构建时 git 短 SHA（build.rs 注入；源码包构建取不到时为 "unknown"）——
+    /// 用户报告「结果不对」时能对回确切代码版本，semver 粒度不够。
+    pub build_sha: String,
+    /// 日志目录绝对路径（前端「打开日志目录」按钮用；路径解析失败为 None）。
+    pub log_dir: Option<String>,
     pub max_docs: usize,
     pub min_docs: usize,
     /// 可选语义模型清单（前端选择器据此渲染，不硬编码）。
@@ -107,9 +112,16 @@ impl CalibrationInfo {
 }
 
 #[tauri::command]
-pub async fn get_app_info() -> AppResult<AppInfo> {
+pub async fn get_app_info(app: tauri::AppHandle) -> AppResult<AppInfo> {
+    use tauri::Manager;
     Ok(AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        build_sha: option_env!("BIDGUARD_BUILD_SHA").unwrap_or("unknown").to_string(),
+        log_dir: app
+            .path()
+            .app_log_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
         max_docs: crate::config::MAX_DOCS,
         min_docs: crate::config::MIN_DOCS,
         embedding_models: crate::engine::embed::MODELS

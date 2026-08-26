@@ -470,7 +470,7 @@ export function Settings() {
 
           {/* 关于与更新 */}
           <Card title="关于" cardBg={cardBg} border={border} mute={mute}>
-            <Row label="检查更新" sub="从 GitHub Releases 获取签名更新包" ink={ink} mute={mute} last>
+            <Row label="检查更新" sub="从 GitHub Releases 获取签名更新包" ink={ink} mute={mute}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <span style={{ fontSize: 11.5, color: mute }}>{updLabel()}</span>
                 <Button
@@ -482,6 +482,35 @@ export function Settings() {
                   检查
                 </Button>
               </div>
+            </Row>
+            <Row label="版本与构建" sub="反馈问题时请附带此标识，便于对回确切代码版本" ink={ink} mute={mute}>
+              <span style={{ fontSize: 11.5, color: mute, fontFamily: C.mono, userSelect: "all" }}>
+                {appInfo ? `v${appInfo.version} · ${appInfo.buildSha}` : "读取中…"}
+              </span>
+            </Row>
+            <Row
+              label="日志目录"
+              sub="日志仅含任务 ID / 计数 / 错误码，永不记录标书正文"
+              ink={ink}
+              mute={mute}
+              last
+            >
+              <Button
+                kind="secondary"
+                size="sm"
+                disabled={!appInfo?.logDir}
+                onClick={async () => {
+                  if (!appInfo?.logDir) return;
+                  try {
+                    const { openPath } = await import("@tauri-apps/plugin-opener");
+                    await openPath(appInfo.logDir);
+                  } catch (e) {
+                    toast.show("打开日志目录失败：" + errMsg(e), "error");
+                  }
+                }}
+              >
+                打开
+              </Button>
             </Row>
           </Card>
 
