@@ -69,8 +69,13 @@ pub fn cluster(chunks: &[CmpChunk], edges: &[ScoredEdge], threshold: f32) -> Vec
         comp_edges.entry(dsu.find(e.a)).or_default().push(e);
     }
 
+    // 按分量根序遍历（DSU 根由确定性的边序推得）：HashMap 迭代序随运行漂移，
+    // 末尾按 avg 的稳定排序会保留平局项的入序——不定序会穿透到落库顺序与
+    // MAX_STORE_CLUSTERS 截断边界，破坏「同输入逐字节一致」承诺。
+    let mut comps: Vec<(u32, Vec<&ScoredEdge>)> = comp_edges.into_iter().collect();
+    comps.sort_unstable_by_key(|(root, _)| *root);
     let mut out = Vec::new();
-    for (_, es) in comp_edges {
+    for (_, es) in comps {
         for group in cohesive_split(es) {
             if let Some(c) = build_raw(chunks, &group) {
                 out.push(c);
@@ -135,7 +140,10 @@ fn group_by_component<'a>(es: &[&'a ScoredEdge]) -> Vec<Vec<&'a ScoredEdge>> {
     for e in es {
         groups.entry(dsu.find(idx_of[&e.a])).or_default().push(e);
     }
-    groups.into_values().collect()
+    // 同上：按根序输出，拆分递归的分支顺序才可复现
+    let mut out: Vec<(u32, Vec<&ScoredEdge>)> = groups.into_iter().collect();
+    out.sort_unstable_by_key(|(root, _)| *root);
+    out.into_iter().map(|(_, g)| g).collect()
 }
 
 /// 一组内聚边 → RawCluster（跨 ≥2 文档才成组；含角色分配与统计）。

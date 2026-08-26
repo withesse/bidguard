@@ -255,14 +255,23 @@ pub fn delete(conn: &rusqlite::Connection, id: &str) -> AppResult<()> {
 }
 
 /// 启动自检：上次运行残留的未完结任务全部判失败（进程已死，任务不可能还在跑）。
-pub fn mark_stale_as_failed(conn: &rusqlite::Connection) -> AppResult<usize> {
-    let n = conn.execute(
+/// 返回被判失败的 compare 任务 id：进程可能死在「结果事务已提交、汇总（summary）未写」的
+/// 窗口，这些任务会带着不可见的半成品结果行——调用方（启动清障）据此逐个清理。
+pub fn mark_stale_as_failed(conn: &rusqlite::Connection) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM jobs
+         WHERE status IN ('pending', 'running', 'cancelling') AND job_type = 'compare'",
+    )?;
+    let compare_ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    conn.execute(
         "UPDATE jobs SET status = 'failed', error_code = 'unknown',
          error_message = '应用重启，任务中断', finished_at = ?1
          WHERE status IN ('pending', 'running', 'cancelling')",
         [now_iso()],
     )?;
-    Ok(n)
+    Ok(compare_ids)
 }
 
 #[cfg(test)]
@@ -298,7 +307,7 @@ mod tests {
         // 残留任务清理
         let j2 = create(&conn, &ws.id, "compare", None, "{}").unwrap();
         set_running(&conn, &j2.id).unwrap();
-        assert_eq!(mark_stale_as_failed(&conn).unwrap(), 1);
+        assert_eq!(mark_stale_as_failed(&conn).unwrap(), vec![j2.id.clone()]);
         assert_eq!(get(&conn, &j2.id).unwrap().status, "failed");
     }
 

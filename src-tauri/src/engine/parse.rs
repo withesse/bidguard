@@ -522,20 +522,43 @@ fn parse_pdf_ocr(
     ocr_model: &'static crate::engine::ocr::OcrModelSpec,
     max_pages: Option<usize>,
 ) -> Result<ParsedBlocks, String> {
-    let (imgs, total_pages) = rasterize_pdf_capped(path, cancel, max_pages)
-        .ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
-    if imgs.is_empty() {
+    let pdfium = bind_pdfium().ok_or_else(|| "无法栅格化 PDF（pdfium 不可用）".to_string())?;
+    let doc = match path.to_str().map(|p| pdfium.load_pdf_from_file(p, None)) {
+        Some(Ok(d)) => d,
+        _ => return Err("无法栅格化 PDF（pdfium 不可用）".into()),
+    };
+    let total_pages = doc.pages().len() as usize;
+    let session = crate::engine::ocr::OcrSession::new(ocr_model)
+        .ok_or_else(|| "OCR 不可用（缺模型或识别失败）".to_string())?;
+    let cfg = pdf_render_config();
+    let limit = max_pages.unwrap_or(usize::MAX);
+    // 流式：渲染一页 → 识别一页 → 丢位图，峰值内存 = 单页位图（1600px 宽 ≈ 11MB）。
+    // 此前整本页图先攒进 Vec 再交 OCR，W2-4 命中解除页上限后 500 页扫描件会驻留 ~5.7GB；
+    // 流式化后解除上限只受时间约束，不再受内存约束。取消检查粒度不变（每页之间）。
+    let mut ocr_pages: Vec<crate::engine::ocr::OcrPage> = Vec::new();
+    for page in doc.pages().iter() {
+        if ocr_pages.len() >= limit {
+            break;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.into());
+        }
+        // 渲染/转换失败跳过该页（与旧 rasterize 行为一致：不中断整本）
+        let Ok(bm) = page.render_with_config(&cfg) else { continue };
+        let Some(rgb) = bitmap_to_rgb(&bm) else { continue };
+        drop(bm);
+        let p = session
+            .run_page(rgb)
+            .ok_or_else(|| "OCR 不可用（缺模型或识别失败）".to_string())?;
+        ocr_pages.push(p);
+    }
+    if ocr_pages.is_empty() {
         return Err("PDF 无可渲染页面".into());
     }
-    let rendered = imgs.len();
+    let rendered = ocr_pages.len();
     let truncated = total_pages > rendered;
     // 如实上报总页数（而非被 OCR 上限截断后的数量）
     let pages = total_pages.max(rendered) as u32;
-    let ocr_pages = crate::engine::ocr::ocr_images(imgs, cancel, ocr_model)
-        .ok_or_else(|| "OCR 不可用（缺模型或识别失败）".to_string())?;
-    if cancel.load(Ordering::SeqCst) {
-        return Err(CANCELLED.into());
-    }
     // 旧实现是所有识别行直接拼接（每行带 \n，空页无贡献），逐字符复刻
     let legacy_text: String = ocr_pages.iter().map(|p| p.text.as_str()).collect();
     if legacy_text.trim().is_empty() {
@@ -607,7 +630,7 @@ fn bitmap_to_rgb(bm: &pdfium_render::prelude::PdfBitmap) -> Option<image::RgbIma
 }
 
 /// 用 pdfium 把 PDF 各页渲染为 RgbImage（上限 OCR_MAX_PAGES）。仅测试在用——生产路径
-/// parse_pdf_ocr 直接调 rasterize_pdf_capped 以参数化页上限（W2-4 回落传 None 解除上限）。
+/// parse_pdf_ocr 已改为「渲染一页→识别一页」流式，不再整本攒页图（见其注释）。
 #[cfg(test)]
 fn rasterize_pdf(path: &Path, cancel: &AtomicBool) -> Option<(Vec<image::RgbImage>, usize)> {
     rasterize_pdf_capped(path, cancel, Some(OCR_MAX_PAGES))
@@ -642,7 +665,9 @@ fn rasterize_pages(
     Some(out)
 }
 
-/// 栅格化按页上限参数化：max_pages=Some(n) 渲染前 n 页；None 渲染全部（取证回落）。
+/// 栅格化按页上限参数化：max_pages=Some(n) 渲染前 n 页；None 渲染全部。
+/// 仅测试在用（渲染行为回归）——生产 OCR 路径已流式化，整本攒页图的内存形态不再出现。
+#[cfg(test)]
 fn rasterize_pdf_capped(
     path: &Path,
     cancel: &AtomicBool,

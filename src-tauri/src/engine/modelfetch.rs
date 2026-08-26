@@ -98,6 +98,59 @@ pub fn fetch_tar_into(
     extract_verified(resp.into_body().into_reader(), expect_sha256, dest, wanted)
 }
 
+/// 下载 .tar 并解出其中【第一个】.onnx 到 `dest` 文件（OCR 档位专用：det/rec 归档内条目
+/// 同名 inference.onnx，按名匹配会撞名，故按扩展名取首个并落为目标文件名）。
+/// 与 fetch_tar_into 的两点差异：dest 所在缓存目录为多档位共享，校验失败只删本次 .part、
+/// 不清目录；rename 发生在【整流摘要通过之后】——失败时磁盘上不会出现「看似就位」的目标文件。
+pub fn fetch_tar_first_onnx(
+    url: &str,
+    expect_sha256: Option<&str>,
+    dest: &Path,
+) -> Result<u64, String> {
+    let resp = ureq::get(url).call().map_err(|e| format!("下载失败：{e}"))?;
+    extract_first_onnx_verified(resp.into_body().into_reader(), expect_sha256, dest)
+}
+
+fn extract_first_onnx_verified<R: Read>(
+    reader: R,
+    expect_sha256: Option<&str>,
+    dest: &Path,
+) -> Result<u64, String> {
+    let part = dest.with_extension("part");
+    let mut archive = tar::Archive::new(HashingReader::new(reader));
+    let mut written: Option<u64> = None;
+    {
+        for entry in archive.entries().map_err(|e| e.to_string())? {
+            let mut e = entry.map_err(|e| e.to_string())?;
+            let is_onnx = e
+                .path()
+                .ok()
+                .and_then(|p| p.extension().map(|x| x.eq_ignore_ascii_case("onnx")))
+                .unwrap_or(false);
+            if is_onnx {
+                let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
+                written = Some(std::io::copy(&mut e, &mut out).map_err(|e| e.to_string())?);
+                break; // 剩余字节由 finish() 排空计入摘要
+            }
+        }
+    }
+    let digest = archive.into_inner().finish().map_err(|e| e.to_string())?;
+    let Some(n) = written else {
+        let _ = std::fs::remove_file(&part);
+        return Err("tar 包内未找到 .onnx".to_string());
+    };
+    if let Some(exp) = expect_sha256 {
+        if !digest_matches(exp, &digest) {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "模型归档校验失败：sha256 期望 {exp}，实得 {digest}；已丢弃本次下载内容"
+            ));
+        }
+    }
+    std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +209,35 @@ mod tests {
             .expect_err("摘要不符必须拒收");
         assert!(err.contains("sha256"), "错误信息应点明校验失败：{err}");
         assert!(!root.exists(), "校验失败后目标目录必须清空");
+    }
+
+    // 首个 .onnx 变体：改名发生在摘要通过之后；子目录内的 inference.onnx 也能按扩展名命中。
+    #[test]
+    fn first_onnx_renames_only_after_digest_ok() {
+        let root = std::env::temp_dir().join(format!("bg_mf_onnx_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = tar_bytes(&[("PP-OCRv6_x_det_onnx_infer/inference.onnx", b"onnx-bytes"), ("x/inference.yml", b"cfg")]);
+        let dest = root.join("pp-ocrv6_x_det.onnx");
+        let n = extract_first_onnx_verified(&bytes[..], Some(&sha256_hex(&bytes)), &dest)
+            .expect("摘要一致应接受");
+        assert_eq!(n, "onnx-bytes".len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"onnx-bytes");
+        assert!(!dest.with_extension("part").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn first_onnx_rejects_wrong_digest_without_touching_dest() {
+        let root = std::env::temp_dir().join(format!("bg_mf_onnxbad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = tar_bytes(&[("a/inference.onnx", b"onnx-bytes")]);
+        let dest = root.join("target.onnx");
+        let err = extract_first_onnx_verified(&bytes[..], Some(&"0".repeat(64)), &dest)
+            .expect_err("摘要不符必须拒收");
+        assert!(err.contains("sha256"), "{err}");
+        assert!(!dest.exists(), "校验失败后目标文件不得存在");
+        assert!(!dest.with_extension("part").exists(), "半成品 .part 必须清除");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // 未声明期望摘要（内网自建归档）时行为不变：正常落盘，不因缺摘要而拒绝。

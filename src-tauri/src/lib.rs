@@ -70,8 +70,17 @@ pub fn run() {
             // 清理失败只记录，不阻止应用启动。
             match pool.get() {
                 Ok(conn) => {
-                    if let Err(e) = db::repo::job_repo::mark_stale_as_failed(&conn) {
-                        log::error!("启动清理残留任务失败：{e}");
+                    match db::repo::job_repo::mark_stale_as_failed(&conn) {
+                        // 死在「结果已落库、汇总未写」窗口的 compare 任务会残留不可见半成品，
+                        // 判失败的同时把结果行一并清掉（与 run_compare 失败路径同一兜底）
+                        Ok(compare_ids) => {
+                            for id in compare_ids {
+                                if let Err(e) = db::repo::compare_repo::delete_job_results(&conn, &id) {
+                                    log::error!("启动清理孤儿比对结果失败 job_id={id} code={:?}", e.code);
+                                }
+                            }
+                        }
+                        Err(e) => log::error!("启动清理残留任务失败：{e}"),
                     }
                     // 卡在 'parsing' 的孤儿文档（上次被杀/崩溃）也判失败，否则界面永显「解析中」
                     if let Err(e) = db::repo::document_repo::mark_stale_parsing_as_failed(&conn) {

@@ -44,6 +44,10 @@ pub struct OcrModelSpec {
     /// 按需下载源（PaddleOCR 官方 BCE 的 .tar）；打包档位为 None。
     pub det_url: Option<&'static str>,
     pub rec_url: Option<&'static str>,
+    /// 下载归档的整流 sha256（TOFU 自官方源钉死；None = 不校验，仅打包档位允许）。
+    /// 被投毒的 OCR 模型可系统性压低扫描件相似度——与 embed/rerank 的 modelfetch 同纪律。
+    pub det_sha256: Option<&'static str>,
+    pub rec_sha256: Option<&'static str>,
 }
 
 pub const OCR_MODELS: &[OcrModelSpec] = &[
@@ -57,6 +61,8 @@ pub const OCR_MODELS: &[OcrModelSpec] = &[
         size_label: "~6MB",
         det_url: None,
         rec_url: None,
+        det_sha256: None,
+        rec_sha256: None,
     },
     OcrModelSpec {
         key: "v6-small",
@@ -68,6 +74,8 @@ pub const OCR_MODELS: &[OcrModelSpec] = &[
         size_label: "~30MB",
         det_url: None,
         rec_url: None,
+        det_sha256: None,
+        rec_sha256: None,
     },
     OcrModelSpec {
         key: "v6-medium",
@@ -79,6 +87,9 @@ pub const OCR_MODELS: &[OcrModelSpec] = &[
         size_label: "~132MB",
         det_url: Some("https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv6_medium_det_onnx_infer.tar"),
         rec_url: Some("https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv6_medium_rec_onnx_infer.tar"),
+        // 2026-08-26 自官方 BCE 源钉死（det 62,044,160B / rec 76,718,080B，onnx 魔数已验）
+        det_sha256: Some("c5adb0b15de1b1838934eba1dd72e7529e7d80132216c6ee6d26eba6fa054fcf"),
+        rec_sha256: Some("d8cc46c7163c83a151aef8fce5856b965860df90a875029216d605b0f607eaec"),
     },
 ];
 
@@ -136,38 +147,20 @@ pub fn download_model(spec: &OcrModelSpec) -> Result<u64, String> {
     let cache = ocr_cache_dir().ok_or_else(|| "无法定位 OCR 缓存目录".to_string())?;
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let mut total = 0u64;
-    for (url, fname) in [(spec.det_url, spec.det), (spec.rec_url, spec.rec)] {
+    for (url, sha, fname) in [
+        (spec.det_url, spec.det_sha256, spec.det),
+        (spec.rec_url, spec.rec_sha256, spec.rec),
+    ] {
         let dest = cache.join(fname);
         if dest.exists() {
             continue; // 断点：已下好的那一半跳过
         }
         let url = url.ok_or_else(|| "该档位不支持下载".to_string())?;
-        total += fetch_tar_onnx(url, &dest)?;
+        // 走 modelfetch 统一校验：整流 sha256 通过后才落为目标文件名（此前 OCR 通道无校验，
+        // 是 embed/rerank 补齐 W6-2 后的遗留缺口——SECURITY.md 的承诺自此对三类模型一致）
+        total += crate::engine::modelfetch::fetch_tar_first_onnx(url, sha, &dest)?;
     }
     Ok(total)
-}
-
-/// 流式下载 .tar，解出其中的 inference.onnx 写到 dest（先写 .part 再 rename，避免半截文件被当成就位）。
-fn fetch_tar_onnx(url: &str, dest: &Path) -> Result<u64, String> {
-    let resp = ureq::get(url).call().map_err(|e| format!("下载失败：{e}"))?;
-    let reader = resp.into_body().into_reader();
-    let mut archive = tar::Archive::new(reader);
-    for entry in archive.entries().map_err(|e| e.to_string())? {
-        let mut e = entry.map_err(|e| e.to_string())?;
-        let is_onnx = e
-            .path()
-            .ok()
-            .and_then(|p| p.extension().map(|x| x.eq_ignore_ascii_case("onnx")))
-            .unwrap_or(false);
-        if is_onnx {
-            let tmp = dest.with_extension("part");
-            let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-            let n = std::io::copy(&mut e, &mut out).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-            return Ok(n);
-        }
-    }
-    Err("tar 包内未找到 .onnx".to_string())
 }
 
 /// 删除某档位已下载的 det/rec（打包档位无影响）。返回释放字节数。
@@ -203,31 +196,30 @@ pub struct OcrPage {
     pub lines: Vec<OcrLine>,
 }
 
-/// 逐页 OCR，返回每页识别文本与行级版面（与输入页一一对应）。
-/// 模型缺失/识别失败/被取消返回 None；取消时不返回部分结果，避免半截文本被当成全文入库。
-pub fn ocr_images(
-    images: Vec<RgbImage>,
-    cancel: &AtomicBool,
-    spec: &OcrModelSpec,
-) -> Option<Vec<OcrPage>> {
-    if images.is_empty() {
-        return Some(Vec::new());
+/// 已加载的 OCR 引擎会话：det/rec 两个 ONNX 加载成本高，流式逐页识别时必须复用——
+/// 供 parse_pdf_ocr 的「渲染一页→识别一页→丢位图」流水（峰值内存从整本页图降到单页）。
+pub struct OcrSession {
+    ocr: OAROCR,
+}
+
+impl OcrSession {
+    /// 模型缺失/构建失败返回 None（与 ocr_images 同降级语义）。
+    pub fn new(spec: &OcrModelSpec) -> Option<Self> {
+        let (det, rec, dict) = resolve_paths(spec)?;
+        OAROCRBuilder::new(
+            det.to_string_lossy().into_owned(),
+            rec.to_string_lossy().into_owned(),
+            dict.to_string_lossy().into_owned(),
+        )
+        .build()
+        .ok()
+        .map(|ocr| Self { ocr })
     }
-    let (det, rec, dict) = resolve_paths(spec)?;
-    let ocr = OAROCRBuilder::new(
-        det.to_string_lossy().into_owned(),
-        rec.to_string_lossy().into_owned(),
-        dict.to_string_lossy().into_owned(),
-    )
-    .build()
-    .ok()?;
-    let mut pages = Vec::with_capacity(images.len());
-    for img in images {
-        if cancel.load(Ordering::SeqCst) {
-            return None;
-        }
+
+    /// 识别一页；识别失败返回 None。
+    pub fn run_page(&self, img: RgbImage) -> Option<OcrPage> {
         let (pw, ph) = (img.width() as f32, img.height() as f32);
-        let results = ocr.predict(vec![img]).ok()?;
+        let results = self.ocr.predict(vec![img]).ok()?;
         let mut out = String::new();
         let mut lines: Vec<OcrLine> = Vec::new();
         for r in results {
@@ -260,7 +252,29 @@ pub fn ocr_images(
                 }
             }
         }
-        pages.push(OcrPage { text: out, lines });
+        Some(OcrPage { text: out, lines })
+    }
+}
+
+/// 逐页 OCR，返回每页识别文本与行级版面（与输入页一一对应）。
+/// 模型缺失/识别失败/被取消返回 None；取消时不返回部分结果，避免半截文本被当成全文入库。
+/// 适用于「页图已在手」的有界场景（xcheck 抽样页、docx 内嵌图片 ≤60 张）；
+/// 整本扫描件走 parse_pdf_ocr 的流式路径，不要先攒全量页图再进本函数。
+pub fn ocr_images(
+    images: Vec<RgbImage>,
+    cancel: &AtomicBool,
+    spec: &OcrModelSpec,
+) -> Option<Vec<OcrPage>> {
+    if images.is_empty() {
+        return Some(Vec::new());
+    }
+    let session = OcrSession::new(spec)?;
+    let mut pages = Vec::with_capacity(images.len());
+    for img in images {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        pages.push(session.run_page(img)?);
     }
     Some(pages)
 }
@@ -276,6 +290,11 @@ mod tests {
         // medium 可下载、tiny/small 打包
         assert!(!resolve("v6-medium").bundled && resolve("v6-medium").det_url.is_some());
         assert!(resolve("v6-tiny").bundled && resolve("v6-small").bundled);
+        // 可下载档位必须钉死归档摘要（被投毒的模型会静默压低检测结果）
+        for m in OCR_MODELS.iter().filter(|m| !m.bundled) {
+            assert!(m.det_url.is_none() || m.det_sha256.is_some(), "{} det 缺 sha256", m.key);
+            assert!(m.rec_url.is_none() || m.rec_sha256.is_some(), "{} rec 缺 sha256", m.key);
+        }
     }
 
     #[test]
@@ -284,7 +303,8 @@ mod tests {
         let url = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv6_tiny_det_onnx_infer.tar";
         let dest =
             std::env::temp_dir().join(format!("bg_ocrdl_{}.onnx", uuid::Uuid::new_v4()));
-        let n = fetch_tar_onnx(url, &dest).expect("应能下载并解出 onnx");
+        let n = crate::engine::modelfetch::fetch_tar_first_onnx(url, None, &dest)
+            .expect("应能下载并解出 onnx");
         assert!(n > 1_000_000, "onnx 应 >1MB，实际 {n}");
         let head = std::fs::read(&dest).unwrap();
         let _ = std::fs::remove_file(&dest);

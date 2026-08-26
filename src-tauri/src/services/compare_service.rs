@@ -273,9 +273,14 @@ pub fn run_compare(
     workspace_id: &str,
     cfg: &CompareRunConfig,
 ) -> AppResult<()> {
-    let r = run_inner(ctx, &jieba, &embedder, workspace_id, cfg);
-    if r.is_err() {
-        // 失败/取消后清理半成品；清理本身失败不能静默（会留下残留结果），记日志（仅 job_id + 码）
+    // catch_unwind：panic（如越界索引）此前会绕过下方清理直达 jobs::execute 的兜底，
+    // 半写结果以「failed 任务带幽灵数据」残留。此处只负责清理，随后原样续抛，
+    // 终态判定仍归 execute 的 catch_unwind（failed/unknown）。
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_inner(ctx, &jieba, &embedder, workspace_id, cfg)
+    }));
+    if !matches!(r, Ok(Ok(()))) {
+        // 失败/取消/panic 后清理半成品；清理本身失败不能静默（会留下残留结果），记日志（仅 job_id + 码）
         match ctx.db.get() {
             Ok(conn) => {
                 if let Err(e) = compare_repo::delete_job_results(&conn, &ctx.job_id) {
@@ -285,7 +290,10 @@ pub fn run_compare(
             Err(e) => log::error!("清理比对半成品取连接失败 job_id={}: {e}", ctx.job_id),
         }
     }
-    r
+    match r {
+        Ok(inner) => inner,
+        Err(p) => std::panic::resume_unwind(p),
+    }
 }
 
 /// 招标文件豁免物料（M4 接线）：一次加载招标/补遗文档产出四类对减依据——
@@ -2143,6 +2151,8 @@ fn shared_terms_of(chunks: &[CmpChunk]) -> Vec<SharedTerm> {
             .len()
             .cmp(&a.docs.len())
             .then(b.term.chars().count().cmp(&a.term.chars().count()))
+            // 终极平局键：词本身。缺它时平局项保留 HashMap 入序，top-30 截断边界随运行漂移
+            .then_with(|| a.term.cmp(&b.term))
     });
     out.truncate(30);
     out
@@ -2151,7 +2161,7 @@ fn shared_terms_of(chunks: &[CmpChunk]) -> Vec<SharedTerm> {
 /// 招标文件豁免（M4 招标对减接线预留）：招标文件本身的笔误/词元各家照抄不算串标
 /// （调研 §13 反向豁免——错误内容一致的证明力恰恰依赖「不是各家都抄同一份母本」）。
 /// `tokens` 供词典外词豁免，`normalized_text` 供异常标点/引用错误指纹的子串豁免。
-/// 当前 run_compare 恒传 None；W3/M4 招标文件角色落地后由其解析产物填充。
+/// M4 起由 run_compare 以招标文件解析产物填充（工作区未导入招标文件时为 None）。
 pub struct TenderExemption {
     pub tokens: HashSet<String>,
     pub normalized_text: String,

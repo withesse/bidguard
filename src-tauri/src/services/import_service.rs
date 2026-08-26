@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const ACCEPTED: &[&str] = &["docx", "pdf", "txt", "md", "xlsx", "xls"];
+/// 单文件导入上限（1GB）：解析器整文档驻内存，超此体积的「标书」按误选/构造性输入拒绝。
+const MAX_IMPORT_FILE_BYTES: u64 = 1_073_741_824;
 
 /// 导入期生效的解析配置（来自四层配置合并；见 ImportOptions::from_config）。
 #[derive(Debug, Clone)]
@@ -198,6 +200,18 @@ pub fn run_import(
                 format!("文件不存在：{file_name}"),
             )
             .with_detail(p.clone()));
+        }
+        // 体积护栏：解析是整文档驻内存（docx XML/整本文本），标书极限也远在 1GB 之下；
+        // 超限多半是误选文件或构造性输入，明确报错好过让解析器在内存里挣扎。
+        let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if file_len > MAX_IMPORT_FILE_BYTES {
+            return Err(AppError::new(
+                AppErrorCode::UnsupportedFileType,
+                format!(
+                    "「{file_name}」体积 {:.1}GB 超过单文件 1GB 上限，请确认是否选错文件",
+                    file_len as f64 / 1_073_741_824.0
+                ),
+            ));
         }
         let file_hash = hash_file(path, ctx)?;
 

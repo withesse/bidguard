@@ -87,7 +87,8 @@ impl JobCtx {
             (current as f32 / total as f32).clamp(0.0, 1.0)
         };
         {
-            let mut last = self.last_emit.lock().unwrap();
+            // 毒化恢复：节流状态即使被 panic 线程污染也只是时间戳/百分比，取内值继续
+            let mut last = self.last_emit.lock().unwrap_or_else(|e| e.into_inner());
             let stage_changed = last.2 != stage;
             let edge = current == 0 || current >= total;
             let due = last.0.elapsed().as_millis() >= THROTTLE_MS
@@ -235,7 +236,7 @@ impl JobManager {
         let cancel = Arc::new(AtomicBool::new(false));
         self.running
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(job.id.clone(), cancel.clone());
 
         let running = self.running.clone();
@@ -250,7 +251,9 @@ impl JobManager {
             }
             impl Drop for RunningGuard {
                 fn drop(&mut self) {
-                    self.map.lock().unwrap().remove(&self.id);
+                    // 本 Drop 常在 panic 展开路径执行：此处再 unwrap 毒化锁会二次 panic → abort，
+                    // 运行表反而永久残留 zombie。恢复内值照常摘除。
+                    self.map.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
                 }
             }
             let _guard = RunningGuard {
@@ -271,7 +274,7 @@ impl JobManager {
             "completed" | "failed" | "cancelled" => return Ok(()),
             _ => {}
         }
-        let flag = self.running.lock().unwrap().get(job_id).cloned();
+        let flag = self.running.lock().unwrap_or_else(|e| e.into_inner()).get(job_id).cloned();
         match flag {
             Some(f) => {
                 f.store(true, Ordering::SeqCst);
