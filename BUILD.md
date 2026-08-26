@@ -106,18 +106,34 @@ git tag -a v0.6.0 -m "..." && git push origin v0.6.0    # 触发构建发布
 是硬性阻断项：当前二进制内嵌的仍是开发公钥 `lic-dev-2026a`，未换发即发布意味着任何持有该私钥的人
 都能伪造合法许可。
 
-### macOS 代码签名 / 公证（可选，配置后自动启用）
+### 代码签名（可选，配置 secrets 后自动启用；均未配置时照常产出未签名包）
 
-在仓库 Settings → Secrets 配置后，`release.yml` 自动签名公证：
+`release.yml` 内有「secrets 非空才注入」的启用步骤（tauri CLI 对空串证书 env 行为未定义，
+静态映射会让未配证书的发布翻车，故按需注入）。在仓库 Settings → Secrets 配置：
+
+**macOS 签名 + 公证：**
 
 | Secret | 说明 |
 |---|---|
 | `APPLE_CERTIFICATE` | base64 的 Developer ID Application 证书(.p12) |
 | `APPLE_CERTIFICATE_PASSWORD` | 证书密码 |
 | `APPLE_SIGNING_IDENTITY` | 形如 `Developer ID Application: Name (TEAMID)` |
-| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 公证用 Apple ID、专用密码、团队 ID |
+| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | 公证用 Apple ID、App 专用密码、团队 ID |
 
-未配置时产出未签名包（本地可用，分发到他机需用户手动放行 Gatekeeper）。
+（`KEYCHAIN_PASSWORD` 为 runner 一次性钥匙串口令，工作流现场生成，无需配置。）
+
+**Windows Authenticode：**
+
+| Secret | 说明 |
+|---|---|
+| `WINDOWS_CERTIFICATE` | base64 的代码签名证书(.pfx) |
+| `WINDOWS_CERTIFICATE_PASSWORD` | .pfx 导出密码 |
+
+工作流把证书导入 runner 证书库后，以 `--config` 文件注入 `certificateThumbprint`
+（sha256 + digicert 时间戳）——证书轮换只换 secrets，不改仓库。
+
+未配置对应平台的 secrets 时：macOS 包需用户手动放行 Gatekeeper，Windows 包会被
+SmartScreen 提示未知发布者。
 
 ### 自动更新（**已启用**）
 

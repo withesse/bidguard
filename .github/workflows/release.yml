@@ -73,6 +73,57 @@ jobs:
         shell: bash
         run: ./scripts/fetch-embedding-model.sh
 
+      # macOS 签名/公证：secrets 配齐才把 env 注入后续步骤（tauri CLI 对空串 APPLE_CERTIFICATE
+      # 的行为未定义，静态映射会让未配证书的发布翻车——按需注入则两种状态都稳）。
+      # KEYCHAIN_PASSWORD 为 runner 一次性临时钥匙串口令，现场生成，不需配 secret。
+      - name: 启用 macOS 签名（配置了 secrets 时）
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          _CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          _CERT_PWD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          _IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          _APPLE_ID: ${{ secrets.APPLE_ID }}
+          _APPLE_PWD: ${{ secrets.APPLE_PASSWORD }}
+          _TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$_CERT" ]; then
+            echo "未配置 Apple 签名 secrets，产出未签名包（Gatekeeper 需用户手动放行）"
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE<<__EOF__"; echo "$_CERT"; echo "__EOF__"
+            echo "APPLE_CERTIFICATE_PASSWORD=$_CERT_PWD"
+            echo "APPLE_SIGNING_IDENTITY=$_IDENTITY"
+            echo "APPLE_ID=$_APPLE_ID"
+            echo "APPLE_PASSWORD=$_APPLE_PWD"
+            echo "APPLE_TEAM_ID=$_TEAM_ID"
+            echo "KEYCHAIN_PASSWORD=$(openssl rand -hex 16)"
+          } >> "$GITHUB_ENV"
+          echo "已注入 Apple 签名与公证凭据"
+
+      # Windows Authenticode：secrets 配齐才导入证书库，并以 --config 文件注入 thumbprint
+      # （tauri.conf.json 不写死指纹——证书轮换只换 secrets，不改仓库）。
+      - name: 启用 Windows 签名（配置了 secrets 时）
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          _CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+          _CERT_PWD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:_CERT) {
+            Write-Host "未配置 Windows 签名 secrets，产出未签名包（SmartScreen 会提示未知发布者）"
+            exit 0
+          }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\sign.pfx", [Convert]::FromBase64String($env:_CERT))
+          $pwd = ConvertTo-SecureString $env:_CERT_PWD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\sign.pfx" -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+          Remove-Item "$env:RUNNER_TEMP\sign.pfx"
+          $cfg = @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } } } | ConvertTo-Json -Depth 4
+          Set-Content -Path "$env:RUNNER_TEMP\sign-win.json" -Value $cfg -Encoding utf8
+          "TAURI_SIGN_ARGS=--config $env:RUNNER_TEMP\sign-win.json" >> $env:GITHUB_ENV
+          Write-Host "已导入签名证书（thumbprint $($cert.Thumbprint)）"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -80,9 +131,8 @@ jobs:
           # tauri.conf.json 已配 createUpdaterArtifacts:true + 公钥，构建时生成 .sig 与 latest.json。
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS 证书/公证（可选；配好后补 secrets 即生效）：
-          #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
-          #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+          # 代码签名凭据由上方「启用 macOS/Windows 签名」步骤按 secrets 是否配置动态注入
+          # （APPLE_* 走 GITHUB_ENV；Windows thumbprint 走 TAURI_SIGN_ARGS 的 --config 文件）
         with:
           # tag 推送时 ref_name 即 tag；手动触发时用 inputs.tag（否则 ref_name=分支名会建出错误 tag）
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
@@ -92,4 +142,5 @@ jobs:
           prerelease: false
           # 生成并上传 latest.json（自动更新清单）
           includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          # TAURI_SIGN_ARGS：Windows 签名步骤注入的 --config <thumbprint 文件>；未配置时为空
+          args: ${{ matrix.args }} ${{ env.TAURI_SIGN_ARGS }}
