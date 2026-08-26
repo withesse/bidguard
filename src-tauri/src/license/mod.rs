@@ -68,6 +68,9 @@ pub struct LicenseManager {
     store: StateStore,
     fp: Fingerprint,
     base: PathBuf,
+    /// kid→公钥解析器。生产恒为 keys::public_key_for（内嵌 TRUSTED_KEYS）；
+    /// 测试经 load_with_keys 注入临时密钥对，使全流程可在无真实私钥的 CI 上运行。
+    resolve_key: fn(&str) -> Option<[u8; 32]>,
 }
 
 /// 内部裁决：把「状态展示」与「闸门放行」收敛到一份逻辑。
@@ -92,6 +95,15 @@ struct Assessment {
 impl LicenseManager {
     /// 启动装载：指纹 → 状态双写读取（fail-closed）→ 时间证人 → 已装许可验签 → 启动对账。
     pub fn load(base: &Path, pool: &DbPool) -> Self {
+        Self::load_with_keys(base, pool, keys::public_key_for)
+    }
+
+    /// 同 load，但验签公钥集可注入（仅测试/工具使用；生产入口恒走 load）。
+    pub fn load_with_keys(
+        base: &Path,
+        pool: &DbPool,
+        resolve_key: fn(&str) -> Option<[u8; 32]>,
+    ) -> Self {
         let fp = Fingerprint::collect();
         let store = StateStore::new(base, fp.anchor_raw());
 
@@ -124,7 +136,7 @@ impl LicenseManager {
         }
 
         // 已装许可：验签失败/换机不匹配都退化为「无许可」，交由试用/未激活分支
-        let installed = read_installed(base);
+        let installed = read_installed(base, resolve_key);
 
         let _ = store.save(&st); // 持久化证人/初始化态；失败仅记录，不阻断启动
 
@@ -133,6 +145,7 @@ impl LicenseManager {
             store,
             fp,
             base: base.to_path_buf(),
+            resolve_key,
         };
         mgr.reconcile_startup(pool);
         mgr
@@ -251,7 +264,7 @@ impl LicenseManager {
         } else {
             read_license_path(input)?
         };
-        let payload = token::verify_license(&text)?;
+        let payload = token::verify_license_with(&text, self.resolve_key)?;
         if !self.fp.matches(&payload.machine) {
             return Err(AppError::new(
                 AppErrorCode::LicenseMachineMismatch,
@@ -501,10 +514,10 @@ fn new_id() -> String {
 }
 
 /// 读取已装许可（current.lic）并验签；不存在/验签失败均返回 None。
-fn read_installed(base: &Path) -> Option<LicensePayload> {
+fn read_installed(base: &Path, resolve_key: fn(&str) -> Option<[u8; 32]>) -> Option<LicensePayload> {
     let path = base.join("license").join("current.lic");
     let text = std::fs::read_to_string(path).ok()?;
-    match token::verify_license(&text) {
+    match token::verify_license_with(&text, resolve_key) {
         Ok(p) => Some(p),
         Err(e) => {
             log::warn!("已装许可验签失败 code={:?}", e.code);
