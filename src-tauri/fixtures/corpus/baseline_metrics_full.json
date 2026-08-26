@@ -1,0 +1,63 @@
+{
+  "lane": "full",
+  "recallRate": 1.0,
+  "recallByLabel": {
+    "changed": 1.0,
+    "minor_change": 1.0,
+    "rewrite": 1.0,
+    "same": 1.0
+  },
+  "labels": {
+    "changed": {
+      "precision": 0.3576017130620985,
+      "recall": 0.47714285714285715,
+      "f1": 0.40881272949816405,
+      "support": 350
+    },
+    "minor_change": {
+      "precision": 0.25886524822695034,
+      "recall": 0.20857142857142857,
+      "f1": 0.2310126582278481,
+      "support": 350
+    },
+    "rewrite": {
+      "precision": 0.875,
+      "recall": 0.22,
+      "f1": 0.35159817351598177,
+      "support": 350
+    },
+    "same": {
+      "precision": 0.6628787878787878,
+      "recall": 1.0,
+      "f1": 0.7972665148063781,
+      "support": 350
+    },
+    "unrelated": {
+      "precision": 0.9038961038961039,
+      "recall": 0.9942857142857143,
+      "f1": 0.9469387755102041,
+      "support": 350
+    }
+  },
+  "macroF1": 0.5471257703117152,
+  "bands": {
+    "routing": "review-all",
+    "alpha": 0.05,
+    "beta": 0.05,
+    "passFnr": 0.0,
+    "flagFpr": 0.0,
+    "passShare": 0.0,
+    "reviewShare": 1.0,
+    "flagShare": 0.0
+  },
+  "collusionAuc": 1.0,
+  "meanCollusionScore": 0.9968236088752747,
+  "meanIndependentScore": 0.05713801831007004,
+  "pairsCount": 1750,
+  "docsetsCount": 12,
+  "pairsHash": "ae38744f8c8aa29677c6fa77118f998ae956f69123a1795d9e6042654051214a",
+  "docsetsHash": "d68c053648ef246962512217241b397c4d91919c183ca5005d94766301c91601",
+  "gitRev": "30b2155",
+  "generatedAt": "2026-08-26",
+  "note": "语义层：bge-zh(bge-small-zh-v1.5)；AUC 仍走无模型层"
+}

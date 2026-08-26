@@ -26,6 +26,10 @@ dist-ssr
 # 运行时 embedding 模型缓存（首次语义查重在线下载，体积大 ~481M，勿入库）
 **/.fastembed_cache/
 
+# 随包内置语义模型（scripts/fetch-embedding-model.sh 按固定 sha256 拉取；可再生大二进制
+# 勿入库，见 src-tauri/models/embeddings/README.md——目录下仅 README 入库）
+src-tauri/models/embeddings/*/
+
 # 说明：src-tauri/binaries（pdfium 原生库）与 src-tauri/models（OCR ONNX 模型）
 # 保留入库，以便 clone 后开箱即可构建；如需瘦身可改为 setup 脚本按需下载。
 

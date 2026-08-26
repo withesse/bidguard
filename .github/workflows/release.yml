@@ -66,6 +66,13 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      # 随包内置语义模型（bge-small-zh-v1.5，~90MB，逐文件 sha256 校验）。模型按仓库策略
+      # 不入 git，发布产物必须带上它——否则默认开启的语义通道（rewrite 检测依赖）开箱即缺。
+      # 校验失败即终止发布，绝不出「静默无语义」的安装包。
+      - name: 内置语义模型（sha256 校验）
+        shell: bash
+        run: ./scripts/fetch-embedding-model.sh
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

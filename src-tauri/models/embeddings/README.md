@@ -17,19 +17,22 @@ models/embeddings/<id>/
   └── tokenizer_config.json
 ```
 
-默认建议内置 `bge-small-zh-v1.5`（~95MB，`MODELS` 里 key=`bge-zh` 的默认档）。
+内置档为 `bge-small-zh-v1.5`（~90MB，`MODELS` 里 key=`bge-zh` 的默认档）——**语义比对默认开启
+依赖它**（rewrite/洗稿分类需要语义维；模型缺失时降级纯词面并置 `semantic_degraded`）。
 
-## 如何取得这 5 个文件（从 fastembed 缓存提取，保证与下载版一致）
+## 如何取得这 5 个文件（脚本，固定 sha256）
 
-1. 临时允许联网：设置里把 `security.allowCloudModel` 打开（或在工具屏点「预下载」bge 中文·小）。
-2. 触发一次该模型加载（跑一次启用语义的比对，或工具屏预下载）。fastembed 会下到：
-   `~/.cache/bidguard/fastembed/models--Qdrant--bge-small-zh-v1.5/snapshots/<hash>/`
-3. 从该 `snapshots/<hash>/` 里把上面 5 个文件拷进 `models/embeddings/bge-small-zh-v1.5/`
-   （onnx 可能在 `onnx/` 子目录下，名字可能是 `model.onnx`；拷过来统一命名为 `model.onnx`）。
-4. 重新 `npm run tauri build` 打包即内置生效。之后把 `allowCloudModel` 关回默认（离线）。
+```bash
+./scripts/fetch-embedding-model.sh     # 幂等；HF 不可达时 BIDGUARD_HF_BASE=https://hf-mirror.com
+```
 
-> ⚠️ 必须用 fastembed 实际下载的那份 onnx/tokenizer，勿从别处找同名模型——否则 tokenizer/权重
-> 细节不同会导致向量与下载版不可比（DB 里按 `(normalized_hash, model_id)` 缓存的向量会串味）。
+脚本从 HF `Qdrant/bge-small-zh-v1.5` 拉取 fastembed 同款文件（onnx 远端名 `model_optimized.onnx`，
+落地统一 `model.onnx`），逐文件按脚本内钉死的 sha256 校验后才落位。`release.yml` 打包前自动执行；
+本地打包前手动跑一次即可。
+
+> ⚠️ 摘要即契约：必须是 fastembed 实际下载的那份 onnx/tokenizer（脚本保证），勿从别处找同名
+> 模型——否则 tokenizer/权重细节不同会导致向量与下载版不可比（DB 里按
+> `(normalized_hash, model_id)` 缓存的向量会串味）。升级模型版本时重钉脚本内摘要并 bump `id`。
 
 ## 大模型（bge-large / e5-*）
 

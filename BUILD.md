@@ -66,10 +66,17 @@ npm run tauri build            # 当前平台产物（.app/.dmg 或 .msi/.exe）
 
 ### 语义 embedding 模型（三种来源，按优先级）
 
-1. **随包内置**（推荐默认档 `bge-small-zh-v1.5`，~95MB）：把 5 个文件放进
-   `src-tauri/models/embeddings/<id>/` 即随安装包内置、开箱离线可用。放法与提取步骤见
-   `src-tauri/models/embeddings/README.md`。运行时以 fastembed user-defined 方式加载，pooling
-   对齐后向量与下载版逐位等价。
+1. **随包内置**（默认档 `bge-small-zh-v1.5`，~90MB，**语义比对默认开启依赖它**）：
+
+   ```bash
+   ./scripts/fetch-embedding-model.sh    # 从 HF 拉 5 个文件，逐文件 sha256 校验后落位
+   ```
+
+   落进 `src-tauri/models/embeddings/bge-small-zh-v1.5/`（模型不入 git，本地打包前跑一次即可，
+   幂等；HF 不可达时 `BIDGUARD_HF_BASE=https://hf-mirror.com` 走镜像，摘要不变）。release.yml
+   已内置该前置步骤——校验失败即终止发布，不会出「静默无语义」的安装包。运行时以 fastembed
+   user-defined 方式加载，pooling 对齐后向量与下载版逐位等价；细节见
+   `src-tauri/models/embeddings/README.md`。
 2. **自托管下载**（大模型 bge-large/e5-*，1~2GB 不宜内置）：把 5 个文件打成 `.tar` 传到可控 URL，
    填 `embed.rs` 的 `EmbedModelSpec.download_url`；工具屏「下载」即走该源（离线内网友好），落地
    `~/.cache/bidguard/embeddings/<id>/`。

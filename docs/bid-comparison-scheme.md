@@ -94,9 +94,15 @@
 - TF-IDF 稀疏向量；
 - 章节路径（`section_path`）、表格行/列表项标记。
 
-### 3.5 语义向量化（可选，`src-tauri/src/engine/embed.rs`）
+### 3.5 语义向量化（默认开启，可关；`src-tauri/src/engine/embed.rs`）
 
-模型可选 bge-large-zh / multilingual-e5 系列，ONNX Runtime 本地推理，支持内置和按需下载。语义层专门用于抓"换句式洗稿"——词面全变但意思不变的段落。向量按 `(normalized_hash, model_id)` 缓存，重复比对不重算。
+默认档 bge-small-zh-v1.5 **随安装包内置**（`scripts/fetch-embedding-model.sh` 按固定 sha256 拉取，
+release 打包前置步骤保证产物必带），离线开箱即有语义通道；可选升级 bge-large-zh / multilingual-e5
+系列（按需下载）。ONNX Runtime 本地推理。语义层专门用于抓"换句式洗稿"——词面全变但意思不变的
+段落；**rewrite 分类依赖语义维，纯词面配置下该类结构性不可命中**（全档语料基线
+`baseline_metrics_full.json`：rewrite P 0.875 / R 0.22，快档无模型基线恒为 0——这也是语义改为
+默认开启的原因）。向量按 `(normalized_hash, model_id)` 缓存，重复比对不重算；模型缺失时降级
+纯词面并以 `semantic_degraded` 如实进报告。
 
 ## 4. 比对期：召回与评分
 

@@ -50,7 +50,10 @@ impl Default for CompareDefaults {
             default_chunk_level: "paragraph".into(),
             similarity_threshold: 0.7,
             candidate_top_k: 100,
-            enable_semantic: false,
+            // 默认开启（2026-08-26 拍板）：bge-small-zh 已随包内置（fetch-embedding-model.sh +
+            // release 前置步骤），离线开箱即有语义通道——rewrite（洗稿）分类依赖语义维，关着等于
+            // 该能力默认不存在。模型意外缺失时走既有降级：semantic_degraded 如实进报告，不误报。
+            enable_semantic: true,
             enable_fact_conflict: true,
             ignore_whitespace: true,
             ignore_punctuation: true,
@@ -188,7 +191,7 @@ mod tests {
         assert_eq!(c.compare.default_chunk_level, "paragraph");
         assert_eq!(c.compare.similarity_threshold, 0.7);
         assert_eq!(c.compare.candidate_top_k, 100);
-        assert!(!c.compare.enable_semantic);
+        assert!(c.compare.enable_semantic, "语义默认开启：模型已随包内置，rewrite 通道依赖它");
         assert!(c.compare.enable_fact_conflict);
         assert_eq!(c.parser.min_paragraph_length, 10);
         assert!(c.parser.pdf_cross_check, "W2-4 预置键默认开启（行为 M2 实现）");
