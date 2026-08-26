@@ -5,10 +5,16 @@ on:
     branches: ["main"]
   pull_request:
 
+# 同一 ref 的旧运行随新 push 取消：macOS runner 分钟贵，快速连推不该排队烧满流水线
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     # 用 macOS：仓库内置 libpdfium.dylib + ONNX Runtime 可用，pdfium / 引擎测试可真实运行
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,6 +31,10 @@ jobs:
           workspaces: src-tauri
       - name: 安装前端依赖
         run: npm ci
+      # npm 侧供应链门禁（对齐 Rust 侧 rustsec/audit-check）：pdfjs-dist/dompurify 直接
+      # 渲染投标方提供的不可信文件，high 级通告必须阻断而非静默积压
+      - name: npm 依赖审计（high 即失败）
+        run: npm audit --audit-level=high
       - name: 前端类型检查 + 构建（含 tsc）
         run: npm run build
       - name: 前端 Lint（ESLint + react-hooks）
@@ -35,10 +45,16 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --all-targets -- -D warnings
       - name: 引擎单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      # 集成测试（tests/）：许可签发→验签→计次→退款闭环用临时密钥对恒运行；
+      # BIDGUARD_DEV_PRIV 门控的用例在 CI 无私钥时自跳过（CI 永不持有签发私钥）。
+      - name: 集成测试（含许可闭环）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --tests
       # 回归门禁（W6-5 快档）：无模型层跑合成语料，比 baseline_metrics.json（F1/召回/AUC）。
       # 语料 hash 先行校验；任一指标越容差即失败并打印新旧全表。预算 <60s。
-      - name: 语料回归门禁（快档）
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --features dev-tools corpus_regression -- --nocapture
+      # 不加 --features dev-tools：corpusgen 在 cfg(test) 下已编入，同特征集直接复用上一步
+      # 构建产物；加该 feature 会触发整仓第二次全量编译，只为重跑一个已跑过的测试。
+      - name: 语料回归门禁（快档 · --nocapture 打印指标表）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib corpus_regression -- --nocapture
 
   # 跨平台：Linux 编译检查；Windows 跑完整引擎测试（随包 pdfium.dll 为 x64，可真跑）。
   cross-check:
@@ -47,6 +63,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -103,9 +120,10 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: npm run tauri build -- --debug --bundles deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-  # 依赖供应链审计（非阻塞信息位；出 CVE 时 CI 变红提醒）
+  # Rust 依赖供应链审计（阻断：出 CVE 时该 job 失败——解析器全线面对投标方不可信输入）
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # rustsec/audit-check 会把结果写成 check-run（缺 checks: write 时报
     # "Resource not accessible by integration"，即便无漏洞该 job 也红）。
     # 就近声明而非放顶层：其余 job 保持默认权限，最小授权。
