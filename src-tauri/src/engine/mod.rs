@@ -17,6 +17,9 @@ pub mod corpus;
 #[cfg(any(test, feature = "dev-tools"))]
 pub mod corpusgen;
 pub mod diff;
+// 外部真值相似度校准评估（打破合成同源循环）：仅测试/开发工具编译。
+#[cfg(any(test, feature = "dev-tools"))]
+pub mod extcalib;
 pub mod embed;
 pub mod fact;
 pub mod features;

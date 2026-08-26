@@ -2,12 +2,23 @@
 # 语料回归一键评测（执行方案 §8 W6-5）。
 # 快档：无模型层，进 CI，比 baseline_metrics.json（F1/召回/AUC）。
 # 慢档：追加语义层（需本地缓存模型，设 BIDGUARD_EMBED_DIR），比 baseline_metrics_full.json（可选）。
+# 外部档：用【独立于合成生成器】的人工标注真值语料（fixtures/corpus/external/*.jsonl，
+#         或 BIDGUARD_GT_DIR 覆盖为本地非提交数据）评估打分器判别力，出 ROC-AUC/PR-AUC/
+#         阈值扫描/ECE/Spearman，比 baseline_metrics_external.json。当前为词面 score_pair 档
+#         （无需模型），打破合成指标系统性偏乐观循环。
 #
 # 用法：
 #   scripts/eval-corpus.sh                # 跑两档并打印全表（无模型时慢档自动跳过）
 #   scripts/eval-corpus.sh fast           # 仅快档
 #   scripts/eval-corpus.sh full           # 仅慢档（需 BIDGUARD_EMBED_DIR）
-#   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh fast   # 重写快档基线（改算法后）
+#   scripts/eval-corpus.sh external       # 仅外部真值档（词面，无需模型）
+#   scripts/eval-corpus.sh template       # 仅官方范本误报档（合法雷同，无需模型）
+#   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh fast       # 重写快档基线（改算法后）
+#   BIDGUARD_WRITE_BASELINE=1 scripts/eval-corpus.sh external   # 重写外部真值基线
+#   BIDGUARD_GT_DIR=/path/to/gt scripts/eval-corpus.sh external # 用本地非提交真值数据
+#   BIDGUARD_EMBED_MODEL=bge-large-zh scripts/eval-corpus.sh external  # 换语义模型横比
+#     （external/template 两档会自动追加 fused:<模型> / cosine:<模型>；模型缺失则只跑词面。
+#      基线按 scorer 合并，换模型写基线不会冲掉其它档。注意 bge-large 在长条款上慢两个量级。）
 #   BIDGUARD_EMBED_DIR=/path/to/models scripts/eval-corpus.sh full
 set -euo pipefail
 
@@ -32,9 +43,26 @@ run_full() {
     engine::corpusgen::tests::corpus_regression_full --nocapture
 }
 
+run_external() {
+  echo "==== 外部真值档（词面 score_pair，无需模型）===="
+  cargo test --manifest-path "$MANIFEST" --lib --features dev-tools \
+    external_calib -- --ignored --exact \
+    engine::corpusgen::tests::external_calib --nocapture
+}
+
+run_template() {
+  echo "==== 官方范本误报档（合法雷同，全负样本，无需模型）===="
+  cargo test --manifest-path "$MANIFEST" --lib --features dev-tools \
+    -- --ignored --nocapture \
+    engine::corpusgen::tests::template_fp_probe \
+    engine::corpusgen::tests::official_template_not_covered_by_builtin_library
+}
+
 case "$LANE" in
   fast) run_fast ;;
   full) run_full ;;
+  external) run_external ;;
+  template) run_template ;;
   both) run_fast; run_full ;;
-  *) echo "未知参数：$LANE（应为 fast|full|both）" >&2; exit 2 ;;
+  *) echo "未知参数：$LANE（应为 fast|full|external|template|both）" >&2; exit 2 ;;
 esac
