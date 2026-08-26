@@ -17,7 +17,25 @@ permissions:
   contents: write
 
 jobs:
+  # 发布前置守卫：内嵌验签公钥仍是开发钥（lic-dev-*）时禁止出厂——开发私钥按
+  # docs/license-activation-scheme-v2.md §11 视为已泄漏，未换发即发布等于任何人可伪造许可。
+  # 放 release 而非 ci：日常开发允许带开发钥跑测试，只有对外发布是硬阻断点。
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: 许可验签密钥守卫（开发钥禁止发布）
+        run: |
+          # 只匹配带引号的 kid 字面量（"lic-dev-…"），不误伤日后注释里的历史提及
+          if grep -n '"lic-dev-' src-tauri/src/license/keys.rs; then
+            echo "::error file=src-tauri/src/license/keys.rs::TRUSTED_KEYS 仍含开发验签公钥（lic-dev-*）。按 docs/license-activation-scheme-v2.md §11 A 组在离线机换发正式密钥后方可发布。"
+            exit 1
+          fi
+          echo "OK：未发现开发验签公钥。"
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +48,7 @@ jobs:
             args: ""
           # 暂不构建 Linux(用户决定)
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +57,11 @@ jobs:
           node-version: 20
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # 复用 ci.yml 同款编译缓存：发布此前每次冷编译 800+ crate（含 ort/tauri），两平台各 ~40 分钟
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
 
       - name: 安装前端依赖
         run: npm ci
