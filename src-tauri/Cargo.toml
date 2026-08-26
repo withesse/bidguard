@@ -44,7 +44,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] } # 解 
 # 解析 docx 正文与元数据 XML（不可信输入）。≥0.41 修复 RUSTSEC-2026-0194（重复属性名检查的
 # 二次方复杂度）与 -0195（NsReader 命名空间声明无界分配导致内存耗尽）。
 quick-xml = "0.41"
-jieba-rs = "0.7"     # 中文分词
+jieba-rs = "0.10"     # 中文分词
 pdf-extract = "0.12" # PDF 文本抽取回落（纯 Rust，文本型 PDF）；随其自带的 lopdf 一并升到已修复版
 pdfium-render = "0.8" # 更鲁棒的 PDF 文本抽取（绑定 libpdfium 原生库）
 # 读 PDF 元数据指纹（Info 字典）与内容流审计。≥0.42 修复 RUSTSEC-2026-0187（深嵌套 PDF 对象
