@@ -2,6 +2,8 @@
 // 业务在 commands/（薄壳）→ services/（编排）→ engine/（算法）+ db/（持久化）。
 mod commands;
 pub mod config;
+#[cfg(test)]
+mod contract_wire;
 pub mod db;
 mod engine;
 pub mod error;
