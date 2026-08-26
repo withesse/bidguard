@@ -41,7 +41,9 @@ function summarize(st: LicenseStatusDto): string {
     const d = daysUntil(st.trialExpiresAt);
     const parts = [];
     if (st.remainingUses != null) parts.push(`剩余 ${st.remainingUses} 次`);
+    // 时钟自首次比对起算：未起算时没有到期日
     if (d != null) parts.push(`${d} 天后到期`);
+    else parts.push("首次比对时开始计时");
     return `免费试用 · ${parts.join(" · ")}`;
   }
   if (st.state === "licensed" || st.state === "grace") {
@@ -167,6 +169,22 @@ export function Activate() {
             }}
           >
             检测到系统时间异常，请校正系统时钟后重试。
+          </div>
+        )}
+
+        {st?.tamper && (
+          <div
+            style={{
+              fontSize: 11.5,
+              color: C.danger,
+              background: C.dangerSoft,
+              border: `1px solid ${C.danger}33`,
+              borderRadius: 8,
+              padding: "8px 12px",
+              marginBottom: 18,
+            }}
+          >
+            授权状态文件校验异常（曾被修改、删除或自他机复制），既往用量已按本机审计记录从严恢复。如属误判（如恢复系统备份后触发），请联系支持处理。
           </div>
         )}
 

@@ -118,7 +118,6 @@ impl LicenseManager {
                     tamper_flag: true,
                     trial_exhausted: true,
                     time_hwm: clock::to_iso(clock::now()),
-                    initialized: true,
                     ..Default::default()
                 }
             }
@@ -148,6 +147,7 @@ impl LicenseManager {
             resolve_key,
         };
         mgr.reconcile_startup(pool);
+        mgr.reconcile_usage_witness(pool);
         mgr
     }
 
@@ -156,11 +156,11 @@ impl LicenseManager {
         self.fp.machine_code(APP_VERSION)
     }
 
-    /// 当前授权状态（可能自动开启试用并持久化）。
+    /// 当前授权状态（只读裁决，不再有副作用地开启试用——试用时钟自首次比对起算，见
+    /// check_and_consume；否则「装好看了一眼、开标日才真用」的用户会平白烧掉试用期）。
     pub fn status(&self, pool: &DbPool) -> LicenseStatus {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.touch_time(&mut inner);
-        self.ensure_trial_started(&mut inner);
         let eff = clock::effective_now(&inner.st.time_hwm);
         let a = self.assess(&inner, eff);
         let _ = self.store.save(&inner.st);
@@ -265,6 +265,13 @@ impl LicenseManager {
             read_license_path(input)?
         };
         let payload = token::verify_license_with(&text, self.resolve_key)?;
+        // 硬件标识读不到时禁止绑定：兜底常量在所有此类机器上相同，放行等于解除节点锁定
+        if !self.fp.anchor_ok() {
+            return Err(AppError::new(
+                AppErrorCode::LicenseInvalid,
+                "无法读取本机硬件标识，暂不能绑定许可，请联系支持",
+            ));
+        }
         if !self.fp.matches(&payload.machine) {
             return Err(AppError::new(
                 AppErrorCode::LicenseMachineMismatch,
@@ -278,13 +285,21 @@ impl LicenseManager {
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            // 新 license_id → 重置计数（不同许可各自计次）；同 id 重导入 → 保留计数（防重导刷次数）
+            // 换 license_id → 计数按该许可的账本证人起算（真·新许可无账本行=0；
+            // 「删状态→重导入同一张」的洗计数路径会被账本余痕堵住）；同 id 重导入 → 保留计数。
             if inner.st.license_id.as_deref() != Some(payload.license_id.as_str()) {
                 inner.st.license_id = Some(payload.license_id.clone());
-                inner.st.used_count = 0;
-                inner.st.used_count_hwm = 0;
+                let witness = pool
+                    .get()
+                    .ok()
+                    .and_then(|c| ledger::net_consumed_count(&c, &payload.license_id).ok())
+                    .unwrap_or(0);
+                if witness > 0 {
+                    log::warn!("导入许可携带账本历史用量 {witness}，计数按证人起算而非清零");
+                }
+                inner.st.used_count = witness;
+                inner.st.used_count_hwm = witness;
             }
-            inner.st.initialized = true;
             inner.installed = Some(payload);
             self.store.save(&inner.st)?;
         }
@@ -303,17 +318,17 @@ impl LicenseManager {
         inner.st.time_hwm = clock::max_iso(&inner.st.time_hwm, &now_iso);
     }
 
-    /// 无已装许可且从未开启试用 → 自动开启（一次性）。
+    /// 无已装许可且从未开启试用 → 开启（一次性）。仅由 check_and_consume 调用：
+    /// 时钟从首次比对起算，而非启动/看状态即起算。到期时刻锚定有效时间（防先回拨再首用）。
     fn ensure_trial_started(&self, inner: &mut Inner) {
         if inner.installed.is_some() {
             return;
         }
         if inner.st.trial_started_at.is_none() && !inner.st.trial_exhausted {
-            let now = clock::now();
-            inner.st.trial_started_at = Some(clock::to_iso(now));
-            inner.st.trial_expires_at = Some(clock::to_iso(now + Duration::days(TRIAL_DAYS)));
+            let eff = clock::effective_now(&inner.st.time_hwm);
+            inner.st.trial_started_at = Some(clock::to_iso(eff));
+            inner.st.trial_expires_at = Some(clock::to_iso(eff + Duration::days(TRIAL_DAYS)));
             inner.st.trial_max_uses = TRIAL_USES;
-            inner.st.initialized = true;
         }
     }
 
@@ -437,6 +452,20 @@ impl LicenseManager {
             );
         }
 
+        // 试用尚未开始（时钟自首次比对起算）：展示为可用试用态；首次 check_and_consume
+        // 会先 ensure_trial_started 再走常规裁决，不会命中本分支。
+        if inner.st.trial_started_at.is_none() {
+            let remaining = TRIAL_USES as i64 - inner.st.trial_used as i64;
+            return mk(
+                Access::Allow { consume: Some(GrantKind::Trial) },
+                "trial",
+                true,
+                Some(remaining.max(0)),
+                Some(inner.st.trial_used as i64),
+                Some(format!("试用计时将于首次比对时开始（{TRIAL_DAYS} 天 / {TRIAL_USES} 次）")),
+            );
+        }
+
         let trial_expired = inner
             .st
             .trial_expires_at
@@ -499,6 +528,50 @@ impl LicenseManager {
             let _ = ledger::mark_refunded(&conn, &usage_id);
         }
         let _ = self.store.save(&inner.st);
+    }
+
+    /// 用量证人（与 db_time_witness 同思路）：HMAC 状态文件被整删重建时，从审计账本恢复较严值。
+    /// 账本在 DB、本身可被改写，故只向严不向宽（ledger > state 才采信）；连 DB 一起删则接受
+    /// 重置——那会同时失去全部工作区与结果，代价自担；根治靠 v1.1 服务端锚定。
+    /// 必须在 reconcile_startup（失败退款对账）之后调用，否则未退款行会虚增证人值。
+    fn reconcile_usage_witness(&self, pool: &DbPool) {
+        let Ok(conn) = pool.get() else { return };
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dirty = false;
+
+        // 按次许可：账本净消费 > 状态计数 → 状态曾被删/回滚，按账本恢复并标记 tamper
+        if let Some(lid) = inner.installed.as_ref().map(|l| l.license_id.clone()) {
+            match ledger::net_consumed_count(&conn, &lid) {
+                Ok(n) if n > inner.st.used_count => {
+                    log::warn!("授权计数证人失配：状态 {} < 账本 {n}，按较严恢复", inner.st.used_count);
+                    inner.st.used_count = n;
+                    inner.st.used_count_hwm = inner.st.used_count_hwm.max(n);
+                    inner.st.license_id = Some(lid);
+                    inner.st.tamper_flag = true;
+                    dirty = true;
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("授权计数证人查询失败 code={:?}", e.code),
+            }
+        }
+
+        // 试用：状态自称从未开始，但账本存在历史试用行 → 状态被删重建，fail-closed
+        if inner.st.trial_started_at.is_none() && !inner.st.trial_exhausted {
+            match ledger::trial_evidence_exists(&conn) {
+                Ok(true) => {
+                    log::warn!("试用证人失配：状态无试用记录但账本有历史消费，fail-closed");
+                    inner.st.trial_exhausted = true;
+                    inner.st.tamper_flag = true;
+                    dirty = true;
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("试用证人查询失败 code={:?}", e.code),
+            }
+        }
+
+        if dirty {
+            let _ = self.store.save(&inner.st);
+        }
     }
 }
 

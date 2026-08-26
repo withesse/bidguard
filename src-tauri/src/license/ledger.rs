@@ -39,6 +39,27 @@ pub fn mark_refunded(conn: &rusqlite::Connection, usage_id: &str) -> AppResult<(
     Ok(())
 }
 
+/// 某许可的净消费行数（consumed，不含 refunded）。
+/// 启动时作为 HMAC 状态文件的「较严证人」：状态被整删重建后账本仍在（删 DB 会连工作区
+/// 一起失去，代价自担），ledger > state 即证明计数被回滚，按账本恢复。
+pub fn net_consumed_count(conn: &rusqlite::Connection, license_id: &str) -> AppResult<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM license_usage WHERE license_id = ?1 AND state = 'consumed'",
+        params![license_id],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
+}
+
+/// 是否存在任何历史试用消费行（含已退款——行存在本身即证明试用曾开始过）。
+/// 用于识别「删状态文件白拿新试用」：状态显示从未试用而账本有痕迹 → fail-closed。
+pub fn trial_evidence_exists(conn: &rusqlite::Connection) -> AppResult<bool> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM license_usage WHERE kind = 'trial'", [], |r| {
+        r.get(0)
+    })?;
+    Ok(n > 0)
+}
+
 /// 启动对账：进程被杀导致 RefundSink 未触发的消费行——其 job 现已 failed/cancelled，
 /// 应退款。返回 (usage_id, kind) 供调用方回落计数。仅取 consumed 且 job 为失败/取消态。
 pub fn consumed_for_failed_jobs(conn: &rusqlite::Connection) -> AppResult<Vec<(String, String)>> {

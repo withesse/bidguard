@@ -33,8 +33,9 @@ pub struct LicenseState {
     pub used_count: u64,
     /// 毛用量高水位（只增，退款不回落）：删状态重建时用于识别重置。
     pub used_count_hwm: u64,
-    /// 曾初始化过：区分「全新首装」与「状态被删」，后者 fail-closed。
-    pub initialized: bool,
+    // 注：「全新首装 vs 状态被删」的区分靠 StateStore::any_file_exists() 与
+    // ledger 证人（license::reconcile_usage_witness），不靠状态内自述字段——
+    // 曾有 initialized 字段但从未参与判定，已删（serde default 容忍新旧互读）。
 }
 
 pub struct StateStore {
@@ -128,7 +129,6 @@ fn stricter(a: LicenseState, b: LicenseState) -> LicenseState {
     base.used_count = base.used_count.max(other.used_count);
     base.used_count_hwm = base.used_count_hwm.max(other.used_count_hwm).max(base.used_count);
     base.time_hwm = crate::license::clock::max_iso(&base.time_hwm, &other.time_hwm);
-    base.initialized |= other.initialized;
     base
 }
 
@@ -186,7 +186,6 @@ mod tests {
             trial_used: 3,
             used_count: 5,
             used_count_hwm: 5,
-            initialized: true,
             ..Default::default()
         }
     }

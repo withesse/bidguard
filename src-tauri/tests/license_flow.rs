@@ -8,8 +8,9 @@
 //    未设置则跳过。BIDGUARD_DEV_PRIV=<seed> cargo test --test license_flow -- --nocapture
 use bidguard_lib::db;
 use bidguard_lib::error::AppErrorCode;
+use bidguard_lib::license::fingerprint::machine_code_encoding;
 use bidguard_lib::license::{token, GrantKind, LicenseManager};
-use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
+use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
 
 fn dev_key() -> Option<SigningKey> {
@@ -33,10 +34,11 @@ fn test_resolve(kid: &str) -> Option<[u8; 32]> {
     (kid == TEST_KID).then(|| test_signing_key().verifying_key().to_bytes())
 }
 
-/// 解码 app 机器码 → 取 anchorHash / componentHashes。
+/// 解码 app 机器码（BG2 · Crockford base32）→ 取 anchorHash / componentHashes。
+/// keygen 的解码侧必须与 machine_code_encoding() 一致——本函数即该契约的测试化身。
 fn decode_machine_code(code: &str) -> (String, Vec<String>) {
-    let body = code.strip_prefix("BG1-").unwrap_or(code).replace('-', "");
-    let bytes = BASE32_NOPAD.decode(body.as_bytes()).expect("机器码 base32");
+    let body = code.strip_prefix("BG2-").unwrap_or(code).replace('-', "");
+    let bytes = machine_code_encoding().decode(body.as_bytes()).expect("机器码 Crockford base32");
     let v: serde_json::Value = serde_json::from_slice(&bytes).expect("机器码 json");
     let anchor = v["anchorHash"].as_str().unwrap_or_default().to_string();
     let comps = v["componentHashes"]
@@ -141,10 +143,10 @@ fn machine_mismatch_rejected() {
     let mgr = LicenseManager::load(&base, &pool);
 
     // 用一个错误的机器码签发（anchor 不属于本机）
-    let bogus = "BG1-".to_string()
-        + &BASE32_NOPAD.encode(
+    let bogus = "BG2-".to_string()
+        + &machine_code_encoding().encode(
             serde_json::to_vec(&serde_json::json!({
-                "v":1, "anchorHash":"deadbeef", "componentHashes":[], "appVersion":"x"
+                "v":2, "anchorHash":"deadbeef", "componentHashes":[], "appVersion":"x"
             }))
             .unwrap()
             .as_slice(),
@@ -207,6 +209,79 @@ fn counted_flow_with_ephemeral_key() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// 试用时钟自首次比对起算：装好只看不用，不烧试用期。
+#[test]
+fn trial_clock_starts_on_first_consume_not_on_status() {
+    let base = temp_base("trial-clock");
+    let pool = db::open(&base).unwrap();
+
+    // 看状态若干次 + 重启装载：均不得起算时钟
+    let mgr = LicenseManager::load_with_keys(&base, &pool, test_resolve);
+    let s0 = mgr.status(&pool);
+    assert_eq!(s0.state, "trial");
+    assert!(s0.active);
+    assert!(s0.trial_expires_at.is_none(), "仅查看状态不应开始计时");
+    let _ = mgr.status(&pool);
+    drop(mgr);
+    let mgr = LicenseManager::load_with_keys(&base, &pool, test_resolve);
+    assert!(mgr.status(&pool).trial_expires_at.is_none(), "重启装载也不应开始计时");
+
+    // 首次消费才起算
+    let g = mgr.check_and_consume(&pool).unwrap();
+    assert_eq!(g.kind, GrantKind::Trial);
+    let s1 = mgr.status(&pool);
+    assert!(s1.trial_expires_at.is_some(), "首次比对后时钟应已起算");
+    assert_eq!(s1.remaining_uses, Some(9));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 删掉两份 HMAC 状态文件后，账本证人从审计记录恢复较严计数（按次许可不清零、试用不复活）。
+#[test]
+fn deleting_state_files_does_not_reset_counters() {
+    let sk = test_signing_key();
+    let base = temp_base("witness");
+    let pool = db::open(&base).unwrap();
+
+    // 试用消费 1 次 + 导入 3 次许可再消费 2 次
+    let mgr = LicenseManager::load_with_keys(&base, &pool, test_resolve);
+    let _ = mgr.check_and_consume(&pool).unwrap(); // trial
+    let code = mgr.machine_code();
+    let lic = issue(&sk, TEST_KID, &code, "counted", Some(3), None);
+    mgr.import_license(&pool, &lic).unwrap();
+    let _ = mgr.check_and_consume(&pool).unwrap();
+    let _ = mgr.check_and_consume(&pool).unwrap();
+    assert_eq!(mgr.status(&pool).remaining_uses, Some(1));
+    drop(mgr);
+
+    // 攻击：删两份状态文件（保留 current.lic 与 DB）
+    std::fs::remove_file(base.join("license").join("state.bin")).unwrap();
+    std::fs::remove_file(base.join(".bidguard.lst")).unwrap();
+
+    // 重启：计数由账本恢复为 2（而非清零），并标记 tamper
+    let mgr2 = LicenseManager::load_with_keys(&base, &pool, test_resolve);
+    let s = mgr2.status(&pool);
+    assert_eq!(s.state, "licensed");
+    assert_eq!(s.remaining_uses, Some(1), "删状态文件不得重置已用次数");
+    assert!(s.tamper, "状态重建应标记 tamper");
+
+    // 「删状态→重导入同一张许可」也不得洗计数
+    mgr2.import_license(&pool, &lic).unwrap();
+    assert_eq!(mgr2.status(&pool).remaining_uses, Some(1), "重导入同一许可不得清零计数");
+    drop(mgr2);
+
+    // 移除许可后：试用不复活（账本有历史试用行 → fail-closed）
+    std::fs::remove_file(base.join("license").join("state.bin")).unwrap();
+    std::fs::remove_file(base.join(".bidguard.lst")).unwrap();
+    std::fs::remove_file(base.join("license").join("current.lic")).unwrap();
+    let mgr3 = LicenseManager::load_with_keys(&base, &pool, test_resolve);
+    let s3 = mgr3.status(&pool);
+    assert_eq!(s3.state, "unlicensed", "试用不得复活，实际 {}", s3.state);
+    assert!(!s3.active);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn machine_mismatch_rejected_with_ephemeral_key() {
     let sk = test_signing_key();
@@ -214,10 +289,10 @@ fn machine_mismatch_rejected_with_ephemeral_key() {
     let pool = db::open(&base).unwrap();
     let mgr = LicenseManager::load_with_keys(&base, &pool, test_resolve);
 
-    let bogus = "BG1-".to_string()
-        + &BASE32_NOPAD.encode(
+    let bogus = "BG2-".to_string()
+        + &machine_code_encoding().encode(
             serde_json::to_vec(&serde_json::json!({
-                "v":1, "anchorHash":"deadbeef", "componentHashes":[], "appVersion":"x"
+                "v":2, "anchorHash":"deadbeef", "componentHashes":[], "appVersion":"x"
             }))
             .unwrap()
             .as_slice(),
