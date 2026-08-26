@@ -19,9 +19,10 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn from_blob(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+    // as_chunks 给出定长 [u8;4] 切片：长度在类型层成立，无需 try_into().unwrap()；
+    // 余数（非 4 的整数倍的尾字节）按损坏数据丢弃，与此前 chunks_exact 语义一致。
+    let (quads, _rest) = b.as_chunks::<4>();
+    quads.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// 批量查缓存。分批 IN 查询（SQLite 绑定变量上限 999，留余量），返回 hash → 向量。

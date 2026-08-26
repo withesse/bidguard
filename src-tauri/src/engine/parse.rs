@@ -353,11 +353,13 @@ fn is_page_number_line(line: &str) -> bool {
 /// 会被硬解成乱码静默入库（GB18030 几乎不解码失败），永远比对不上 → 无声漏报。
 pub fn decode_text(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let (pairs, _odd) = rest.as_chunks::<2>(); // 奇数尾字节按截断丢弃（同 chunks_exact）
+        let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         return String::from_utf16_lossy(&units);
     }
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let (pairs, _odd) = rest.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().copied().map(u16::from_be_bytes).collect();
         return String::from_utf16_lossy(&units);
     }
     let body = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {

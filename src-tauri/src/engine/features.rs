@@ -100,9 +100,9 @@ pub fn minhash_to_blob(sig: &[u64]) -> Vec<u8> {
 }
 
 pub fn blob_to_minhash(blob: &[u8]) -> Vec<u64> {
-    blob.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+    // 同 embedding_repo::from_blob：定长切片免去 try_into().unwrap()，尾部余数按损坏丢弃
+    let (words, _rest) = blob.as_chunks::<8>();
+    words.iter().copied().map(u64::from_le_bytes).collect()
 }
 
 // —— 实体抽取（金额/日期/工期/百分比的规则雏形，事实冲突检测在其上扩展）——
