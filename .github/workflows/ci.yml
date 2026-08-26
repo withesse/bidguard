@@ -4,6 +4,9 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  # 手动触发：工作流曾被停用过一段时间，恢复后需要能按需重跑当前 main 验证门禁，
+  # 而不必靠「造一次提交」来触发（release.yml 一直有此触发器，CI 补齐对齐）。
+  workflow_dispatch:
 
 # 同一 ref 的旧运行随新 push 取消：macOS runner 分钟贵，快速连推不该排队烧满流水线
 concurrency:
