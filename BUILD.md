@@ -78,14 +78,18 @@ npm run tauri build            # 当前平台产物（.app/.dmg 或 .msi/.exe）
 
 ## CI / 发布
 
-- `.github/workflows/ci.yml`（push / PR）：
-  - `test`（macOS）：前端类型检查 + 构建、ESLint、前端单测、Clippy（`-D warnings`）、引擎单测、语料回归门禁。
+- `.github/workflows/ci.yml`（push / PR；同 ref 新 push 取消旧运行）：
+  - `test`（macOS）：npm 依赖审计（high 即失败）、前端类型检查 + 构建、ESLint、前端单测、
+    Clippy（`-D warnings`）、引擎单测、集成测试（`--tests`，许可闭环用临时密钥对恒运行，
+    CI 永不持有签发私钥）、语料回归门禁（与引擎单测同特征集，不重复编译）。
   - `cross-check`（Ubuntu + Windows）：Windows 跑引擎测试验证平台分叉（路径分隔 / GBK 文件名 / pdfium.dll）；
     Linux 编译检查 + **单一应用二进制守卫** + **打包冒烟**（debug 打到 `.deb`，覆盖资源路径 / 配置 schema /
     beforeBuildCommand）。冒烟是补上「打包问题只在打 tag 才暴露」的缺口。
-  - `audit`：依赖供应链审计（`rustsec/audit-check`，需 `checks: write` 权限才能写 check-run）。
-- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → macOS(arm64) / Windows(x64)
-  构建并发布为 GitHub Release **草稿**（人工点发布才生效，是最后一道闸门）。
+  - `audit`：Rust 依赖供应链审计（`rustsec/audit-check`，阻断；需 `checks: write` 权限才能写 check-run）。
+    npm 侧由 `test` job 的 `npm audit --audit-level=high` 对齐覆盖。
+- `.github/workflows/release.yml`：打 `v*` tag 或手动触发 → **preflight 守卫**（内嵌验签公钥
+  仍是开发钥 `lic-dev-*` 时直接失败，堵「带开发钥出厂」）→ macOS(arm64) / Windows(x64)
+  构建（带 rust-cache）并发布为 GitHub Release **草稿**（人工点发布才生效，是最后一道闸门）。
 
 ```bash
 git tag -a v0.6.0 -m "..." && git push origin v0.6.0    # 触发构建发布
